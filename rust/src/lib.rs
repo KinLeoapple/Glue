@@ -2,6 +2,9 @@
 
 pub mod ast;
 
+#[path = "Type.rs"]
+pub mod Type;
+
 #[path = "Value.rs"]
 pub mod Value;
 

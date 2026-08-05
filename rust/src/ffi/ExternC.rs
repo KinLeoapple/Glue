@@ -1,18 +1,21 @@
-//! @extern("C") C 代码提取器 + Rust FFI wrapper 生成器
+//! `@extern("C")` C code extractor + Rust FFI wrapper generator.
 //!
-//! 扫描已解析的 AST，提取所有带 `@extern("C")` 属性和 `extern_c_body` 的 FunDecl：
-//! 1. 生成 C 源文件（函数原型 + 函数体 + 头文件依赖）
-//! 2. 生成 Rust FFI 代码（extern "C" bindings + 安全 wrapper）
+//! Scans the parsed AST and extracts every `FunDecl` carrying the `@extern("C")`
+//! attribute and an `extern_c_body`:
+//! 1. Generates a C source file (function prototypes + function bodies + header file dependencies).
+//! 2. Generates Rust FFI code (`extern "C"` bindings + safe wrappers).
 //!
-//! ## 头文件管理
+//! ## Header file management
 //!
-//! 函数级 `@c_include("header.h")` 属性声明 C 函数体依赖的系统头文件。
-//! 提取器收集所有函数的 @c_include，去重后输出到 .c 文件顶部。
+//! The function-level `@c_include("header.h")` attribute declares the system header
+//! files that a C function body depends on. The extractor collects every function's
+//! `@c_include` declarations, deduplicates them, and emits them at the top of the
+//! generated `.c` file.
 //!
-//! ## Glue → C 类型映射
+//! ## Glue → C type mapping
 //!
-//! | Glue 类型 | C 参数 | C 返回 | Rust wrapper 类型 |
-//! |-----------|--------|--------|-------------------|
+//! | Glue type | C parameter | C return | Rust wrapper type |
+//! |-----------|-------------|----------|-------------------|
 //! | i8/i16/i32/i64 | name | int8_t..int64_t | i8..i64 |
 //! | u8/u16/u32/u64 | name | uint8_t..uint64_t | u8..u64 |
 //! | i128 | name_lo, name_hi | __int128 | i128 |
@@ -25,47 +28,51 @@
 //! | f64 | name | double | f64 |
 //! | f16 | name | uint16_t (bit pattern) | u16 |
 //! | f128 | name_lo, name_hi | unsigned __int128 (bit pattern) | u128 |
-//! | void (返回) | — | void | () |
+//! | void (return) | — | void | () |
 //!
-//! **str 返回**：C 无法直接返回 fat pointer，采用 out 参数模式。
-//! Glue `fun foo(): str` → C `void glue_foo(..., const char** out_data, size_t* out_len)`。
-//! C body 设置 `*out_data` 和 `*out_len`，Rust wrapper 构造 `&'static str`。
+//! **`str` return**: C cannot return a fat pointer directly, so an out-parameter
+//! pattern is used. Glue `fun foo(): str` → C
+//! `void glue_foo(..., const char** out_data, size_t* out_len)`. The C body sets
+//! `*out_data` and `*out_len`, and the Rust wrapper constructs a `&'static str`.
 //!
-//! **i128/u128/f128 返回**：C 侧用 `__int128`/`unsigned __int128`（GCC/Clang 扩展）。
-//! Rust `i128`/`u128` 在 extern "C" 中 ABI 兼容。MSVC 不支持 `__int128`，需用 GCC/Clang。
+//! **`i128`/`u128`/`f128` return**: The C side uses `__int128`/`unsigned __int128`
+//! (GCC/Clang extensions). Rust `i128`/`u128` are ABI-compatible in `extern "C"`.
+//! MSVC does not support `__int128`; GCC/Clang is required.
 //!
-//! **f16/f128**：以 bit pattern 传递（u16/u128），C body 内部用 union/memcpy 转换。
-//! f128 参数同 u128（lo/hi 两个 uint64_t），f128 返回用 `unsigned __int128`。
+//! **`f16`/`f128`**: Passed as bit patterns (`u16`/`u128`); the C body converts
+//! internally via `union`/`memcpy`. `f128` parameters use the same layout as
+//! `u128` (two `uint64_t` values, `lo`/`hi`); `f128` returns use
+//! `unsigned __int128`.
 //!
-//! ## Rust wrapper marshal 规则
+//! ## Rust wrapper marshal rules
 //!
-//! | Glue 参数 | Rust wrapper 类型 | marshal 动作 |
+//! | Glue parameter | Rust wrapper type | marshal action |
 //! |-----------|-------------------|-------------|
 //! | str | &str | s.as_ptr() as *const c_char, s.len() |
 //! | i128/u128 | i128/u128 | (n as u64), (n >> 64) as u64 |
 //! | f128 | u128 | (n as u64), (n >> 64) as u64 |
 //! | bool | bool | b as c_int |
 //! | char | char | c as u32 |
-//! | 其他标量 | 同名 | 直接传 |
+//! | other scalars | same name | pass directly |
 
 use crate::ast::Ast::{Attribute, Decl, Module, TypeNode};
 use std::borrow::Cow;
 
-// ============ 类型映射 ============
+// ============ Type mapping ============
 
-/// C 函数参数：名称 + 类型
+/// C function parameter: name + type.
 struct CParam {
     name: String,
     c_type: String,
 }
 
-/// Glue 参数（wrapper 签名用）
+/// Glue parameter (used in wrapper signatures).
 struct GlueParam {
     name: String,
     glue_type: String,
 }
 
-/// 提取结果：一个 @extern("C") 函数的完整信息
+/// Extraction result: complete information for one `@extern("C")` function.
 struct ExternCFunc {
     glue_name: String,
     c_return: String,
@@ -77,34 +84,36 @@ struct ExternCFunc {
     glue_return: String,
 }
 
-/// Glue 类型 → C/Rust 映射条目（单点定义，消除 4 处 match 的标量重复）。
+/// Glue type → C/Rust mapping entry (single source of truth, eliminates scalar
+/// duplication across 4 match sites).
 ///
-/// - `c_return`: C 返回类型（str 返回 None，由 out 参数模式处理）
-/// - `rust_wrapper`: Rust wrapper 参数/返回类型
-/// - `c_param_kind`: C 参数分派模式（标量直接透传，i128/u128/f128 拆 lo/hi，str/u8[] 拆 data/len）
+/// - `c_return`: C return type (`str` returns `None`, handled by the out-parameter pattern)
+/// - `rust_wrapper`: Rust wrapper parameter/return type
+/// - `c_param_kind`: C parameter dispatch mode (scalars pass through directly,
+///   `i128`/`u128`/`f128` split into `lo`/`hi`, `str`/`u8[]` split into `data`/`len`)
 struct GlueTypeMapping {
     c_return: Option<&'static str>,
     rust_wrapper: Option<&'static str>,
     c_param_kind: CParamKind,
 }
 
-/// C 参数构造模式。
+/// C parameter construction mode.
 #[derive(Clone, Copy)]
 enum CParamKind {
-    /// 单参数，直接用 glue_name 对应的 C 类型。
+    /// Single parameter, using the C type for the corresponding `glue_name`.
     Single(&'static str),
-    /// 双参数 lo/hi（i128/u128/f128）。
+    /// Two parameters `lo`/`hi` (`i128`/`u128`/`f128`).
     LoHi,
-    /// data/len 双参数（str/u8[]）。
+    /// Two parameters `data`/`len` (`str`/`u8[]`).
     DataLen { c_data_type: &'static str },
 }
 
-/// 全 Glue 类型映射表（标量 + str/void/指针/数组）。
+/// Complete Glue type mapping table (scalars + `str`/`void`/pointers/arrays).
 ///
-/// 新增类型只需在此追加一行，`glue_type_to_c_return`/`glue_type_to_rust_wrapper`/
-/// `glue_type_to_c_params` 自动派生。
+/// To add a new type, simply append a row here; `glue_type_to_c_return`,
+/// `glue_type_to_rust_wrapper`, and `glue_type_to_c_params` are auto-derived.
 const GLUE_TYPE_MAP: &[(&str, GlueTypeMapping)] = &[
-    // 标量整数
+    // Scalar integers
     ("i8",    GlueTypeMapping { c_return: Some("int8_t"),  rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
     ("i16",   GlueTypeMapping { c_return: Some("int16_t"), rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
     ("i32",   GlueTypeMapping { c_return: Some("int32_t"), rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
@@ -117,19 +126,19 @@ const GLUE_TYPE_MAP: &[(&str, GlueTypeMapping)] = &[
     ("u128",  GlueTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
     ("isize", GlueTypeMapping { c_return: Some("ssize_t"), rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
     ("usize", GlueTypeMapping { c_return: Some("size_t"),  rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
-    // 标量浮点
+    // Scalar floating-point
     ("f32",   GlueTypeMapping { c_return: Some("float"),   rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
     ("f64",   GlueTypeMapping { c_return: Some("double"),  rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
     ("f16",   GlueTypeMapping { c_return: Some("uint16_t"), rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
     ("f128",  GlueTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
-    // 非算术标量
+    // Non-arithmetic scalars
     ("bool",  GlueTypeMapping { c_return: Some("int"),     rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
     ("char",  GlueTypeMapping { c_return: Some("uint32_t"), rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
-    // 特殊类型
+    // Special types
     ("str",   GlueTypeMapping { c_return: None,            rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
     ("void",  GlueTypeMapping { c_return: Some("void"),    rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
     ("u8[]",  GlueTypeMapping { c_return: None,            rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
-    // 指针类型
+    // Pointer types
     ("*u8",   GlueTypeMapping { c_return: Some("uint8_t*"), rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
     ("*i8",   GlueTypeMapping { c_return: Some("int8_t*"),  rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
     ("*u16",  GlueTypeMapping { c_return: Some("uint16_t*"), rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
@@ -141,29 +150,31 @@ const GLUE_TYPE_MAP: &[(&str, GlueTypeMapping)] = &[
     ("*void", GlueTypeMapping { c_return: Some("void*"),    rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
 ];
 
-/// 按 Glue 类型名查映射表。
+/// Look up the mapping table by Glue type name.
 #[inline]
 fn lookup_glue_type(glue_name: &str) -> Option<&'static GlueTypeMapping> {
     GLUE_TYPE_MAP.iter().find(|(n, _)| *n == glue_name).map(|(_, m)| m)
 }
 
-/// Glue 类型名 → C 返回类型。
+/// Glue type name → C return type.
 ///
-/// str 返回 None：C 无法返回 fat pointer，由 `extract_extern_c_funcs` 用 out 参数模式处理。
-/// i128/u128/f128 返回 `__int128`/`unsigned __int128`（需 GCC/Clang）。
-/// f16 返回 `uint16_t`（bit pattern）。
+/// `str` returns `None`: C cannot return a fat pointer, so `extract_extern_c_funcs`
+/// handles it via the out-parameter pattern.
+/// `i128`/`u128`/`f128` return `__int128`/`unsigned __int128` (requires GCC/Clang).
+/// `f16` returns `uint16_t` (bit pattern).
 fn glue_type_to_c_return(glue_name: &str) -> Option<&'static str> {
     lookup_glue_type(glue_name).and_then(|m| m.c_return)
 }
 
-/// Glue 类型名 → Rust wrapper 参数/返回类型。
+/// Glue type name → Rust wrapper parameter/return type.
 ///
-/// f16 → u16, f128 → u128：以 bit pattern 传递，Glue 侧 f16/f128 内部就是 u16/u128。
+/// `f16` → `u16`, `f128` → `u128`: passed as bit patterns; on the Glue side
+/// `f16`/`f128` are internally `u16`/`u128`.
 fn glue_type_to_rust_wrapper(glue_type: &str) -> Option<&'static str> {
     lookup_glue_type(glue_type).and_then(|m| m.rust_wrapper)
 }
 
-/// Glue 类型名 → C 参数列表（一个 Glue 参数可能映射为多个 C 参数）。
+/// Glue type name → C parameter list (one Glue parameter may map to multiple C parameters).
 fn glue_type_to_c_params(glue_name: &str, param_name: &str) -> Option<Vec<CParam>> {
     let m = lookup_glue_type(glue_name)?;
     Some(match m.c_param_kind {
@@ -179,7 +190,7 @@ fn glue_type_to_c_params(glue_name: &str, param_name: &str) -> Option<Vec<CParam
     })
 }
 
-/// C 类型名 → Rust binding 类型
+/// C type name → Rust binding type.
 fn c_type_to_rust(c_type: &str) -> &'static str {
     match c_type {
         "int8_t" => "i8",
@@ -215,10 +226,11 @@ fn c_type_to_rust(c_type: &str) -> &'static str {
     }
 }
 
-// ============ 属性识别 ============
+// ============ Attribute recognition ============
 
-/// 检查属性列表是否包含 @extern("C")
-/// [E-3] 仅识别大写 "C"（项目约束）；若误写小写 "c" 输出警告，避免静默漏判。
+/// Check whether the attribute list contains `@extern("C")`.
+/// [E-3] Only recognizes uppercase "C" (project constraint); a lowercase "c"
+/// emits a warning to avoid silently missing the attribute.
 fn is_extern_c(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
         if a.name != "extern" {
@@ -234,7 +246,7 @@ fn is_extern_c(attrs: &[Attribute]) -> bool {
     })
 }
 
-/// 收集 @c_include("...") 属性中的头文件名
+/// Collect header file names from `@c_include("...")` attributes.
 fn collect_c_includes(attrs: &[Attribute]) -> Vec<String> {
     let mut includes = Vec::new();
     for attr in attrs {
@@ -250,27 +262,29 @@ fn collect_c_includes(attrs: &[Attribute]) -> Vec<String> {
     includes
 }
 
-// ============ AST 提取 ============
+// ============ AST extraction ============
 
-/// 从 TypeNode 提取类型名字字符串
+/// Extract the type name string from a `TypeNode`.
 ///
-/// 支持的类型：
-/// - `Named { name }` → 返回 name（如 "i32"、"str"）
-/// - `Array { element_type, size: None }` → 返回 "elem[]"（如 "u8[]"）
-/// - `Array { element_type, size: Some(n) }` → 返回 "elem[n]"（暂不支持 @extern("C")）
+/// Supported types:
+/// - `Named { name }` → returns `name` (e.g. `"i32"`, `"str"`)
+/// - `Array { element_type, size: None }` → returns `"elem[]"` (e.g. `"u8[]"`)
+/// - `Array { element_type, size: Some(n) }` → returns `"elem[n]"` (`@extern("C")` not yet supported)
 ///
-/// 其他复杂类型（Record/Function 等）返回 None。
+/// Other complex types (`Record`/`Function`, etc.) return `None`.
 fn extract_type_name<'a>(
     ty: Option<crate::ast::Ast::TypeRef>,
     arena: &crate::ast::Ast::AstArena<'a>,
 ) -> Option<Cow<'a, str>> {
     let ty_ref = ty?;
-    // [E-2] 安全索引：畸形 AST（parser 错误恢复）可能产生非法 TypeRef，避免 panic
+    // [E-2] Safe indexing: a malformed AST (from parser error recovery) may produce
+    // an invalid TypeRef; this avoids a panic.
     let node = arena.types.get(ty_ref.0 as usize)?;
     match &node.node {
         TypeNode::Named { name } => Some(Cow::Borrowed(*name)),
         TypeNode::RawPtr { inner } => {
-            // *T → "*T"（如 *u8 → "*u8"），由 glue_type_to_c_return/params 映射为 C 指针
+            // *T → "*T" (e.g. *u8 → "*u8"), mapped to a C pointer by
+            // glue_type_to_c_return / glue_type_to_c_params.
             let inner_ref = *inner;
             let inner_node = arena.types.get(inner_ref.0 as usize)?;
             if let TypeNode::Named { name: inner_name } = &inner_node.node {
@@ -286,7 +300,7 @@ fn extract_type_name<'a>(
                 if size.is_none() {
                     Some(Cow::Owned(format!("{}[]", elem_name)))
                 } else {
-                    // 固定大小数组暂不支持 @extern("C")
+                    // Fixed-size arrays are not yet supported for @extern("C").
                     None
                 }
             } else {
@@ -297,7 +311,7 @@ fn extract_type_name<'a>(
     }
 }
 
-/// 从模块中提取所有 @extern("C") 函数信息
+/// Extract information for all `@extern("C")` functions from a module.
 fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, String> {
     let arena = &module.arena;
     let mut funcs = Vec::new();
@@ -313,29 +327,30 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             ..
         } = &decl.node
         {
-            // 只处理带 @extern("C") 属性的函数
+            // Only process functions with the @extern("C") attribute.
             if !is_extern_c(attributes) {
                 continue;
             }
 
-            // @extern("C") 必须有 C 函数体
+            // @extern("C") requires a C function body.
             let c_body = match extern_c_body {
                 Some(body) => body.to_string(),
                 None => {
                     errors.push(format!(
-                        "@extern(\"C\") 函数 '{}': 缺少 C 函数体（需要 #{{ ... }}# 原始块）",
+                        "@extern(\"C\") function '{}': missing C function body (expected #{{ ... }}# raw block)",
                         name
                     ));
                     continue;
                 }
             };
 
-            // 收集 @c_include 依赖
+            // Collect @c_include dependencies.
             let c_includes = collect_c_includes(attributes);
 
-            // 映射返回类型
-            // str 返回用 out 参数模式：C 函数返回 void，追加 out_data/out_len 参数
-            // i128/u128/f128 返回用 __int128/unsigned __int128（需 GCC/Clang）
+            // Map the return type.
+            // `str` return uses the out-parameter pattern: the C function returns void
+            // and `out_data`/`out_len` parameters are appended.
+            // `i128`/`u128`/`f128` returns use `__int128`/`unsigned __int128` (requires GCC/Clang).
             let ret_name = extract_type_name(*return_type, arena);
             let glue_return = ret_name.as_deref().unwrap_or("void").to_string();
             let is_str_return = glue_return == "str";
@@ -347,7 +362,7 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                     None => {
                         let ty_str = ret_name.as_deref().unwrap_or("<unknown>");
                         errors.push(format!(
-                            "@extern(\"C\") 函数 '{}': 不支持的返回类型 '{}'",
+                            "@extern(\"C\") function '{}': unsupported return type '{}'",
                             name, ty_str
                         ));
                         continue;
@@ -355,7 +370,7 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                 }
             };
 
-            // 映射参数
+            // Map parameters.
             let mut c_params = Vec::new();
             let mut glue_params = Vec::new();
             let mut param_ok = true;
@@ -367,7 +382,7 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                     None => {
                         let ty_str = param_ty_name.as_deref().unwrap_or("<unknown>");
                         errors.push(format!(
-                            "@extern(\"C\") 函数 '{}': 不支持的参数类型 '{}'（参数 '{}'）",
+                            "@extern(\"C\") function '{}': unsupported parameter type '{}' (parameter '{}')",
                             name, ty_str, param.name
                         ));
                         param_ok = false;
@@ -383,7 +398,7 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                 continue;
             }
 
-            // str 返回追加 out 参数（C 侧填充 out_data/out_len）
+            // For `str` returns, append the out parameters (the C side fills out_data/out_len).
             if is_str_return {
                 c_params.push(CParam {
                     name: "out_data".to_string(),
@@ -415,13 +430,13 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
     Ok(funcs)
 }
 
-// ============ C 代码生成 ============
+// ============ C code generation ============
 
-/// 从模块中提取所有 @extern("C") 函数，生成完整 .c 文件内容
+/// Extract all `@extern("C")` functions from a module and generate the complete `.c` file content.
 pub fn extract_c_from_module<'a>(module: &Module<'a>) -> Result<String, String> {
     let funcs = extract_extern_c_funcs(module)?;
 
-    // 收集所有头文件去重
+    // Collect all header files and deduplicate them.
     let mut all_includes: Vec<String> = Vec::new();
     for func in &funcs {
         for inc in &func.c_includes {
@@ -453,8 +468,9 @@ pub fn extract_c_from_module<'a>(module: &Module<'a>) -> Result<String, String> 
         };
         out.push_str(&format!("{} {}({}) {{\n", func.c_return, func.c_name, params_str));
 
-        // 为 i128/u128/f128 参数自动插入 lo/hi 重建变量
-        // 使 C body 可直接用原始参数名（如 x），无需手动处理 x_lo/x_hi
+        // For i128/u128/f128 parameters, automatically insert lo/hi reconstruction
+        // variables so the C body can use the original parameter name (e.g. `x`)
+        // without manually handling x_lo/x_hi.
         for p in &func.glue_params {
             match p.glue_type.as_str() {
                 "i128" => {
@@ -481,9 +497,9 @@ pub fn extract_c_from_module<'a>(module: &Module<'a>) -> Result<String, String> 
     Ok(out)
 }
 
-// ============ Rust FFI 生成 ============
+// ============ Rust FFI generation ============
 
-/// 从模块中提取所有 @extern("C") 函数，生成 Rust FFI 代码（bindings + wrapper）
+/// Extract all `@extern("C")` functions from a module and generate Rust FFI code (bindings + wrapper).
 pub fn extract_rust_ffi_from_module<'a>(module: &Module<'a>) -> Result<String, String> {
     let funcs = extract_extern_c_funcs(module)?;
     generate_rust_ffi(&funcs)
@@ -495,8 +511,8 @@ fn generate_rust_ffi(funcs: &[ExternCFunc]) -> Result<String, String> {
     out.push_str("// Auto-generated by glue-rs @extern(\"C\") FFI generator\n");
     out.push_str("// DO NOT EDIT — regenerate with: glue emit-ffi <file>\n\n");
 
-    // === bindings 模块 ===
-    out.push_str("/// @extern(\"C\") 绑定：由 build.rs 编译的 glue_extern 静态库提供符号\n");
+    // === bindings module ===
+    out.push_str("/// @extern(\"C\") bindings: symbols provided by the glue_extern static library compiled by build.rs\n");
     out.push_str("#[cfg(has_extern_c)]\n");
     out.push_str("pub mod bindings {\n");
     out.push_str("    extern \"C\" {\n");
@@ -520,11 +536,11 @@ fn generate_rust_ffi(funcs: &[ExternCFunc]) -> Result<String, String> {
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
-    // === wrapper 模块 ===
-    out.push_str("/// 安全包装层：Glue 值 → C ABI marshal\n");
+    // === wrapper module ===
+    out.push_str("/// Safe wrapper layer: Glue value → C ABI marshal\n");
     out.push_str("#[allow(clippy::missing_safety_doc)]\n");
     out.push_str("pub mod wrapper {\n");
-    out.push_str("    /// 调用底层 binding（需 cfg(has_extern_c)）\n");
+    out.push_str("    /// Calls the underlying binding (requires cfg(has_extern_c))\n");
     out.push_str("    #[cfg(has_extern_c)]\n");
     out.push_str("    use super::bindings;\n\n");
 
@@ -537,15 +553,17 @@ fn generate_rust_ffi(funcs: &[ExternCFunc]) -> Result<String, String> {
     Ok(out)
 }
 
-/// 为单个函数生成 wrapper 函数
+/// Generate the wrapper function for a single function.
 ///
-/// str 返回用 out 参数模式：声明 out 变量 → 调用 binding 传入 &mut → 构造 &'static str。
-/// f128 参数同 u128（lo/hi 拆分），f16 参数直接传 u16。
+/// `str` return uses the out-parameter pattern: declare out variables → call the
+/// binding with `&mut` → construct a `&'static str`.
+/// `f128` parameters behave like `u128` (split into `lo`/`hi`); `f16` parameters
+/// are passed directly as `u16`.
 fn generate_wrapper_fn(func: &ExternCFunc) -> String {
     let mut out = String::new();
     let is_str_return = func.glue_return == "str";
 
-    // 文档注释
+    // Doc comment.
     let glue_sig = format!(
         "fun {}({}): {}",
         func.glue_name,
@@ -556,10 +574,10 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
             .join(", "),
         func.glue_return
     );
-    out.push_str(&format!("    /// @extern(\"C\") {} 的安全包装\n", func.glue_name));
-    out.push_str(&format!("    /// Glue 签名: {}\n", glue_sig));
+    out.push_str(&format!("    /// Safe wrapper for @extern(\"C\") {}\n", func.glue_name));
+    out.push_str(&format!("    /// Glue signature: {}\n", glue_sig));
 
-    // 函数签名
+    // Function signature.
     let rust_params: Vec<String> = func
         .glue_params
         .iter()
@@ -571,7 +589,7 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
             )
         })
         .collect();
-    // str 返回用 &'static str（C 侧 out 参数填充，wrapper 构造引用）
+    // `str` returns use `&'static str` (filled by the C side's out parameters; the wrapper constructs the reference).
     let rust_return = if is_str_return {
         "&'static str"
     } else {
@@ -594,13 +612,13 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         ));
     }
 
-    // str 返回：声明 out 变量供 C 侧填充
+    // For `str` returns: declare out variables for the C side to fill.
     if is_str_return {
         out.push_str("        let mut out_data: *const core::ffi::c_char = core::ptr::null();\n");
         out.push_str("        let mut out_len: usize = 0;\n");
     }
 
-    // marshal 代码：为 1:N 参数生成拆分变量
+    // Marshal code: generate split variables for 1:N parameters.
     for p in &func.glue_params {
         match p.glue_type.as_str() {
             "str" => {
@@ -625,7 +643,7 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         }
     }
 
-    // 生成调用参数：按 Glue 参数顺序展开为 C 参数
+    // Generate call arguments: expand Glue parameters into C arguments in order.
     let mut call_args: Vec<String> = Vec::new();
     for p in &func.glue_params {
         match p.glue_type.as_str() {
@@ -653,20 +671,24 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         }
     }
 
-    // str 返回追加 out 参数到调用列表
+    // For `str` returns, append the out parameters to the call list.
     if is_str_return {
         call_args.push("&mut out_data".to_string());
         call_args.push("&mut out_len".to_string());
     }
 
-    // 返回值转换
+    // Return value conversion.
     let call_expr = format!("bindings::{}({})", func.c_name, call_args.join(", "));
 
     if is_str_return {
-        // str 返回：先调用 binding 填充 out 变量，再构造 &'static str 返回。
-        // [E-1] 安全化：校验 null + UTF-8，消除 from_utf8_unchecked 与 null 切片两重 UB。
-        // 生命周期 UB 由 C body 契约消除：C body 必须写入 'static 内存（字符串字面量指针），
-        // 不得用栈/堆临时缓冲返回（否则 wrapper 返回的 &'static str 在 C 函数返回后悬垂）。
+        // `str` return: first call the binding to fill the out variables, then
+        // construct a `&'static str` to return.
+        // [E-1] Hardened: validate null + UTF-8, eliminating two sources of UB
+        // (`from_utf8_unchecked` and null slicing).
+        // The lifetime UB is eliminated by the C body contract: the C body must
+        // write to 'static memory (a string literal pointer) and must not return
+        // a stack/heap temporary buffer (otherwise the `&'static str` returned by
+        // the wrapper would dangle after the C function returns).
         out.push_str(&format!("        {};\n", call_expr));
         out.push_str("        if out_data.is_null() || out_len == 0 {\n");
         out.push_str("            \"\"\n");

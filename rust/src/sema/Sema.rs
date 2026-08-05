@@ -29,14 +29,10 @@ use crate::TypeDesc::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
-// =========================================================================
-// TypeHandle — ConcreteType 在 TypeArena 中的索引句柄
-// =========================================================================
-
-/// `ConcreteType` 在 `TypeArena::types` 中的索引。newtype 保证类型安全，
-/// 避免与普通 `u32` 或 `Ast::TypeId` 混淆。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeHandle(pub u32);
+// 从 Type 模块 re-export TypeHandle（打破 Type↔sema 循环依赖）。
+// 原定义已移至 crate::Type；此处 pub use 确保 sema 子模块通过
+// `use crate::sema::Sema::*;` 仍能导入 TypeHandle。
+pub use crate::Type::TypeHandle;
 
 // =========================================================================
 // SemKind — kind 系统（支持高阶类型 HKT）
