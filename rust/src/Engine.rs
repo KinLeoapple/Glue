@@ -627,7 +627,7 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId) -> Value {
 /// FFI 调用是同步的，不设 pending_call，不挂起帧。
 #[cfg(has_extern_c)]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Ffi::wrapper;
+    use crate::ffi::Ffi::wrapper;
     read_node_inputs!(frame, node, graph, n, inputs);
     let fn_name = graph.ffi_call_names[node.0 as usize]
         .as_ref()

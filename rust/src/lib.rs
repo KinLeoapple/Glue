@@ -13,11 +13,7 @@ pub mod sema;
 #[path = "Reflect.rs"]
 pub mod Reflect;
 
-#[path = "ExternC.rs"]
-pub mod ExternC;
-
-#[path = "Ffi.rs"]
-pub mod Ffi;
+pub mod ffi;
 
 #[path = "ModuleLoader.rs"]
 pub mod ModuleLoader;

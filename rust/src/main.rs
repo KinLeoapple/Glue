@@ -335,7 +335,7 @@ fn debug_emit_c(source: &str) {
                 }
                 process::exit(1);
             }
-            match glue::ExternC::extract_c_from_module(&module) {
+            match glue::ffi::ExternC::extract_c_from_module(&module) {
                 Ok(c_code) => print!("{}", c_code),
                 Err(e) => {
                     eprintln!("Error extracting C: {}", e);
@@ -368,7 +368,7 @@ fn debug_emit_ffi(source: &str) {
                 }
                 process::exit(1);
             }
-            match glue::ExternC::extract_rust_ffi_from_module(&module) {
+            match glue::ffi::ExternC::extract_rust_ffi_from_module(&module) {
                 Ok(ffi_code) => print!("{}", ffi_code),
                 Err(e) => {
                     eprintln!("Error generating FFI: {}", e);
