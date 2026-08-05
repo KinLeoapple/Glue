@@ -48,7 +48,7 @@
 //! | char | char | c as u32 |
 //! | 其他标量 | 同名 | 直接传 |
 
-use crate::Ast::{Attribute, Decl, Module, TypeNode};
+use crate::ast::Ast::{Attribute, Decl, Module, TypeNode};
 use std::borrow::Cow;
 
 // ============ 类型映射 ============
@@ -77,90 +77,106 @@ struct ExternCFunc {
     glue_return: String,
 }
 
-/// Glue 类型名 → C 返回类型
+/// Glue 类型 → C/Rust 映射条目（单点定义，消除 4 处 match 的标量重复）。
+///
+/// - `c_return`: C 返回类型（str 返回 None，由 out 参数模式处理）
+/// - `rust_wrapper`: Rust wrapper 参数/返回类型
+/// - `c_param_kind`: C 参数分派模式（标量直接透传，i128/u128/f128 拆 lo/hi，str/u8[] 拆 data/len）
+struct GlueTypeMapping {
+    c_return: Option<&'static str>,
+    rust_wrapper: Option<&'static str>,
+    c_param_kind: CParamKind,
+}
+
+/// C 参数构造模式。
+#[derive(Clone, Copy)]
+enum CParamKind {
+    /// 单参数，直接用 glue_name 对应的 C 类型。
+    Single(&'static str),
+    /// 双参数 lo/hi（i128/u128/f128）。
+    LoHi,
+    /// data/len 双参数（str/u8[]）。
+    DataLen { c_data_type: &'static str },
+}
+
+/// 全 Glue 类型映射表（标量 + str/void/指针/数组）。
+///
+/// 新增类型只需在此追加一行，`glue_type_to_c_return`/`glue_type_to_rust_wrapper`/
+/// `glue_type_to_c_params` 自动派生。
+const GLUE_TYPE_MAP: &[(&str, GlueTypeMapping)] = &[
+    // 标量整数
+    ("i8",    GlueTypeMapping { c_return: Some("int8_t"),  rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
+    ("i16",   GlueTypeMapping { c_return: Some("int16_t"), rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
+    ("i32",   GlueTypeMapping { c_return: Some("int32_t"), rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
+    ("i64",   GlueTypeMapping { c_return: Some("int64_t"), rust_wrapper: Some("i64"),   c_param_kind: CParamKind::Single("int64_t") }),
+    ("i128",  GlueTypeMapping { c_return: Some("__int128"), rust_wrapper: Some("i128"), c_param_kind: CParamKind::LoHi }),
+    ("u8",    GlueTypeMapping { c_return: Some("uint8_t"), rust_wrapper: Some("u8"),    c_param_kind: CParamKind::Single("uint8_t") }),
+    ("u16",   GlueTypeMapping { c_return: Some("uint16_t"), rust_wrapper: Some("u16"), c_param_kind: CParamKind::Single("uint16_t") }),
+    ("u32",   GlueTypeMapping { c_return: Some("uint32_t"), rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
+    ("u64",   GlueTypeMapping { c_return: Some("uint64_t"), rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
+    ("u128",  GlueTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    ("isize", GlueTypeMapping { c_return: Some("ssize_t"), rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
+    ("usize", GlueTypeMapping { c_return: Some("size_t"),  rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
+    // 标量浮点
+    ("f32",   GlueTypeMapping { c_return: Some("float"),   rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
+    ("f64",   GlueTypeMapping { c_return: Some("double"),  rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
+    ("f16",   GlueTypeMapping { c_return: Some("uint16_t"), rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
+    ("f128",  GlueTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    // 非算术标量
+    ("bool",  GlueTypeMapping { c_return: Some("int"),     rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
+    ("char",  GlueTypeMapping { c_return: Some("uint32_t"), rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
+    // 特殊类型
+    ("str",   GlueTypeMapping { c_return: None,            rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
+    ("void",  GlueTypeMapping { c_return: Some("void"),    rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
+    ("u8[]",  GlueTypeMapping { c_return: None,            rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
+    // 指针类型
+    ("*u8",   GlueTypeMapping { c_return: Some("uint8_t*"), rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
+    ("*i8",   GlueTypeMapping { c_return: Some("int8_t*"),  rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
+    ("*u16",  GlueTypeMapping { c_return: Some("uint16_t*"), rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
+    ("*i16",  GlueTypeMapping { c_return: Some("int16_t*"), rust_wrapper: Some("*mut i16"), c_param_kind: CParamKind::Single("int16_t*") }),
+    ("*u32",  GlueTypeMapping { c_return: Some("uint32_t*"), rust_wrapper: Some("*mut u32"), c_param_kind: CParamKind::Single("uint32_t*") }),
+    ("*i32",  GlueTypeMapping { c_return: Some("int32_t*"), rust_wrapper: Some("*mut i32"), c_param_kind: CParamKind::Single("int32_t*") }),
+    ("*u64",  GlueTypeMapping { c_return: Some("uint64_t*"), rust_wrapper: Some("*mut u64"), c_param_kind: CParamKind::Single("uint64_t*") }),
+    ("*i64",  GlueTypeMapping { c_return: Some("int64_t*"), rust_wrapper: Some("*mut i64"), c_param_kind: CParamKind::Single("int64_t*") }),
+    ("*void", GlueTypeMapping { c_return: Some("void*"),    rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
+];
+
+/// 按 Glue 类型名查映射表。
+#[inline]
+fn lookup_glue_type(glue_name: &str) -> Option<&'static GlueTypeMapping> {
+    GLUE_TYPE_MAP.iter().find(|(n, _)| *n == glue_name).map(|(_, m)| m)
+}
+
+/// Glue 类型名 → C 返回类型。
 ///
 /// str 返回 None：C 无法返回 fat pointer，由 `extract_extern_c_funcs` 用 out 参数模式处理。
 /// i128/u128/f128 返回 `__int128`/`unsigned __int128`（需 GCC/Clang）。
 /// f16 返回 `uint16_t`（bit pattern）。
 fn glue_type_to_c_return(glue_name: &str) -> Option<&'static str> {
-    match glue_name {
-        "i8" => Some("int8_t"),
-        "i16" => Some("int16_t"),
-        "i32" => Some("int32_t"),
-        "i64" => Some("int64_t"),
-        "u8" => Some("uint8_t"),
-        "u16" => Some("uint16_t"),
-        "u32" => Some("uint32_t"),
-        "u64" => Some("uint64_t"),
-        "i128" => Some("__int128"),
-        "u128" => Some("unsigned __int128"),
-        "isize" => Some("ssize_t"),
-        "usize" => Some("size_t"),
-        "bool" => Some("int"),
-        "char" => Some("uint32_t"),
-        "f32" => Some("float"),
-        "f64" => Some("double"),
-        "f16" => Some("uint16_t"),
-        "f128" => Some("unsigned __int128"),
-        "void" => Some("void"),
-        "*u8" => Some("uint8_t*"),
-        "*i8" => Some("int8_t*"),
-        "*u16" => Some("uint16_t*"),
-        "*i16" => Some("int16_t*"),
-        "*u32" => Some("uint32_t*"),
-        "*i32" => Some("int32_t*"),
-        "*u64" => Some("uint64_t*"),
-        "*i64" => Some("int64_t*"),
-        "*void" => Some("void*"),
-        _ => None,
-    }
+    lookup_glue_type(glue_name).and_then(|m| m.c_return)
 }
 
-/// Glue 类型名 → C 参数列表（一个 Glue 参数可能映射为多个 C 参数）
+/// Glue 类型名 → Rust wrapper 参数/返回类型。
+///
+/// f16 → u16, f128 → u128：以 bit pattern 传递，Glue 侧 f16/f128 内部就是 u16/u128。
+fn glue_type_to_rust_wrapper(glue_type: &str) -> Option<&'static str> {
+    lookup_glue_type(glue_type).and_then(|m| m.rust_wrapper)
+}
+
+/// Glue 类型名 → C 参数列表（一个 Glue 参数可能映射为多个 C 参数）。
 fn glue_type_to_c_params(glue_name: &str, param_name: &str) -> Option<Vec<CParam>> {
-    match glue_name {
-        "i8" => Some(vec![CParam { name: param_name.to_string(), c_type: "int8_t".to_string() }]),
-        "i16" => Some(vec![CParam { name: param_name.to_string(), c_type: "int16_t".to_string() }]),
-        "i32" => Some(vec![CParam { name: param_name.to_string(), c_type: "int32_t".to_string() }]),
-        "i64" => Some(vec![CParam { name: param_name.to_string(), c_type: "int64_t".to_string() }]),
-        "u8" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint8_t".to_string() }]),
-        "u16" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint16_t".to_string() }]),
-        "u32" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint32_t".to_string() }]),
-        "u64" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint64_t".to_string() }]),
-        "i128" | "u128" => Some(vec![
+    let m = lookup_glue_type(glue_name)?;
+    Some(match m.c_param_kind {
+        CParamKind::Single(c_type) => vec![CParam { name: param_name.to_string(), c_type: c_type.to_string() }],
+        CParamKind::LoHi => vec![
             CParam { name: format!("{}_lo", param_name), c_type: "uint64_t".to_string() },
             CParam { name: format!("{}_hi", param_name), c_type: "uint64_t".to_string() },
-        ]),
-        "isize" => Some(vec![CParam { name: param_name.to_string(), c_type: "ssize_t".to_string() }]),
-        "usize" => Some(vec![CParam { name: param_name.to_string(), c_type: "size_t".to_string() }]),
-        "bool" => Some(vec![CParam { name: param_name.to_string(), c_type: "int".to_string() }]),
-        "char" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint32_t".to_string() }]),
-        "str" => Some(vec![
-            CParam { name: format!("{}_data", param_name), c_type: "const char*".to_string() },
+        ],
+        CParamKind::DataLen { c_data_type } => vec![
+            CParam { name: format!("{}_data", param_name), c_type: c_data_type.to_string() },
             CParam { name: format!("{}_len", param_name), c_type: "size_t".to_string() },
-        ]),
-        "f32" => Some(vec![CParam { name: param_name.to_string(), c_type: "float".to_string() }]),
-        "f64" => Some(vec![CParam { name: param_name.to_string(), c_type: "double".to_string() }]),
-        "f16" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint16_t".to_string() }]),
-        "f128" => Some(vec![
-            CParam { name: format!("{}_lo", param_name), c_type: "uint64_t".to_string() },
-            CParam { name: format!("{}_hi", param_name), c_type: "uint64_t".to_string() },
-        ]),
-        "u8[]" => Some(vec![
-            CParam { name: format!("{}_data", param_name), c_type: "uint8_t*".to_string() },
-            CParam { name: format!("{}_len", param_name), c_type: "size_t".to_string() },
-        ]),
-        "*u8" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint8_t*".to_string() }]),
-        "*i8" => Some(vec![CParam { name: param_name.to_string(), c_type: "int8_t*".to_string() }]),
-        "*u16" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint16_t*".to_string() }]),
-        "*i16" => Some(vec![CParam { name: param_name.to_string(), c_type: "int16_t*".to_string() }]),
-        "*u32" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint32_t*".to_string() }]),
-        "*i32" => Some(vec![CParam { name: param_name.to_string(), c_type: "int32_t*".to_string() }]),
-        "*u64" => Some(vec![CParam { name: param_name.to_string(), c_type: "uint64_t*".to_string() }]),
-        "*i64" => Some(vec![CParam { name: param_name.to_string(), c_type: "int64_t*".to_string() }]),
-        "*void" => Some(vec![CParam { name: param_name.to_string(), c_type: "void*".to_string() }]),
-        _ => None,
-    }
+        ],
+    })
 }
 
 /// C 类型名 → Rust binding 类型
@@ -196,45 +212,6 @@ fn c_type_to_rust(c_type: &str) -> &'static str {
         "double" => "f64",
         "void" => "()",
         _ => "()",
-    }
-}
-
-/// Glue 类型名 → Rust wrapper 参数/返回类型
-///
-/// f16 → u16, f128 → u128：以 bit pattern 传递，Glue 侧 f16/f128 内部就是 u16/u128。
-fn glue_type_to_rust_wrapper(glue_type: &str) -> Option<&'static str> {
-    match glue_type {
-        "i8" => Some("i8"),
-        "i16" => Some("i16"),
-        "i32" => Some("i32"),
-        "i64" => Some("i64"),
-        "u8" => Some("u8"),
-        "u16" => Some("u16"),
-        "u32" => Some("u32"),
-        "u64" => Some("u64"),
-        "i128" => Some("i128"),
-        "u128" => Some("u128"),
-        "isize" => Some("isize"),
-        "usize" => Some("usize"),
-        "bool" => Some("bool"),
-        "char" => Some("char"),
-        "str" => Some("&str"),
-        "f32" => Some("f32"),
-        "f64" => Some("f64"),
-        "f16" => Some("u16"),
-        "f128" => Some("u128"),
-        "u8[]" => Some("&[u8]"),
-        "void" => Some("()"),
-        "*u8" => Some("*mut u8"),
-        "*i8" => Some("*mut i8"),
-        "*u16" => Some("*mut u16"),
-        "*i16" => Some("*mut i16"),
-        "*u32" => Some("*mut u32"),
-        "*i32" => Some("*mut i32"),
-        "*u64" => Some("*mut u64"),
-        "*i64" => Some("*mut i64"),
-        "*void" => Some("*mut core::ffi::c_void"),
-        _ => None,
     }
 }
 
@@ -284,8 +261,8 @@ fn collect_c_includes(attrs: &[Attribute]) -> Vec<String> {
 ///
 /// 其他复杂类型（Record/Function 等）返回 None。
 fn extract_type_name<'a>(
-    ty: Option<crate::Ast::TypeRef>,
-    arena: &crate::Ast::AstArena<'a>,
+    ty: Option<crate::ast::Ast::TypeRef>,
+    arena: &crate::ast::Ast::AstArena<'a>,
 ) -> Option<Cow<'a, str>> {
     let ty_ref = ty?;
     // [E-2] 安全索引：畸形 AST（parser 错误恢复）可能产生非法 TypeRef，避免 panic

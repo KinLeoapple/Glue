@@ -1,7 +1,7 @@
 //! Engine.rs — 数据流就绪调度执行引擎
 //!
 //! 基于 Ir.rs 的 DataFlowGraph，实现：
-//! - Frame 管理（FramePool）
+//! - Frame 管理（HashMap + LockStrategy）
 //! - 就绪调度（核心循环）
 //! - 子图启动（start/complete）
 //! - compute_fn 执行
@@ -13,6 +13,163 @@
 
 use crate::Ir::*;
 use crate::Value::{Value, ValueArena};
+use std::cell::{RefCell, RefMut};
+use std::ops::DerefMut;
+use parking_lot::{Condvar, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
+use hashbrown::HashMap;
+use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
+use std::sync::Arc;
+
+// =========================================================================
+// 哨兵常量 — 集中定义，避免散落魔数
+// =========================================================================
+
+/// Thunk 帧使用的哨兵 FrameId（不参与正常分配，避免与 alloc_frame_id 冲突）。
+const THUNK_FRAME_ID: FrameId = FrameId(u32::MAX);
+/// LoopBody 回退子帧使用的哨兵 FrameId（不参与正常分配）。
+const LOOPBODY_FALLBACK_FRAME_ID: FrameId = FrameId(u32::MAX - 1);
+/// `pending_inputs` 槽位哨兵：标记"永不就绪/外部源"（实际入度必须 < 255）。
+const PENDING_EXTERNAL: u8 = u8::MAX;
+/// splitmix64 黄金比例散列常量（确保各 worker 的 steal 顺序互异）。
+const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
+
+/// IO 写入成功返回值（i32）。仅在 `#[cfg(not(has_extern_c))]` 的 fallback 路径使用。
+#[allow(dead_code)]
+const IO_OK: i32 = 0;
+/// IO 写入失败返回值（i32）。仅在 `#[cfg(not(has_extern_c))]` 的 fallback 路径使用。
+#[allow(dead_code)]
+const IO_ERR: i32 = -1;
+/// UTF-8 解码失败/越界返回值（i64）。
+const UTF8_DECODE_ERR: i64 = -1;
+
+/// Result 变体构造器名（与 stdlib 的 Result 类型定义保持同步）。
+const CTOR_OK: &str = "Ok";
+const CTOR_ERR: &str = "Error";
+const CTOR_ERR_ALT: &str = "Err";
+
+/// Timer 事件 Record 中 duration 字段名。
+const TIMER_DURATION_NS_FIELD: &str = "duration_ns";
+
+/// reflect 类型名常量（单点维护，供 __reflect_type_name / compute_cast_to_str 共用）。
+const TYPE_NAME_NULL: &str = "null";
+const TYPE_NAME_VOID: &str = "void";
+const TYPE_NAME_STR: &str = "str";
+const TYPE_NAME_ARRAY: &str = "array";
+const TYPE_NAME_UNKNOWN: &str = "unknown";
+
+// =========================================================================
+// reflect 辅助函数 — 消除 FFI/fallback 双路径重复
+// =========================================================================
+
+/// 返回 Value 的 reflect kind 编号（ABI 协议：0-12）。
+/// 单一权威来源，FFI 与 fallback 路径共用，确保一致。
+fn reflect_kind(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Void => 1,
+        Value::Scalar(_, _) => 2,
+        Value::Ref(r) => match &**r {
+            crate::Value::HeapObj::Str(_) => 3,
+            crate::Value::HeapObj::Array(_) => 4,
+            crate::Value::HeapObj::Record(_) => 5,
+            crate::Value::HeapObj::Adt(_) => 6,
+            crate::Value::HeapObj::Closure(_) => 7,
+            crate::Value::HeapObj::TraitVal(_) => 8,
+            crate::Value::HeapObj::ThrowVal(_) => 9,
+            crate::Value::HeapObj::ChannelVal(_) => 10,
+            crate::Value::HeapObj::AsyncVal(_) => 11,
+            _ => 12,
+        },
+    }
+}
+
+/// 返回 Value 的 reflect kind 显示名（单点维护，FFI 与 fallback 共用）。
+fn reflect_kind_str(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "Null",
+        Value::Void => "Void",
+        Value::Scalar(_, _) => "Primitive",
+        Value::Ref(r) => match &**r {
+            crate::Value::HeapObj::Str(_) => "Str",
+            crate::Value::HeapObj::Array(_) => "Array",
+            crate::Value::HeapObj::Record(_) => "Record",
+            crate::Value::HeapObj::Adt(_) => "Adt",
+            crate::Value::HeapObj::Newtype(_) => "Newtype",
+            crate::Value::HeapObj::Closure(_) => "Closure",
+            crate::Value::HeapObj::TraitVal(_) => "Trait",
+            _ => "Ref",
+        },
+    }
+}
+
+/// 返回 Value 的类型名（单点维护，FFI 与 fallback / cast_to_str 共用）。
+fn reflect_type_name(v: &Value) -> String {
+    match v {
+        Value::Null => TYPE_NAME_NULL.to_string(),
+        Value::Void => TYPE_NAME_VOID.to_string(),
+        Value::Scalar(_, tag) => tag.type_name().to_string(),
+        Value::Ref(r) => match &**r {
+            crate::Value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
+            crate::Value::HeapObj::Array(_) => TYPE_NAME_ARRAY.to_string(),
+            crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
+            crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
+            crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
+            _ => TYPE_NAME_UNKNOWN.to_string(),
+        },
+    }
+}
+
+/// UTF-8 解码：从 bytes[offset] 起解码一个 codepoint。
+/// 成功返回 (codepoint, consumed_bytes)，失败（越界/非法首字节）返回 None。
+/// 单一实现，消除 FFI/fallback 双路径重复。
+fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
+    if offset >= bytes.len() {
+        return None;
+    }
+    let c = bytes[offset];
+    // ASCII（1 字节）
+    if c < 0x80 {
+        return Some((c as u32, 1));
+    }
+    // 2 字节序列：110xxxxx 10xxxxxx
+    if (c & 0xE0) == 0xC0 {
+        if offset + 1 >= bytes.len() {
+            return None;
+        }
+        let cp = ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F);
+        return Some((cp, 2));
+    }
+    // 3 字节序列：1110xxxx 10xxxxxx 10xxxxxx
+    if (c & 0xF0) == 0xE0 {
+        if offset + 2 >= bytes.len() {
+            return None;
+        }
+        let cp = ((c as u32 & 0x0F) << 12)
+            | ((bytes[offset + 1] as u32 & 0x3F) << 6)
+            | (bytes[offset + 2] as u32 & 0x3F);
+        return Some((cp, 3));
+    }
+    // 4 字节序列：11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+    if (c & 0xF8) == 0xF0 {
+        if offset + 3 >= bytes.len() {
+            return None;
+        }
+        let cp = ((c as u32 & 0x07) << 18)
+            | ((bytes[offset + 1] as u32 & 0x3F) << 12)
+            | ((bytes[offset + 2] as u32 & 0x3F) << 6)
+            | (bytes[offset + 3] as u32 & 0x3F);
+        return Some((cp, 4));
+    }
+    // 非法首字节
+    None
+}
+
+/// 将 u32 codepoint 转为 char，非法 codepoint 回退为 U+0000。
+/// 单点统一，消除 3 处重复的 `char::from_u32(x).unwrap_or('\0')`。
+#[inline]
+fn char_from_u32_or_nul(u: u32) -> char {
+    char::from_u32(u).unwrap_or('\0')
+}
 
 // =========================================================================
 // compute_fn 生成宏 — 批量生成类型特化计算函数
@@ -436,6 +593,10 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
 /// 输入为 ThrowVal：
 /// - Ok(val) → 返回 val（解包）
 /// - Err(err) → 设 frame.control_signal = Return(ThrowVal(Err))，函数提前返回错误
+///
+/// 输入为 Nullable 值：
+/// - null → 设 frame.control_signal = Return(null)，函数提前返回 null（要求外层返回类型为 T?）
+/// - 非 null → 返回值本身（nullable 值与非空值表示同构，直接透传）
 pub fn compute_propagate(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -449,8 +610,12 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId) -> Value {
                 Value::VOID
             }
         }
+    } else if v.is_null() {
+        // Nullable 传播：值为 null 时，设 Return 信号携带 null 提前返回
+        frame.control_signal = ControlSignal::Return(v.clone());
+        Value::VOID
     } else {
-        // 非 ThrowVal：直接透传（类型系统保证此处不应到达）
+        // 非 null 的 Nullable 值：直接透传（nullable 值与非空值表示同构）
         v
     }
 }
@@ -483,6 +648,34 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             _ => panic!("FFI u8[] arg expected"),
         }
     }
+
+    // 将 FFI 读取的数据写回 Glue u8[] 数组（原地修改底层 HeapObj，&self 语义）。
+    //
+    // extract_u8_buf 返回 clone 的 Vec，FFI 写入局部 Vec 后需写回原数组，
+    // 否则 Glue 侧读取的数据为零（H-2 修复）。
+    // 仅写回 buf[0..n]，n 由 FFI 返回值决定（调用方传入）。
+    fn writeback_u8_buf(buf_val: &Value, data: &[u8], n: usize) {
+        if let Value::Ref(arc) = buf_val {
+            // Safety: 引擎单线程执行，caller 帧在 callee 执行期间 Suspended，
+            // 不会有并发访问同一 HeapObj 的路径（与 compute_record_field_set 一致）。
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
+            unsafe {
+                if let crate::Value::HeapObj::Array(arr) = &mut *ptr {
+                    let len = n.min(data.len()).min(arr.elements.len());
+                    // SOA 快路径：U8 连续存储直接 memcpy
+                    if let Some(crate::Value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
+                        let len = len.min(soa_data.len());
+                        soa_data[..len].copy_from_slice(&data[..len]);
+                    } else {
+                        for i in 0..len {
+                            arr.elements[i] = Value::u8(data[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     match fn_name.as_str() {
         // ── IO: stdout/stderr ──
@@ -538,9 +731,11 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── IO: file read/write (u8[] + len) ──
         "__file_read_into" => {
             let fd = frame.get_value_by_global(inputs[0]).as_i64();
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let len = frame.get_value_by_global(inputs[2]).as_usize();
             let n = unsafe { wrapper::__file_read_into(fd, &mut buf, len) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
             Value::i64(n)
         }
         "__file_write" => {
@@ -553,22 +748,28 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
 
         // ── IO: stdin ──
         "__stdin_readln_into" => {
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[0]));
+            let buf_val = frame.get_value_by_global(inputs[0]);
+            let mut buf = extract_u8_buf(&buf_val);
             let n = unsafe { wrapper::__stdin_readln_into(&mut buf) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
             Value::i64(n)
         }
 
         // ── IO: stat/fstat ──
         "__file_stat_into" => {
             let path = extract_str(&frame.get_value_by_global(inputs[0]));
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let rc = unsafe { wrapper::__file_stat_into(&path, &mut buf) };
+            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
             Value::i32(rc)
         }
         "__file_fstat_into" => {
             let fd = frame.get_value_by_global(inputs[0]).as_i64();
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let rc = unsafe { wrapper::__file_fstat_into(fd, &mut buf) };
+            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
             Value::i32(rc)
         }
 
@@ -589,13 +790,21 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── IO: dir list ──
         "__dir_list_into" => {
             let path = extract_str(&frame.get_value_by_global(inputs[0]));
-            let mut names_buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
-            let mut name_offsets = extract_u8_buf(&frame.get_value_by_global(inputs[2]));
-            let mut kinds_buf = extract_u8_buf(&frame.get_value_by_global(inputs[3]));
+            let names_val = frame.get_value_by_global(inputs[1]);
+            let offsets_val = frame.get_value_by_global(inputs[2]);
+            let kinds_val = frame.get_value_by_global(inputs[3]);
+            let mut names_buf = extract_u8_buf(&names_val);
+            let mut name_offsets = extract_u8_buf(&offsets_val);
+            let mut kinds_buf = extract_u8_buf(&kinds_val);
             let max_count = frame.get_value_by_global(inputs[4]).as_usize();
             let count = unsafe {
                 wrapper::__dir_list_into(&path, &mut names_buf, &mut name_offsets, &mut kinds_buf, max_count)
             };
+            if count > 0 {
+                writeback_u8_buf(&names_val, &names_buf, names_buf.len());
+                writeback_u8_buf(&offsets_val, &name_offsets, name_offsets.len());
+                writeback_u8_buf(&kinds_val, &kinds_buf, kinds_buf.len());
+            }
             Value::i64(count)
         }
 
@@ -623,9 +832,11 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__net_tcp_read" => {
             let fd = frame.get_value_by_global(inputs[0]).as_i64();
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let len = frame.get_value_by_global(inputs[2]).as_usize();
             let n = unsafe { wrapper::__net_tcp_read(fd, &mut buf, len) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
             Value::i64(n)
         }
         "__net_tcp_write" => {
@@ -662,18 +873,22 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__net_udp_recv_from_v4" => {
             let fd = frame.get_value_by_global(inputs[0]).as_i64();
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let len = frame.get_value_by_global(inputs[2]).as_usize();
             let n = unsafe { wrapper::__net_udp_recv_from_v4(fd, &mut buf, len) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
             Value::i64(n)
         }
 
         // ── net: resolve ──
         "__net_resolve_into" => {
             let host = extract_str(&frame.get_value_by_global(inputs[0]));
-            let mut out_buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut out_buf = extract_u8_buf(&buf_val);
             let max_count = frame.get_value_by_global(inputs[2]).as_usize();
             let count = unsafe { wrapper::__net_resolve_into(&host, &mut out_buf, max_count) };
+            if count > 0 { writeback_u8_buf(&buf_val, &out_buf, out_buf.len()); }
             Value::i64(count)
         }
 
@@ -718,9 +933,11 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__net_udp_recv_from_v6" => {
             let fd = frame.get_value_by_global(inputs[0]).as_i64();
-            let mut buf = extract_u8_buf(&frame.get_value_by_global(inputs[1]));
+            let buf_val = frame.get_value_by_global(inputs[1]);
+            let mut buf = extract_u8_buf(&buf_val);
             let len = frame.get_value_by_global(inputs[2]).as_usize();
             let n = unsafe { wrapper::__net_udp_recv_from_v6(fd, &mut buf, len) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
             Value::i64(n)
         }
 
@@ -840,60 +1057,20 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── cast: char ──
         "__cast_char_to_u8" => {
             let x = frame.get_value_by_global(inputs[0]).as_u32();
-            let r = unsafe { wrapper::__cast_char_to_u8(char::from_u32(x).unwrap_or('\0')) };
+            let r = unsafe { wrapper::__cast_char_to_u8(char_from_u32_or_nul(x)) };
             Value::u8(r)
         }
 
-        // ── reflect: Rust 侧实现（非 C 库函数），直接调用 Reflect::format_value ──
-        "__reflect_format" => {
-            let v = frame.get_value_by_global(inputs[0]);
-            // LazyValue 强制求值：格式化前触发 thunk 计算
-            let v = force_lazy_value_sync(frame, &v);
-            let s = crate::Reflect::format_value(&v, 0);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
-        }
-        "__reflect_scalar_to_str" => {
-            let v = frame.get_value_by_global(inputs[0]);
-            let v = force_lazy_value_sync(frame, &v);
-            let s = crate::Reflect::format_value(&v, 0);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
-        }
+        // ── reflect: __reflect_format/__reflect_scalar_to_str 已拆分为独立
+        // compute_fn（CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR，idx 290/291），
+        // 不再走 FFI 分派路径 ──
         "__reflect_kind" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let kind: u8 = match &v {
-                Value::Null => 0,
-                Value::Void => 1,
-                Value::Scalar(_, _) => 2,
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => 3,
-                    crate::Value::HeapObj::Array(_) => 4,
-                    crate::Value::HeapObj::Record(_) => 5,
-                    crate::Value::HeapObj::Adt(_) => 6,
-                    crate::Value::HeapObj::Closure(_) => 7,
-                    crate::Value::HeapObj::TraitVal(_) => 8,
-                    crate::Value::HeapObj::ThrowVal(_) => 9,
-                    crate::Value::HeapObj::ChannelVal(_) => 10,
-                    crate::Value::HeapObj::AsyncVal(_) => 11,
-                    _ => 12,
-                }
-            };
-            Value::u8(kind)
+            Value::u8(reflect_kind(&v))
         }
         "__reflect_type_name" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let name = match &v {
-                Value::Null => "null".to_string(),
-                Value::Void => "void".to_string(),
-                Value::Scalar(_, tag) => tag.type_name().to_string(),
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => "str".to_string(),
-                    crate::Value::HeapObj::Array(_) => "array".to_string(),
-                    crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
-                    crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
-                    crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
-                    _ => "unknown".to_string(),
-                },
-            };
+            let name = reflect_type_name(&v);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_array_len" => {
@@ -915,13 +1092,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_size" => {
             let v = frame.get_value_by_global(inputs[0]);
             let size: u8 = match &v {
-                Value::Scalar(_, tag) => match tag {
-                    crate::Value::ScalarTag::Bool | crate::Value::ScalarTag::U8 | crate::Value::ScalarTag::I8 => 1,
-                    crate::Value::ScalarTag::U16 | crate::Value::ScalarTag::I16 | crate::Value::ScalarTag::F16 => 2,
-                    crate::Value::ScalarTag::U32 | crate::Value::ScalarTag::I32 | crate::Value::ScalarTag::F32 | crate::Value::ScalarTag::Char => 4,
-                    crate::Value::ScalarTag::U64 | crate::Value::ScalarTag::I64 | crate::Value::ScalarTag::F64 | crate::Value::ScalarTag::Usize | crate::Value::ScalarTag::Isize => 8,
-                    crate::Value::ScalarTag::U128 | crate::Value::ScalarTag::I128 | crate::Value::ScalarTag::F128 => 16,
-                },
+                Value::Scalar(_, tag) => tag.byte_width(),
                 _ => 0,
             };
             Value::u8(size)
@@ -968,21 +1139,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__reflect_kind_str" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let kind = match &v {
-                Value::Null => "Null",
-                Value::Void => "Void",
-                Value::Scalar(_, _) => "Primitive",
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => "Str",
-                    crate::Value::HeapObj::Array(_) => "Array",
-                    crate::Value::HeapObj::Record(_) => "Record",
-                    crate::Value::HeapObj::Adt(_) => "Adt",
-                    crate::Value::HeapObj::Newtype(_) => "Newtype",
-                    crate::Value::HeapObj::Closure(_) => "Closure",
-                    crate::Value::HeapObj::TraitVal(_) => "Trait",
-                    _ => "Ref",
-                },
-            };
+            let kind = reflect_kind_str(&v);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
         }
         "__reflect_layout_size" => {
@@ -1001,30 +1158,9 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             let s = extract_str(&frame.get_value_by_global(inputs[0]));
             let offset = frame.get_value_by_global(inputs[1]).as_usize();
             let bytes = s.as_bytes();
-            if offset >= bytes.len() {
-                Value::i64(-1)
-            } else {
-                let c = bytes[offset];
-                let cp = if c < 0x80 {
-                    c as u32
-                } else if (c & 0xE0) == 0xC0 {
-                    if offset + 1 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F)
-                } else if (c & 0xF0) == 0xE0 {
-                    if offset + 2 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x0F) << 12)
-                        | ((bytes[offset + 1] as u32 & 0x3F) << 6)
-                        | (bytes[offset + 2] as u32 & 0x3F)
-                } else if (c & 0xF8) == 0xF0 {
-                    if offset + 3 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x07) << 18)
-                        | ((bytes[offset + 1] as u32 & 0x3F) << 12)
-                        | ((bytes[offset + 2] as u32 & 0x3F) << 6)
-                        | (bytes[offset + 3] as u32 & 0x3F)
-                } else {
-                    return Value::i64(-1);
-                };
-                Value::i64(cp as i64)
+            match utf8_decode_at(bytes, offset) {
+                Some((cp, _)) => Value::i64(cp as i64),
+                None => Value::i64(UTF8_DECODE_ERR),
             }
         }
         "__str_utf8_char_len_at" => {
@@ -1065,18 +1201,18 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(s.bytes().as_bytes());
                 let _ = std::io::stdout().flush();
-                Value::i32(0)
+                Value::i32(IO_OK)
             } else {
-                Value::i32(-1)
+                Value::i32(IO_ERR)
             }
         }
         "__stderr_write_raw" => {
             if let Some(crate::Value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
                 use std::io::Write;
                 let _ = std::io::stderr().write_all(s.bytes().as_bytes());
-                Value::i32(0)
+                Value::i32(IO_OK)
             } else {
-                Value::i32(-1)
+                Value::i32(IO_ERR)
             }
         }
 
@@ -1123,46 +1259,16 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── cast: char ──
         "__cast_char_to_u8" => Value::u8(frame.get_value_by_global(inputs[0]).as_u32() as u8),
 
-        // ── reflect: Rust 侧实现，直接调用 Reflect::format_value ──
-        "__reflect_format" | "__reflect_scalar_to_str" => {
-            let v = frame.get_value_by_global(inputs[0]);
-            // LazyValue 强制求值：格式化前触发 thunk 计算
-            // 与 has_extern_c 版本保持一致，避免 not(has_extern_c) 路径漏调 force
-            let v = force_lazy_value_sync(frame, &v);
-            let s = crate::Reflect::format_value(&v, 0);
-            Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
-        }
+        // ── reflect: __reflect_format/__reflect_scalar_to_str 已拆分为独立
+        // compute_fn（CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR，idx 290/291），
+        // 不再走 FFI 分派路径 ──
         "__reflect_kind" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let kind: u8 = match &v {
-                Value::Null => 0,
-                Value::Void => 1,
-                Value::Scalar(_, _) => 2,
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => 3,
-                    crate::Value::HeapObj::Array(_) => 4,
-                    crate::Value::HeapObj::Record(_) => 5,
-                    crate::Value::HeapObj::Adt(_) => 6,
-                    _ => 7,
-                },
-            };
-            Value::u8(kind)
+            Value::u8(reflect_kind(&v))
         }
         "__reflect_type_name" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let name = match &v {
-                Value::Null => "null".to_string(),
-                Value::Void => "void".to_string(),
-                Value::Scalar(_, tag) => tag.type_name().to_string(),
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => "str".to_string(),
-                    crate::Value::HeapObj::Array(_) => "array".to_string(),
-                    crate::Value::HeapObj::Record(rec) => rec.type_name.clone(),
-                    crate::Value::HeapObj::Adt(a) => a.type_name.clone(),
-                    crate::Value::HeapObj::Newtype(n) => n.type_name.clone(),
-                    _ => "unknown".to_string(),
-                },
-            };
+            let name = reflect_type_name(&v);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&name)))
         }
         "__reflect_array_len" => {
@@ -1184,13 +1290,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__reflect_size" => {
             let v = frame.get_value_by_global(inputs[0]);
             let size: u8 = match &v {
-                Value::Scalar(_, tag) => match tag {
-                    crate::Value::ScalarTag::Bool | crate::Value::ScalarTag::U8 | crate::Value::ScalarTag::I8 => 1,
-                    crate::Value::ScalarTag::U16 | crate::Value::ScalarTag::I16 | crate::Value::ScalarTag::F16 => 2,
-                    crate::Value::ScalarTag::U32 | crate::Value::ScalarTag::I32 | crate::Value::ScalarTag::F32 | crate::Value::ScalarTag::Char => 4,
-                    crate::Value::ScalarTag::U64 | crate::Value::ScalarTag::I64 | crate::Value::ScalarTag::F64 | crate::Value::ScalarTag::Usize | crate::Value::ScalarTag::Isize => 8,
-                    crate::Value::ScalarTag::U128 | crate::Value::ScalarTag::I128 | crate::Value::ScalarTag::F128 => 16,
-                },
+                Value::Scalar(_, tag) => tag.byte_width(),
                 _ => 0,
             };
             Value::u8(size)
@@ -1228,21 +1328,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
         "__reflect_kind_str" => {
             let v = frame.get_value_by_global(inputs[0]);
-            let kind = match &v {
-                Value::Null => "Null",
-                Value::Void => "Void",
-                Value::Scalar(_, _) => "Primitive",
-                Value::Ref(r) => match &**r {
-                    crate::Value::HeapObj::Str(_) => "Str",
-                    crate::Value::HeapObj::Array(_) => "Array",
-                    crate::Value::HeapObj::Record(_) => "Record",
-                    crate::Value::HeapObj::Adt(_) => "Adt",
-                    crate::Value::HeapObj::Newtype(_) => "Newtype",
-                    crate::Value::HeapObj::Closure(_) => "Closure",
-                    crate::Value::HeapObj::TraitVal(_) => "Trait",
-                    _ => "Ref",
-                },
-            };
+            let kind = reflect_kind_str(&v);
             Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(kind)))
         }
         "__reflect_layout_size" => {
@@ -1264,30 +1350,9 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             };
             let offset = frame.get_value_by_global(inputs[1]).as_usize();
             let bytes = s.as_bytes();
-            if offset >= bytes.len() {
-                Value::i64(-1)
-            } else {
-                let c = bytes[offset];
-                let cp = if c < 0x80 {
-                    c as u32
-                } else if (c & 0xE0) == 0xC0 {
-                    if offset + 1 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F)
-                } else if (c & 0xF0) == 0xE0 {
-                    if offset + 2 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x0F) << 12)
-                        | ((bytes[offset + 1] as u32 & 0x3F) << 6)
-                        | (bytes[offset + 2] as u32 & 0x3F)
-                } else if (c & 0xF8) == 0xF0 {
-                    if offset + 3 >= bytes.len() { return Value::i64(-1); }
-                    ((c as u32 & 0x07) << 18)
-                        | ((bytes[offset + 1] as u32 & 0x3F) << 12)
-                        | ((bytes[offset + 2] as u32 & 0x3F) << 6)
-                        | (bytes[offset + 3] as u32 & 0x3F)
-                } else {
-                    return Value::i64(-1);
-                };
-                Value::i64(cp as i64)
+            match utf8_decode_at(bytes, offset) {
+                Some((cp, _)) => Value::i64(cp as i64),
+                None => Value::i64(UTF8_DECODE_ERR),
             }
         }
         "__str_utf8_char_len_at" => {
@@ -1313,6 +1378,40 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── 未实现的 FFI 函数（无 C 编译器时返回默认值）──
         _ => Value::i32(0),
     }
+}
+
+// =========================================================================
+// reflect 独立 compute_fn（290-291）
+//
+// 从 compute_ffi_call 拆分出来，避免 lazy force 逻辑与 FFI 调用耦合。
+// 这两个函数是唯一涉及 LazyValue 强制求值的 reflect 操作，独立后：
+//   - 不再依赖 ffi_call_name 元数据
+//   - 不走 FFI 分派路径
+//   - lazy force 逻辑与 reflect 格式化逻辑内聚
+// =========================================================================
+
+/// compute_fn (idx 290): `__reflect_format` — 任意值 → str
+///
+/// 格式化前先强制求值 LazyValue（若输入是 lazy），再调用 Reflect::format_value。
+/// 不依赖 ffi_call_name，直接读取 inputs[0]。
+pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, _n, inputs);
+    let v = frame.get_value_by_global(inputs[0]);
+    let v = force_lazy_value_sync(frame, &v);
+    let s = crate::Reflect::format_value(&v, 0);
+    Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
+}
+
+/// compute_fn (idx 291): `__reflect_scalar_to_str` — 标量值 → str
+///
+/// 语义与 compute_reflect_format 一致（均走 format_value），独立保留以
+/// 对应 Raw.glue 中的两个不同 @extern("C") 原语声明。
+pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, _n, inputs);
+    let v = frame.get_value_by_global(inputs[0]);
+    let v = force_lazy_value_sync(frame, &v);
+    let s = crate::Reflect::format_value(&v, 0);
+    Value::ref_val(crate::Value::HeapObj::Str(crate::Value::GlueStr::from_rust_str(&s)))
 }
 
 /// compute_fn: 类型构造（从输入收集字段值，根据 kind 构造 Record/Adt/Newtype HeapObj）
@@ -1369,13 +1468,29 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 统一机制：Record 与 Adt 均通过 `find_field(name)` 按名取值，
 /// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
+    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
     let name = graph.field_set_names[node.0 as usize].as_deref();
-    record_val
-        .heap_obj()
-        .and_then(|h| name.and_then(|n| h.field_get(n)))
-        .unwrap_or(Value::VOID)
+    let make_err = |msg: &str| {
+        let record = Arc::new(RecordValue {
+            type_name: "FieldError".to_string(),
+            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            field_names: vec![Some("message".to_string())],
+            field_ref_bits: 1,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    };
+    let Some(h) = record_val.heap_obj() else {
+        return make_err("field access on non-record value");
+    };
+    let Some(name) = name else {
+        return make_err("field_get node has no field name");
+    };
+    h.field_get(name).unwrap_or_else(|| {
+        make_err(&format!("no such field '{}' on record", name))
+    })
 }
 
 /// compute_fn: 数组构造（从输入收集元素构造 ArrayValue）
@@ -1637,9 +1752,11 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     let matched = match val.heap_obj() {
         Some(crate::Value::HeapObj::Adt(a)) => a.constructor == *ctor_name,
         Some(crate::Value::HeapObj::Record(r)) => r.type_name == *ctor_name,
+        // Newtype：构造器名 == 类型名，匹配 NewtypeValue.type_name
+        Some(crate::Value::HeapObj::Newtype(n)) => n.type_name == *ctor_name,
         Some(crate::Value::HeapObj::ThrowVal(tv)) => match &tv.payload {
-            crate::Value::ThrowPayload::Ok(_) => ctor_name == "Ok",
-            crate::Value::ThrowPayload::Err(_) => ctor_name == "Error" || ctor_name == "Err",
+            crate::Value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
+            crate::Value::ThrowPayload::Err(_) => ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT,
         },
         _ => false,
     };
@@ -1664,6 +1781,14 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
         }
         Some(crate::Value::HeapObj::Record(r)) => {
             r.fields.get(idx).cloned().unwrap_or(Value::VOID)
+        }
+        // Newtype：单字段，idx 0 取 inner 值（通过 ValueArena 全局句柄解引用）
+        Some(crate::Value::HeapObj::Newtype(n)) => {
+            if idx == 0 {
+                crate::Value::ValueArena::with_global(|a| a.get_value(n.inner))
+            } else {
+                Value::VOID
+            }
         }
         Some(crate::Value::HeapObj::ThrowVal(tv)) => {
             if idx == 0 {
@@ -1700,6 +1825,47 @@ pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(lhs_str == rhs_str)
 }
 
+/// compute_fn: str 比较（292-297）
+///
+/// 按 Unicode 码点序列字典序比较（Rust str 的 Ord 语义，UTF-8 字节序与码点序一致）。
+/// 操作数非 str 时返回 false（Eq/Le/Ge）或按 Ord 语义不 panic 地返回 false。
+/// 使用 GlueStr.compare（Ordering）避免重复分配。
+fn str_compare_operands(frame: &mut Frame, node: NodeId) -> Option<std::cmp::Ordering> {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    match (lhs.heap_obj(), rhs.heap_obj()) {
+        (Some(crate::Value::HeapObj::Str(a)), Some(crate::Value::HeapObj::Str(b))) => {
+            Some(a.compare(b))
+        }
+        _ => None,
+    }
+}
+
+pub fn compute_eq_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Equal))
+}
+
+pub fn compute_ne_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(str_compare_operands(frame, node) != Some(std::cmp::Ordering::Equal))
+}
+
+pub fn compute_lt_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Less))
+}
+
+pub fn compute_gt_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Greater))
+}
+
+pub fn compute_le_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(matches!(str_compare_operands(frame, node), Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)))
+}
+
+pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
+    Value::bool_val(matches!(str_compare_operands(frame, node), Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)))
+}
+
 /// compute_fn: 通用类型转换 — 任意值 → str（idx 277）。
 ///
 /// 输入：源值节点。按 Value 变体分派格式化为 GlueStr：
@@ -1717,8 +1883,8 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
     let val = frame.get_value_by_global(inputs[0]);
 
     let s: String = match &val {
-        Value::Null => "null".to_string(),
-        Value::Void => "void".to_string(),
+        Value::Null => TYPE_NAME_NULL.to_string(),
+        Value::Void => TYPE_NAME_VOID.to_string(),
         Value::Scalar(_, tag) => {
             match tag {
                 ScalarTag::Bool => val.as_bool().to_string(),
@@ -1755,27 +1921,10 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         .as_ref()
         .expect("cast_scalar node has no target type");
 
-    let target_tag = match target_ty.as_str() {
-        "i8" => ScalarTag::I8,
-        "i16" => ScalarTag::I16,
-        "i32" => ScalarTag::I32,
-        "i64" => ScalarTag::I64,
-        "i128" => ScalarTag::I128,
-        "u8" => ScalarTag::U8,
-        "u16" => ScalarTag::U16,
-        "u32" => ScalarTag::U32,
-        "u64" => ScalarTag::U64,
-        "u128" => ScalarTag::U128,
-        "isize" => ScalarTag::Isize,
-        "usize" => ScalarTag::Usize,
-        "f16" => ScalarTag::F16,
-        "f32" => ScalarTag::F32,
-        "f64" => ScalarTag::F64,
-        "f128" => ScalarTag::F128,
-        "bool" => ScalarTag::Bool,
-        "char" => ScalarTag::Char,
+    let target_tag = match ScalarTag::from_name(target_ty) {
+        Some(tag) => tag,
         // 未知目标类型：safe cast 返回 Null，否则返回 Void
-        _ => {
+        None => {
             return if graph.safe_op_flags[node.0 as usize] {
                 Value::Null
             } else {
@@ -1793,13 +1942,13 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
     let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
 
     match target_tag {
-        ScalarTag::I8 => Value::i8(val.as_i8()),
-        ScalarTag::I16 => Value::i16(val.as_i16()),
+        ScalarTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
+        ScalarTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
         ScalarTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
         ScalarTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
         ScalarTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
-        ScalarTag::U8 => Value::u8(val.as_u8()),
-        ScalarTag::U16 => Value::u16(val.as_u16()),
+        ScalarTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
+        ScalarTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
         ScalarTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
         ScalarTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
         ScalarTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
@@ -1809,8 +1958,8 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         ScalarTag::F32 => Value::f32(src_f64 as f32),
         ScalarTag::F64 => Value::f64(src_f64),
         ScalarTag::F128 => Value::f128(crate::Value::F128::from_f64(src_f64)),
-        ScalarTag::Bool => Value::bool_val(val.as_int_i128() != 0),
-        ScalarTag::Char => Value::char_val(char::from_u32(val.as_int_i128() as u32).unwrap_or('\0')),
+        ScalarTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
+        ScalarTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
     }
 }
 
@@ -1882,22 +2031,23 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
 /// 修改后写回值表槽，使变更对其他节点可见。
 pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
-    let _record_val = frame.get_value_by_global(inputs[0]);
     let new_value = frame.get_value_by_global(inputs[1]);
     let field_name = graph.field_set_names[node.0 as usize]
         .as_ref()
         .expect("field set node has no field name");
-    // &self 语义：通过 Arc::as_ptr 直接修改底层 HeapObj（不 COW）。
-    // 参数传递时 Arc 被 clone（refcount > 1），Arc::make_mut 会创建副本导致 &self 修改不可见。
     let record_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
+    // &self 语义：直接修改 Arc 底层 HeapObj，确保修改对所有持有者可见。
+    // 这对迭代器模式（next() 修改 self.pos）等场景至关重要：
+    // for 循环通过尾递归传递迭代器引用，若 COW 则 pos 永不更新 → 死循环。
+    //
+    // Arc::make_mut 在 refcount>1 时 COW，破坏 &self 引用语义。
+    // 此处通过 Arc::as_ptr 获取可变指针直接修改，绕过 Rust 别名规则。
+    //
+    // Safety: 引擎单线程执行（LockStrategy::Single 无锁，Multi 在帧级别互斥），
+    // caller 帧在 callee 执行期间处于 Suspended 状态，不会有并发访问同一 HeapObj。
+    // Arc 的引用计数不变（不 clone 也不 drop），仅修改堆数据。
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            // &self 语义：直接修改 Arc 底层的 HeapObj，而非 Arc::make_mut 的 COW 副本。
-            // 参数传递时 Arc 被 clone（refcount > 1），make_mut 会创建副本导致修改对调用方不可见。
-            // 直接修改确保 &self 引用语义正确（修改原始值，不是副本）。
-            //
-            // Safety: 引擎单线程执行，caller 帧在 callee 执行期间处于 Suspended 状态，
-            // 不会有并发访问同一 HeapObj 的代码路径。
             let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::Value::HeapObj;
             unsafe {
                 match &mut *ptr {
@@ -1929,13 +2079,15 @@ pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(is_null)
 }
 
-/// compute_fn: 数组长度（返回 i32，与默认整数运算类型一致）
+/// compute_fn: 长度（返回 i32，与默认整数运算类型一致）
+/// - Array：元素个数
+/// - Str：Unicode 码点数（与 str[i] 索引语义一致，均按码点计数）
 pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
     let len = match val.heap_obj() {
         Some(crate::Value::HeapObj::Array(arr)) => arr.len() as i32,
-        Some(crate::Value::HeapObj::Str(s)) => s.byte_len() as i32,
+        Some(crate::Value::HeapObj::Str(s)) => s.codepoint_count() as i32,
         _ => 0,
     };
     Value::i32(len)
@@ -1963,6 +2115,29 @@ pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
         (Value::Ref(a), Value::Ref(b)) => !std::sync::Arc::ptr_eq(a, b),
         _ => true,
     };
+    Value::bool_val(neq)
+}
+
+/// compute_fn: 复合类型（record/adt/newtype/array/closure/throw 等）语义相等。
+/// 对 Ref 走 heap_equals 深度比较；对标量/Null/Void 回退到 value_equals。
+pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    let eq = crate::Value::ValueArena::with_global(|arena| {
+        crate::Value::value_equals_with_arena(&lhs, &rhs, arena)
+    });
+    Value::bool_val(eq)
+}
+
+/// compute_fn: 复合类型语义不等，compute_eq_obj 的否定。
+pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let lhs = frame.get_value_by_global(inputs[0]);
+    let rhs = frame.get_value_by_global(inputs[1]);
+    let neq = crate::Value::ValueArena::with_global(|arena| {
+        !crate::Value::value_equals_with_arena(&lhs, &rhs, arena)
+    });
     Value::bool_val(neq)
 }
 
@@ -2037,6 +2212,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
             args,
             call_node_local,
             is_async: false,
+            closure_val: None,
         }));
         return Value::VOID;
     }
@@ -2081,6 +2257,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
         args,
         call_node_local: gate_node_local,
         is_async: false,
+        closure_val: None,
     }));
 
     Value::VOID
@@ -2142,15 +2319,32 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
 /// 发送后设置 pending_channel_notify，run_ready_nodes 消费时触发 ChannelReady 事件
 /// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
 pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
+    use std::sync::Arc;
+    use crate::Value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
     let val = frame.get_value_by_global(inputs[1]);
-    let ch = ch_val.heap_obj().and_then(|h| h.channel())
-        .expect("send on non-channel value");
-    let ch_id = crate::Ir::ChannelId(ch.id());
-    ch.send(val);
-    frame.pending = Some(Pending::ChannelNotify(ch_id));
-    Value::VOID
+    let make_err = |msg: &str| {
+        let record = Arc::new(RecordValue {
+            type_name: "ChannelError".to_string(),
+            fields: vec![Value::ref_val(HeapObj::Str(crate::Value::GlueStr::new(msg)))],
+            field_names: vec![Some("message".to_string())],
+            field_ref_bits: 1,
+        });
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    };
+    let ch = match ch_val.heap_obj().and_then(|h| h.channel()) {
+        Some(ch) => ch,
+        None => return make_err("send on non-channel value"),
+    };
+    match ch.send(val) {
+        Ok(()) => {
+            let ch_id = crate::Ir::ChannelId(ch.id());
+            frame.pending = Some(Pending::ChannelNotify(ch_id));
+            Value::VOID
+        }
+        Err(e) => make_err(e.message()),
+    }
 }
 
 /// compute_channel_close（idx 285）：关闭 channel。
@@ -2190,6 +2384,7 @@ pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
         args,
         call_node_local,
         is_async: true,
+        closure_val: None,
     }));
 
     Value::VOID
@@ -2200,14 +2395,19 @@ pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
 /// 从 graph.closure_infos 取子图 id + arity，合并 inputs（捕获值）构造 Closure 堆对象。
 /// 节点的 inputs 即捕获的 upvalues（按 compile_lambda 中 captured 顺序）。
 pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Value::{HeapObj, Closure};
+    use crate::Value::{HeapObj, Closure, Cell};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.closure_infos[node.0 as usize]
         .expect("closure construct node has no ClosureInfo");
+    // 用 Cell 包装每个 upvalue，使逃逸闭包（跨函数调用）能通过 Cell
+    // 的 interior mutability 持久化 upvalue 修改。
+    // same_function 调用不使用 Cell（直接从父帧读最新值）。
     let upvalues: Vec<Value> = inputs
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
+        .map(|v| Value::ref_val(HeapObj::Cell(Cell::new(v))))
         .collect();
+    let cell_bits = if upvalues.len() >= 8 { 0xFF } else { (1u8 << upvalues.len()) - 1 };
     Value::ref_val(HeapObj::Closure(Closure {
         func_id: info.subgraph_id.0,
         arity: info.arity,
@@ -2215,7 +2415,7 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
         bound_args: Vec::new(),
         self_upvalue_idx: info.self_upvalue_idx,
         upvalue_ref_bits: 0,
-        cell_upvalues: 0,
+        cell_upvalues: cell_bits,
     }))
 }
 
@@ -2307,7 +2507,7 @@ pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 若已 forced，直接返回 cached 值；否则创建 thunk 帧，同步运行至完成，
 /// 将结果缓存到 LazyValue（通过 Arc::make_mut 原地更新），返回结果。
 ///
-/// 此函数在 compute_ffi_call 的 __reflect_format 处理器中调用，
+/// 此函数在 compute_reflect_format / compute_reflect_scalar_to_str 中调用，
 /// 用于在格式化前强制求值 lazy 值。
 pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Value {
     use crate::Value::HeapObj;
@@ -2347,8 +2547,8 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
     // 创建 thunk 帧
     let (node_start, node_end) = graph.subgraphs[thunk_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
-    let mut thunk_frame = Frame::new(FrameId(0xFFFF_FFFF), thunk_sg, node_count, graph.clone());
-    prepare_frame_shared(&mut thunk_frame, &graph);
+    let mut thunk_frame = Frame::new(THUNK_FRAME_ID, thunk_sg, node_count, graph.clone());
+    prepare_frame_nodes(&mut thunk_frame, &graph);
 
     // 注入 upvalues 作为参数
     let offset = node_start.0 as usize;
@@ -2378,16 +2578,56 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
 /// 同步执行帧至完成，处理嵌套函数调用、控制信号、vtable 分派。
 ///
 /// 这是 Engine 异步执行模型的同步简化版：
+/// - 帧内节点按就绪队列调度执行
+/// - 遇到 Call 节点时递归调用 run_frame_sync 执行子帧
+/// - 控制信号（return/break/continue）终止循环
+///
+/// defer 执行：帧完成后（任何终止路径），按 LIFO 顺序执行 defer_table 中的
+/// defer body 子图。defer body 通过递归 run_frame_sync 执行（支持嵌套 defer）。
+fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
+    let result = run_frame_sync_inner(frame, graph);
+    // 执行 defer（LIFO）：任何终止路径都执行 defer
+    run_defers_sync(frame, graph);
+    result
+}
+
+/// 执行帧的 defer_table 中的 defer body（LIFO 顺序）。
+/// defer body 是独立子图，创建新帧并通过 run_frame_sync 同步执行。
+fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
+    let sg_id = frame.subgraph_id;
+    let defer_entries: Vec<crate::Ir::DeferEntry> =
+        graph.subgraphs[sg_id.0 as usize].defer_table.clone();
+    for entry in defer_entries.iter().rev() {
+        let (dn_start, dn_end) = graph.subgraphs[entry.body_subgraph.0 as usize].node_range;
+        let dn_count = (dn_end.0 - dn_start.0) as usize;
+        let mut defer_frame = Frame::new(
+            FrameId(u32::MAX),
+            entry.body_subgraph,
+            dn_count,
+            frame.graph.clone(),
+        );
+        prepare_frame_nodes(&mut defer_frame, graph);
+        let _ = run_frame_sync(&mut defer_frame, graph);
+    }
+}
+
+/// run_frame_sync 的内部实现（不执行 defer）。
+///
 /// - 弹出就绪节点 → 调用 compute_fn → 处理 pending_call/control_signal
 /// - pending_call：递归创建子帧 + 同步执行 + 注入返回值
 /// - control_signal：Return 直接返回，Break/Continue 传播
 ///
 /// 不支持：async/await、channel/timer 事件、select、循环体复用。
 /// 适用于 thunk 子图（纯计算 + 同步函数调用）。
-fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
+fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     use crate::Ir::{ControlSignal, LoopKind, NodeKind, PendingCall, SignalKind, SubGraphId};
 
+    let mut iter_guard: u64 = 0;
     loop {
+        iter_guard += 1;
+        if iter_guard > 100000 {
+            return Value::VOID;
+        }
         // 1. 检查控制信号（return/break/continue 已触发）
         let cs = frame.control_signal.clone();
         match cs {
@@ -2426,7 +2666,6 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
             compute_fn(frame, graph_node_id)
         };
-
         // 4. vtable 动态分派（Call 节点有 vtable_call_methods 但无 call_target）
         if frame.pending.is_none() {
             if let Some(method_idx) = graph.vtable_call_methods[graph_node_id.0 as usize] {
@@ -2461,6 +2700,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     args,
                     call_node_local,
                     is_async: false,
+                    closure_val: None,
                 }));
             }
         }
@@ -2472,7 +2712,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
             // 尾调用：复用当前帧
             if graph.tail_call_flags[graph_node_id.0 as usize] {
-                switch_subgraph_shared(frame, graph, pending.target_sg, &pending.args);
+                switch_subgraph(frame, graph, pending.target_sg, &pending.args);
                 continue;
             }
 
@@ -2482,12 +2722,12 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             let (child_start, child_end) = graph.subgraphs[pending.target_sg.0 as usize].node_range;
             let child_count = (child_end.0 - child_start.0) as usize;
             let mut child_frame = Frame::new(
-                FrameId(0xFFFF_FFFE),
+                LOOPBODY_FALLBACK_FRAME_ID,
                 pending.target_sg,
                 child_count,
                 frame.graph.clone(),
             );
-            prepare_frame_shared(&mut child_frame, graph);
+            prepare_frame_nodes(&mut child_frame, graph);
 
             // 注入参数
             let child_offset = child_start.0 as usize;
@@ -2516,6 +2756,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             } else {
                 std::ptr::null_mut()
             };
+            child_frame.closure_val = pending.closure_val.clone();
 
             // 同步执行子帧
             let child_result = run_frame_sync(&mut child_frame, graph);
@@ -2551,7 +2792,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     }
                     ControlSignal::Continue | ControlSignal::None => {
                         // 循环继续：通知下游，循环帧会重新触发 body 调用
-                        notify_downstream_shared(
+                        notify_downstream(
                             frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start),
                         );
                         continue;
@@ -2569,7 +2810,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 continue;
             }
 
-            notify_downstream_shared(frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start));
+            notify_downstream(frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start));
         } else {
             // 6. 普通节点：写值表 + 检查控制信号 + 通知下游
             let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
@@ -2592,7 +2833,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 continue;
             }
 
-            notify_downstream_shared(frame, graph, local_id, graph_node_id, NodeId(node_start));
+            notify_downstream(frame, graph, local_id, graph_node_id, NodeId(node_start));
         }
     }
 }
@@ -2612,7 +2853,7 @@ pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
     let param_count = graph.subgraphs[info.subgraph_id.0 as usize].param_count as usize;
-    let remaining_arity = (param_count - bound_args.len()) as u8;
+    let remaining_arity = param_count.saturating_sub(bound_args.len()) as u8;
     Value::ref_val(HeapObj::Partial(PartialApplication {
         func_id: info.subgraph_id.0,
         upvalues: Vec::new(),
@@ -2649,6 +2890,15 @@ pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// 当新参数数 < needed_arity → 产出新的 Partial（链式偏应用）；
 /// 当新参数数 >= needed_arity → 合并 bound_args + 新参数 + upvalues，设 pending_call。
+/// 解包 Cell 包装的 upvalue：若值是 Cell 则返回内部值的克隆，否则原样克隆。
+/// 用于 compute_closure_call 将 Cell upvalues 转为原始值注入子帧参数。
+fn unwrap_cell(v: &Value) -> Value {
+    match v.heap_obj() {
+        Some(crate::Value::HeapObj::Cell(cell)) => cell.get(),
+        _ => v.clone(),
+    }
+}
+
 pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
     use crate::Value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2669,10 +2919,13 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
         Some(HeapObj::Closure(c)) => {
             let total_params = graph.subgraphs[c.func_id as usize].param_count as usize;
             let needed = total_params.saturating_sub(c.upvalues.len());
-            (c.func_id, c.upvalues.clone(), Vec::new(), needed, c.self_upvalue_idx)
+            // 解包 Cell upvalues 为原始值注入参数（Cell 用于逃逸闭包的持久化回写）
+            let upvalues: Vec<Value> = c.upvalues.iter().map(|v| unwrap_cell(v)).collect();
+            (c.func_id, upvalues, Vec::new(), needed, c.self_upvalue_idx)
         }
         Some(HeapObj::Partial(p)) => {
-            (p.func_id, p.upvalues.clone(), p.bound_args.clone(), p.remaining_arity as usize, p.self_upvalue_idx)
+            let upvalues: Vec<Value> = p.upvalues.iter().map(|v| unwrap_cell(v)).collect();
+            (p.func_id, upvalues, p.bound_args.clone(), p.remaining_arity as usize, p.self_upvalue_idx)
         }
         _ => panic!("compute_closure_call: input is not callable (Closure or Partial)"),
     };
@@ -2713,6 +2966,7 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
         args,
         call_node_local,
         is_async: false,
+        closure_val: Some(callable_val.clone()),
     }));
 
     Value::VOID
@@ -2760,6 +3014,9 @@ pub fn noop_compute_real(_frame: &mut Frame, _node: NodeId) -> Value {
 /// prev_effect 仅作数据依赖边（顺序约束），确保前一个语句完成后才执行当前语句。
 pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
+    if n.input_count == 0 {
+        return Value::VOID;
+    }
     frame.get_value_by_global(inputs[n.input_count as usize - 1])
 }
 
@@ -2767,145 +3024,89 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// inputs[0] = 值来源（当前帧内节点），writeback_targets[node] = 外层全局 NodeId。
 /// 非阻塞：compute_fn 内直接完成写入，无 pending、无 Engine 层消费。
+///
+/// 三条回写路径（按优先级）：
+/// 1. parent_frame_ptr 链：同函数闭包调用，写入最近的包含 target 的父帧
+/// 2. root_frame_ptr：同函数闭包调用，写入函数根帧（使其他 same_function 调用可见）
+/// 3. closure_val Cell：逃逸闭包（跨函数调用，帧链为 null），通过 Cell 的 interior
+///    mutability 更新闭包 upvalues，使下次调用能读到最新值
 pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     let n = &graph.nodes[node.0 as usize];
+    if n.input_count == 0 {
+        return Value::VOID;
+    }
     let val_node = graph.inputs_pool.get(n.inputs_offset, n.input_count)[0];
     let val = frame.get_value_by_global(val_node);
     let target = graph.writeback_targets[node.0 as usize]
         .expect("WriteBack node missing target");
     let consumer_count = graph.downstreams[target.0 as usize].len() as u16;
 
-    // 遍历 parent_frame_ptr 链找到包含 target 的帧（可能在中层帧如循环体帧）
+    // 路径 1：遍历 parent_frame_ptr 链，写入第一个包含 target 的帧（最近的父帧）。
+    // SAFETY: parent_frame_ptr 指向同函数帧（setup_frame_chain 设置），
+    // caller 帧在 callee 执行期间处于 Suspended 状态，无并发访问。
+    let mut written_parent = false;
     let mut ptr = frame.parent_frame_ptr;
-    let mut found = false;
     while !ptr.is_null() {
-        // SAFETY: ptr 指向 FramePool 中的同函数帧，引擎单线程执行，
-        // caller 帧在 callee 执行期间处于 Suspended 状态，无并发访问。
-        // SharedEngine 路径下 parent_frame_ptr 恒为 null，此循环不执行。
         let f = unsafe { &mut *ptr };
         let local = target.0.wrapping_sub(f.node_offset);
         if (local as usize) < f.value_table.len() {
             f.set_value(NodeId(local), val.clone(), consumer_count);
-            found = true;
+            written_parent = true;
             break;
         }
         ptr = f.parent_frame_ptr;
     }
-    // 回退到 root_frame_ptr（函数根帧）
-    if !found && !frame.root_frame_ptr.is_null() {
-        // SAFETY: root_frame_ptr 指向函数根帧（同 FramePool），单线程下无并发访问。
-        // SharedEngine 路径下 root_frame_ptr 恒为 null，此分支不执行。
+
+    // 路径 2：写入 root_frame_ptr（函数根帧），使同函数闭包调用能从根帧读到最新值。
+    if !frame.root_frame_ptr.is_null() {
         let root = unsafe { &mut *frame.root_frame_ptr };
         let local = target.0.wrapping_sub(root.node_offset);
         if (local as usize) < root.value_table.len() {
             root.set_value(NodeId(local), val.clone(), consumer_count);
+        } else {
+            debug_assert!(false, "writeback target {:?} out of root frame range", target);
+        }
+    } else if !written_parent {
+        // 路径 3：逃逸闭包（帧链为 null）— 通过 closure_val 的 Cell 回写 upvalue。
+        // 逃逸闭包跨函数调用时，parent/root 均为 null，无法通过帧链回写。
+        // closure_val 中的 upvalues 以 Cell 包装（compute_closure_construct），
+        // 通过 Cell::set 持久化修改，使下次调用能读到最新值。
+        let mut written_cell = false;
+        if let Some(ref closure_val) = frame.closure_val {
+            if let Value::Ref(arc) = closure_val {
+                let upvalues: &[Value] = match arc.as_ref() {
+                    crate::Value::HeapObj::Closure(c) => &c.upvalues,
+                    crate::Value::HeapObj::Partial(p) => &p.upvalues,
+                    _ => &[],
+                };
+                if !upvalues.is_empty() {
+                    let sg = &frame.graph.subgraphs[frame.subgraph_id.0 as usize];
+                    for (i, &outer_node) in sg.upvalue_outer_nodes.iter().enumerate() {
+                        if outer_node == target && i < upvalues.len() {
+                            if let Some(crate::Value::HeapObj::Cell(cell)) = upvalues[i].heap_obj() {
+                                cell.set(val.clone());
+                                written_cell = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // 路径 4：非逃逸闭包的根帧场景（顶层函数内的赋值），写入当前帧
+        if !written_cell {
+            let local = target.0.wrapping_sub(frame.node_offset);
+            if (local as usize) < frame.value_table.len() {
+                frame.set_value(NodeId(local), val.clone(), consumer_count);
+            } else {
+                debug_assert!(false, "writeback target {:?} out of current frame range", target);
+            }
         }
     }
     val
 }
 
-// =========================================================================
-// FramePool — 帧池
-// =========================================================================
-
-/// 帧池：管理帧的分配与访问。
-pub struct FramePool {
-    frames: Vec<Box<Frame>>,
-    next_id: u32,
-    graph: std::sync::Arc<DataFlowGraph>,
-    /// 空闲帧列表：free 时加入，alloc 时优先复用。
-    /// 避免深度递归时 frames Vec 无限增长导致内存耗尽。
-    free_list: Vec<FrameId>,
-}
-
-impl FramePool {
-    pub fn new(graph: std::sync::Arc<DataFlowGraph>) -> Self {
-        Self {
-            frames: Vec::new(),
-            next_id: 0,
-            graph,
-            free_list: Vec::new(),
-        }
-    }
-
-    /// 分配新帧，返回 FrameId。
-    /// 优先从 free_list 复用已释放的帧，避免 Vec 无限增长。
-    pub fn alloc(&mut self, subgraph_id: SubGraphId, node_count: usize) -> FrameId {
-        // 优先复用空闲帧
-        if let Some(id) = self.free_list.pop() {
-            let frame = self.frames[id.0 as usize].as_mut();
-            // 重置帧以复用：保留 id 和 graph，复用现有 Vec 仅在尺寸不匹配时 resize
-            frame.subgraph_id = subgraph_id;
-            if frame.value_table.len() != node_count {
-                frame.value_table.resize(node_count);
-            }
-            if frame.pending_inputs.len() != node_count {
-                frame.pending_inputs.resize(node_count, 0);
-            }
-            frame.ready_queue.clear();
-            frame.state = FrameState::Ready;
-            frame.caller = None;
-            frame.node_offset = 0;
-            frame.control_signal = ControlSignal::None;
-            frame.suspend_state = SuspendState::NotSuspended;
-            frame.suspend_event = None;
-            frame.pending = None;
-            frame.defer_stack.clear();
-            frame.select_timers.clear();
-            frame.root_frame_ptr = std::ptr::null_mut();
-            frame.parent_frame_ptr = std::ptr::null_mut();
-            frame.body_frame_id = None;
-            return id;
-        }
-
-        assert!(self.next_id < u32::MAX, "FrameId overflow: too many frames allocated");
-        let id = FrameId(self.next_id);
-        self.next_id += 1;
-        let frame = Frame::new(id, subgraph_id, node_count, self.graph.clone());
-        if id.0 as usize >= self.frames.len() {
-            self.frames.resize_with(id.0 as usize + 1, || {
-                Box::new(Frame::new(FrameId(0), SubGraphId(0), 0, self.graph.clone()))
-            });
-        }
-        self.frames[id.0 as usize] = Box::new(frame);
-        id
-    }
-
-    /// 获取帧的可变引用。
-    pub fn get_mut(&mut self, id: FrameId) -> &mut Frame {
-        self.frames[id.0 as usize].as_mut()
-    }
-
-    /// 获取帧的不可变引用。
-    pub fn get(&self, id: FrameId) -> &Frame {
-        self.frames[id.0 as usize].as_ref()
-    }
-
-    /// 释放帧：清空 value_table（堆对象 Arc 自动 decref），重置状态。
-    ///
-    /// spec 4.3 complete_subgraph 末尾 `engine.frames.free(child)`。
-    /// spec 4.7 帧级兜底：遍历 slot，ready 的堆对象 decref（Rust Arc Drop 自动完成）。
-    pub fn free(&mut self, id: FrameId) {
-        let frame = self.frames[id.0 as usize].as_mut();
-        // 清空 value_table：持有堆对象的 Arc<HeapObj> Drop 时自动 decref
-        frame.value_table.reset_all();
-        frame.ready_queue.clear();
-        frame.state = FrameState::Completed;
-        frame.control_signal = ControlSignal::None;
-        frame.suspend_state = SuspendState::NotSuspended;
-        frame.suspend_event = None;
-        frame.pending = None;
-        frame.defer_stack.clear();
-        // 加入空闲列表，供后续 alloc 复用
-        self.free_list.push(id);
-    }
-
-    /// 取出所有帧（用于 SharedEngine::from_engine 将帧迁移到 HashMap）。
-    pub fn drain_frames(&mut self) -> Vec<Frame> {
-        self.frames.drain(..).map(|b| *b).collect()
-    }
-}
 
 // =========================================================================
 // TimerRuntime / AsyncJoinRuntime — 图外运行时
@@ -3030,7 +3231,7 @@ impl Default for AsyncJoinRuntime {
 }
 
 // =========================================================================
-// SIMD/rayon 批量化调度 — 模块级宏 + 自由函数（供 Engine 和 SharedEngine 共用）
+// SIMD/rayon 批量化调度 — 模块级宏 + 自由函数
 // =========================================================================
 
 /// 批量提取二元运算输入 → SIMD/rayon 批算 → 写回 value_table。
@@ -3177,7 +3378,7 @@ fn process_batch_group(
     // 通知所有批处理节点的下游
     for &lid in locals {
         let gid = NodeId(lid.0 + node_start.0);
-        notify_downstream_shared(frame, graph, lid, gid, node_start);
+        notify_downstream(frame, graph, lid, gid, node_start);
     }
     true
 }
@@ -3204,7 +3405,8 @@ fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {
             continue;
         }
         let gid = NodeId(lid.0 + node_start);
-        if let Some(info) = graph.batch_infos[gid.0 as usize] {
+        let batch_info = graph.batch_infos[gid.0 as usize];
+        if let Some(info) = batch_info {
             if let Some(g) = groups.iter_mut().find(|(k, _)| *k == info) {
                 g.1.push(lid);
             } else {
@@ -3242,1383 +3444,11 @@ fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {
 }
 
 // =========================================================================
-// Engine — 执行引擎
-// =========================================================================
-
-/// 引擎：持有图 + 值 arena + 帧池，执行就绪调度。
-pub struct Engine {
-    /// 数据流图（只读共享，Arc 包装供帧共享）
-    pub graph: std::sync::Arc<DataFlowGraph>,
-    /// 值 arena（保留给反射使用，compute_fn 不再使用）
-    pub arena: ValueArena,
-    /// 帧池
-    pub frames: FramePool,
-    /// 就绪帧队列（挂起恢复后可继续执行的帧 + 新启动的子帧）
-    pub ready_frames: std::collections::VecDeque<FrameId>,
-    /// 事件等待者：挂起帧等待的运行时事件（如 SubgraphComplete）
-    pub event_waiters: Vec<(crate::Ir::RuntimeEvent, FrameId)>,
-    /// Timer 运行时（图外）
-    pub timer_runtime: TimerRuntime,
-    /// AsyncJoin 运行时（async 调用完成事件管理）
-    pub async_join_runtime: AsyncJoinRuntime,
-}
-
-impl Engine {
-    /// 创建新 Engine。
-    pub fn new(graph: DataFlowGraph) -> Self {
-        let graph = std::sync::Arc::new(graph);
-        Self {
-            graph: graph.clone(),
-            arena: ValueArena::new(),
-            frames: FramePool::new(graph),
-            ready_frames: std::collections::VecDeque::new(),
-            event_waiters: Vec::new(),
-            timer_runtime: TimerRuntime::new(),
-            async_join_runtime: AsyncJoinRuntime::new(),
-        }
-    }
-
-    /// 分配常量值的 Value。
-    fn alloc_const_value(&mut self, cv: ConstValue) -> Value {
-        match cv {
-            ConstValue::I8(v) => Value::i8(v),
-            ConstValue::I16(v) => Value::i16(v),
-            ConstValue::I32(v) => Value::i32(v),
-            ConstValue::I64(v) => Value::i64(v),
-            ConstValue::I128(v) => Value::i128(v),
-            ConstValue::U8(v) => Value::u8(v),
-            ConstValue::U16(v) => Value::u16(v),
-            ConstValue::U32(v) => Value::u32(v),
-            ConstValue::U64(v) => Value::u64(v),
-            ConstValue::U128(v) => Value::u128(v),
-            ConstValue::Isize(v) => Value::isize_val(v),
-            ConstValue::Usize(v) => Value::usize_val(v),
-            ConstValue::F32(v) => Value::f32(v),
-            ConstValue::F64(v) => Value::f64(v),
-            ConstValue::Bool(v) => Value::bool_val(v),
-            ConstValue::Char(c) => Value::char_val(char::from_u32(c).unwrap_or('\0')),
-            ConstValue::Null => Value::NULL,
-            ConstValue::Void => Value::VOID,
-            ConstValue::Str(s) => {
-                use crate::Value::{HeapObj, GlueStr};
-                Value::ref_val(HeapObj::Str(GlueStr::new(s)))
-            }
-        }
-    }
-
-    /// 初始化帧：预填充 Const 值 + 初始化 pending_inputs + 就绪队列。
-    ///
-    /// 帧内节点用局部 NodeId（从 0 开始），图节点用全局 NodeId。
-    /// 转换：local_id = global_id - node_range.start
-    pub fn init_frame(&mut self, subgraph_id: SubGraphId) -> FrameId {
-        let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
-        let node_count = (node_end.0 - node_start.0) as usize;
-
-        let fid = self.frames.alloc(subgraph_id, node_count);
-        self.prepare_frame(fid, node_start, node_count);
-        fid
-    }
-
-    /// 帧节点初始化共享逻辑：设置 node_offset + pending_inputs + 预填充 Const + Gate 入就绪队列。
-    ///
-    /// init_frame 和 start_subgraph 都调用此方法，确保子图启动时 Const 节点预填充、
-    /// Gate 节点入就绪队列的行为一致。start_subgraph 在此之后注入参数（覆盖参数节点的值）。
-    ///
-    /// 嵌套子图节点跳过：编译期 compile_function 将嵌套子图的节点（如 while_sg 的 cond/gate、
-    /// body_sg 的 Call）包含在父子图 node_range 内，但它们应在子帧中执行，不应在父帧中预填充
-    /// 或就绪。通过检查节点是否落在其他子图的 node_range 内来跳过。
-    fn prepare_frame(&mut self, fid: FrameId, node_start: NodeId, node_count: usize) {
-        let offset = node_start.0 as usize;
-        let sg_id = self.frames.get(fid).subgraph_id;
-        let node_end_global = node_start.0 + node_count as u32;
-
-        // 清空 value_table + ready_queue（帧复用时必须重置，避免旧值残留）
-        let frame = self.frames.get_mut(fid);
-        frame.value_table.reset_all();
-        frame.ready_queue.clear();
-        frame.control_signal = ControlSignal::None;
-        frame.pending = None;
-
-        // 收集嵌套子图范围（在当前子图 node_range 内但属于其他子图的节点范围）
-        let nested_ranges: Vec<(u32, u32)> = self
-            .graph
-            .subgraphs
-            .iter()
-            .filter(|sg| {
-                sg.id != sg_id
-                    && sg.node_range.0 .0 >= node_start.0
-                    && sg.node_range.1 .0 <= node_end_global
-            })
-            .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
-            .collect();
-
-        let is_nested = |global_idx: u32| -> bool {
-            nested_ranges
-                .iter()
-                .any(|&(s, e)| global_idx >= s && global_idx < e)
-        };
-
-        // 设置 node_offset（全局 NodeId → 局部 NodeId 转换用）
-        self.frames.get_mut(fid).node_offset = node_start.0;
-
-        // 1. 初始化 pending_inputs（嵌套节点设为 MAX 永不就绪）
-        let frame = self.frames.get_mut(fid);
-        for i in 0..node_count {
-            if is_nested((offset + i) as u32) {
-                frame.pending_inputs[i] = u8::MAX;
-            } else {
-                let graph_node = &self.graph.nodes[offset + i];
-                // EventSource 声明节点永不就绪（spec 4.4：事件源不进就绪队列）
-                if graph_node.kind == NodeKind::EventSource {
-                    frame.pending_inputs[i] = u8::MAX;
-                } else {
-                    // 统一通过 inputs 计算 pending_inputs（包括 Gate 节点）。
-                    // Gate 的 inputs 包含 condition_input 和 current_effect（如有），
-                    // 确保 Gate 在条件和前序副作用都完成后才就绪。
-                    // 只统计当前帧内的输入（外层节点通过 root_frame_ptr 读取，
-                    // 不计入 pending — 外层节点在不同帧，不会通过 notify_downstream 通知）
-                    let inputs = self.graph.inputs_pool.get(
-                        graph_node.inputs_offset,
-                        graph_node.input_count,
-                    );
-                    let in_frame = inputs
-                        .iter()
-                        .filter(|&&n| (n.0.wrapping_sub(node_start.0) as usize) < node_count)
-                        .count() as u8;
-                    frame.pending_inputs[i] = in_frame;
-                }
-            }
-        }
-
-        // 2. 预填充 Const 节点（跳过嵌套节点；Gate 节点不在此入队——其就绪由
-        //    condition_input 通过 downstreams 机制驱动）
-        for i in 0..node_count {
-            if is_nested((offset + i) as u32) {
-                continue;
-            }
-            let kind = self.graph.nodes[offset + i].kind;
-            if kind == NodeKind::Const {
-                if let Some(cv) = self.graph.const_values[offset + i] {
-                    let handle = self.alloc_const_value(cv);
-                    let local_id = NodeId(i as u32);
-                    let consumer_count = self.graph.downstreams[offset + i].len() as u16;
-                    let frame = self.frames.get_mut(fid);
-                    frame.set_value(local_id, handle, consumer_count);
-                    frame.push_ready(local_id);
-                }
-            }
-        }
-
-        // 3. 非 Const 节点 with 0 inputs 入就绪队列
-        //    （如无参 async call、无参函数入口等）
-        //    EventSource 节点 pending_inputs=MAX，不会满足条件
-        //    Param 节点（index < param_count）跳过：由 start_subgraph 注入值 + 入队
-        let param_count = self.graph.subgraphs[sg_id.0 as usize].param_count as usize;
-        for i in 0..node_count {
-            if i < param_count {
-                continue; // param 节点由 start_subgraph 处理
-            }
-            if is_nested((offset + i) as u32) {
-                continue;
-            }
-            let kind = self.graph.nodes[offset + i].kind;
-            if kind == NodeKind::Const {
-                continue; // 已在步骤 2 处理
-            }
-            let frame = self.frames.get_mut(fid);
-            if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
-                frame.push_ready(NodeId(i as u32));
-            }
-        }
-
-    }
-
-    /// 通知下游节点：减 pending_inputs，归零则入就绪队列。
-    /// 同时调用生产者槽的 consume()（槽级 RC），归零则清槽。
-    ///
-    /// spec 4.7：每通知一个下游就 refcount -= 1（无论下游是否就绪）。
-    fn notify_downstream(
-        &mut self,
-        fid: FrameId,
-        producer_local: NodeId,
-        producer_graph: NodeId,
-        node_start: NodeId,
-    ) {
-        let downstreams: Vec<NodeId> =
-            self.graph.downstreams[producer_graph.0 as usize].clone();
-        let pending_len = self.frames.get(fid).pending_inputs.len();
-        for ds_graph_id in downstreams {
-            let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
-            // 跳过跨子图的下游（属于其他子图的节点，由各自帧处理）
-            if ds_local_id.0 as usize >= pending_len {
-                continue;
-            }
-            let frame = self.frames.get_mut(fid);
-
-            // 槽级 RC：每通知一个下游就 consume()（spec 4.7）
-            let pidx = producer_local.0 as usize;
-            let still_has_consumers = frame.value_table.consume(pidx);
-            if !still_has_consumers && frame.value_table.ready[pidx] {
-                // 生产者槽归零，清槽（堆对象 Arc Drop 自动 decref，槽可复用）
-                frame.value_table.ready[pidx] = false;
-            }
-
-            // 减下游 pending_inputs，归零则入就绪队列
-            if frame.pending_inputs[ds_local_id.0 as usize] > 0 {
-                frame.pending_inputs[ds_local_id.0 as usize] -= 1;
-            }
-            let new_pending = frame.pending_inputs[ds_local_id.0 as usize];
-            let will_push = new_pending == 0 && !frame.value_table.ready[ds_local_id.0 as usize];
-            if will_push {
-                frame.push_ready(ds_local_id);
-            }
-        }
-    }
-
-    /// 执行帧内所有就绪节点，直到就绪队列空或帧挂起。
-    ///
-    /// spec 4.2 核心循环：统一 compute_fn 调用，无 match kind 分派。
-    /// Call/Gate 节点的 compute_fn 设置 frame.pending_call，核心循环检测后
-    /// 执行 start_subgraph + 帧挂起。
-    pub fn run_ready_nodes(&mut self, fid: FrameId) {
-        loop {
-            // 检查控制信号（return/break/continue 已触发）
-            let cs = self.frames.get(fid).control_signal.clone();
-            if !matches!(cs, ControlSignal::None) {
-                break;
-            }
-
-            // 检查帧是否被取消（spec 5.3：跳过节点执行，走 defer 清理）
-            if self.frames.get(fid).state == FrameState::Cancelling {
-                break;
-            }
-
-            // 检查帧是否挂起
-            if self.frames.get(fid).state == FrameState::Suspended {
-                return;
-            }
-
-            // SIMD/rayon 批量化：drain ready_queue → 按 (ScalarTag,BatchOp) 分组 → 批算
-            // 成功批处理时 continue（新就绪节点已通过 notify_downstream 入队）；
-            // 未批处理时 fall through 到单节点路径。
-            {
-                let graph = self.graph.clone();
-                let frame = self.frames.get_mut(fid);
-                if try_batch_nodes(frame, &graph) {
-                    continue;
-                }
-            }
-
-            // 弹出就绪节点（局部 id）
-            let local_id = match self.frames.get_mut(fid).pop_ready() {
-                Some(n) => n,
-                None => break,
-            };
-
-            let node_start = self.frames.get(fid).node_offset;
-            let graph_node_id = NodeId(local_id.0 + node_start);
-            let node = self.graph.nodes[graph_node_id.0 as usize];
-
-            // 预填充节点（Const 在 prepare_frame、Param 在 start_subgraph 已设值）：
-            // 跳过 compute_fn（Const 的 compute_fn 为 noop，会返回 VOID 覆盖预填充值），
-            // 直接复用预填充值。非预填充节点统一调用 compute_fn（spec 4.2：无 match kind 分派）。
-            let pre_filled = self.frames.get(fid).value_table.ready[local_id.0 as usize];
-            let value = if pre_filled {
-                self.frames.get(fid).value_table.values[local_id.0 as usize].clone()
-            } else if self.graph.safe_op_flags[graph_node_id.0 as usize] {
-                let inputs = self.graph.inputs_pool.get(node.inputs_offset, node.input_count);
-                let recv_val = self.frames.get(fid).get_value_by_global(inputs[0]);
-                if !inputs.is_empty() && matches!(recv_val, Value::Null) {
-                    Value::Null
-                } else {
-                    let compute_fn = self.graph.compute_fns[node.compute_fn.0 as usize];
-                    let frame = self.frames.get_mut(fid);
-                    compute_fn(frame, graph_node_id)
-                }
-            } else {
-                let compute_fn = self.graph.compute_fns[node.compute_fn.0 as usize];
-                let frame = self.frames.get_mut(fid);
-                compute_fn(frame, graph_node_id)
-            };
-
-            // vtable 动态分派：Call 节点有 vtable_call_methods 标记但无 call_target
-            //（compute_call_launch 未设 pending_call）→ 从 recv 的 TraitVal 运行时
-            // 查询方法子图，收集参数后设 pending_call，交由下方统一处理。
-            if self.frames.get(fid).pending.is_none() {
-                if let Some(method_idx) =
-                    self.graph.vtable_call_methods[graph_node_id.0 as usize]
-                {
-                    let n = &self.graph.nodes[graph_node_id.0 as usize];
-                    let inputs =
-                        self.graph.inputs_pool.get(n.inputs_offset, n.input_count);
-                    let recv_val = self.frames.get(fid).get_value_by_global(inputs[0]);
-
-                    // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
-                    let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
-                        Some(crate::Value::HeapObj::TraitVal(tv)) => {
-                            let idx = method_idx as usize;
-                            match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                                Some(crate::Value::HeapObj::Closure(c)) => {
-                                    (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
-                                }
-                                _ => panic!("vtable method_idx {} is not a Closure", method_idx),
-                            }
-                        }
-                        _ => panic!("vtable call on non-trait value"),
-                    };
-
-                    // 参数组装：跳过 receiver (inputs[0])，取方法实参 (inputs[1..1+arity])，
-                    // 再追加 Closure 携带的 upvalues，与子图参数节点顺序一致。
-                    let arity = (self.graph.subgraphs[target_sg.0 as usize].param_count as usize)
-                        .saturating_sub(upvalues.len());
-                    let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
-                    for &in_node in inputs.iter().skip(1).take(arity) {
-                        args.push(self.frames.get(fid).get_value_by_global(in_node));
-                    }
-                    args.extend(upvalues);
-
-                    let call_node_local =
-                        NodeId(graph_node_id.0 - self.frames.get(fid).node_offset);
-                    self.frames.get_mut(fid).pending = Some(Pending::Call(PendingCall {
-                        target_sg,
-                        args,
-                        call_node_local,
-                        is_async: false,
-                    }));
-                }
-            }
-
-            // 统一消费 pending（compute_fn 产出，调度器消费）
-            let pending = self.frames.get_mut(fid).pending.take();
-            if let Some(pending) = pending {
-                match pending {
-                crate::Ir::Pending::Call(pending) => {
-
-                // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
-                let node_start = self.frames.get(fid).node_offset;
-                let graph_call_id = NodeId(pending.call_node_local.0 + node_start);
-                if self.graph.tail_call_flags[graph_call_id.0 as usize] {
-                    // 分支中的尾调用传播：当 caller 是 Gate 且非 LoopBody 时，
-                    // 分支帧的 switch_subgraph 会创建 O(n) 分支帧链。
-                    // 解决：释放父帧（函数帧），将分支帧的 caller 更新为原始调用方，
-                    // 然后在分支帧上 switch_subgraph。这样 O(1) 帧即可完成深度递归。
-                    let caller = self.frames.get(fid).caller;
-                    let propagate_to_parent = if let Some((caller_fid, call_node)) = caller {
-                        let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
-                        let caller_loop_kind = self.graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
-                        let caller_has_caller = self.frames.get(caller_fid).caller.is_some();
-                        let caller_offset = self.frames.get(caller_fid).node_offset;
-                        let caller_graph_node = NodeId(call_node.0 + caller_offset);
-                        let caller_is_gate = self.graph.nodes[caller_graph_node.0 as usize].kind == NodeKind::Gate;
-                        caller_is_gate
-                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
-                            && caller_has_caller
-                    } else {
-                        false
-                    };
-
-                    if propagate_to_parent {
-                        let (caller_fid, _) = caller.unwrap();
-                        // 获取函数帧的 caller（原始调用方）
-                        let orig_caller = self.frames.get(caller_fid).caller;
-                        // 清理函数帧的 event_waiters（函数帧被释放，不再等待子图完成）
-                        self.event_waiters.retain(|(_, f)| *f != caller_fid);
-                        // 释放函数帧（它永远不会恢复）
-                        self.frames.free(caller_fid);
-                        // 更新分支帧的 caller 为原始调用方
-                        self.frames.get_mut(fid).caller = orig_caller;
-                        // 切换分支帧为目标子图
-                        self.switch_subgraph(fid, pending.target_sg, &pending.args);
-                    } else {
-                        // 直接尾调用（函数体顶层）或根帧分支：切换当前帧
-                        self.switch_subgraph(fid, pending.target_sg, &pending.args);
-                    }
-                    continue; // 帧已重置为目标子图，继续执行新就绪节点
-                }
-
-                let target_loop_kind =
-                    self.graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
-
-                // LoopBody 帧复用：循环体子图已分配过帧时复用，避免每轮创建新帧（O(1) 内存）
-                let child_fid = if target_loop_kind == crate::Ir::LoopKind::LoopBody {
-                    if let Some(bfid) = self.frames.get(fid).body_frame_id {
-                        // 复用 body_sg 帧：注入参数 + 入就绪队列
-                        let target_sg = &self.graph.subgraphs[pending.target_sg.0 as usize];
-                        let offset = target_sg.node_range.0 .0 as usize;
-                        let param_count = target_sg.param_count as usize;
-                        for (i, arg) in pending.args.iter().enumerate().take(param_count) {
-                            let local_id = NodeId(i as u32);
-                            let consumer_count =
-                                self.graph.downstreams[offset + i].len() as u16;
-                            let frame = self.frames.get_mut(bfid);
-                            frame.set_value(local_id, arg.clone(), consumer_count);
-                            frame.push_ready(local_id);
-                        }
-                        // 重新绑定 caller（Gate 节点 local id）
-                        self.frames.get_mut(bfid).caller =
-                            Some((fid, pending.call_node_local));
-                        // 重新设置 parent_frame_ptr（指向循环帧）
-                        self.frames.get_mut(bfid).parent_frame_ptr =
-                            self.frames.get_mut(fid) as *mut crate::Ir::Frame;
-                        self.frames.get_mut(bfid).state = FrameState::Ready;
-                        bfid
-                    } else {
-                        // 首次创建 body_sg 帧
-                        let bfid = self.start_subgraph(
-                            fid,
-                            pending.call_node_local,
-                            pending.target_sg,
-                            &pending.args,
-                        );
-                        self.frames.get_mut(fid).body_frame_id = Some(bfid);
-                        bfid
-                    }
-                } else {
-                    // 非 LoopBody：正常 start_subgraph
-                    self.start_subgraph(
-                        fid,
-                        pending.call_node_local,
-                        pending.target_sg,
-                        &pending.args,
-                    )
-                };
-
-                // 子帧入就绪帧队列
-                self.ready_frames.push_back(child_fid);
-
-                if pending.is_async {
-                    // async call：当前帧不挂起，call 节点写 AsyncHandle（i32 标量）+ 通知下游
-                    let async_id = self.async_join_runtime.alloc_id();
-                    let async_handle = Value::i32(async_id.0 as i32);
-                    self.async_join_runtime.register(async_id, child_fid);
-
-                    let node_start = self.frames.get(fid).node_offset;
-                    let graph_node_id = NodeId(pending.call_node_local.0 + node_start);
-                    let consumer_count = self.graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                    self.frames.get_mut(fid).set_value(pending.call_node_local, async_handle, consumer_count);
-                    self.notify_downstream(fid, pending.call_node_local, graph_node_id, NodeId(node_start));
-                    // 不挂起，继续循环执行其他就绪节点
-                    continue;
-                } else {
-                    // sync call：当前帧挂起等 SubgraphComplete 事件
-                    self.event_waiters.push((RuntimeEvent::SubgraphComplete(child_fid), fid));
-                    let frame = self.frames.get_mut(fid);
-                    frame.state = FrameState::Suspended;
-                    frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
-                    frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
-                    return; // 帧挂起，不执行 defer，不标记 Completed
-                }
-                }
-
-                crate::Ir::Pending::ChannelNotify(ch_id) => {
-                    self.on_event_arrived(RuntimeEvent::ChannelReady(ch_id), Value::VOID);
-                }
-
-                crate::Ir::Pending::Await(pending) => {
-
-                // 解析事件源 id + 检查就绪
-                let (event, ready_value) = self.resolve_and_check_await(&pending);
-
-                if let Some(value) = ready_value {
-                    // 就绪：注入值到 await 节点 + 通知下游 + 继续执行
-                    let node_start = self.frames.get(fid).node_offset;
-                    let graph_node_id = NodeId(pending.await_node_local.0 + node_start);
-                    let consumer_count = self.graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                    self.frames.get_mut(fid).set_value(pending.await_node_local, value, consumer_count);
-                    self.notify_downstream(fid, pending.await_node_local, graph_node_id, NodeId(node_start));
-                    // 不挂起，继续循环
-                    continue;
-                } else {
-                    // 未就绪：帧挂起，立即注册 event_waiters（与 select 帧一致，
-                    // 保证 run_ready_nodes 单独调用时状态与等待表原子更新）
-                    self.event_waiters.push((event, fid));
-                    let frame = self.frames.get_mut(fid);
-                    frame.state = FrameState::Suspended;
-                    frame.suspend_state = SuspendState::WaitingEvent(pending.await_node_local);
-                    frame.suspend_event = Some(event);
-                    return; // 帧挂起
-                }
-                }
-
-                crate::Ir::Pending::Cancel(async_id) => {
-                // 从 AsyncJoinRuntime 查 child_fid → cancel_frame
-                if let Some(child_fid) = self.async_join_runtime.find_child_by_async_id(async_id) {
-                    self.cancel_frame(child_fid);
-                }
-                // 返回 Void，通知下游继续
-                let consumer_count = self.graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                self.frames.get_mut(fid).set_value(local_id, Value::VOID, consumer_count);
-                self.notify_downstream(fid, local_id, graph_node_id, NodeId(node_start));
-                    continue;
-                }
-
-                crate::Ir::Pending::SelectWait(gate_local) => {
-
-                // clone SelectInfo 避免持有 graph 借用时访问 frames
-                let info = self.graph.select_infos[graph_node_id.0 as usize].clone();
-
-                if let Some(info) = info {
-                    // 检查每个分支事件源是否就绪
-                    let mut ready_branch: Option<SubGraphId> = None;
-                    for (branch_idx, branch) in info.branches.iter().enumerate() {
-                        let event_val =
-                            self.frames.get(fid).get_value_by_global(branch.event_source_node);
-                        let is_ready = match branch.event_kind {
-                            EventSourceKind::Channel => {
-                                // channel 就绪条件：有数据 OR 已关闭（closed+空 → recv 返回 null，分支立即就绪）
-                                event_val.heap_obj()
-                                    .and_then(|h| h.channel())
-                                    .map_or(false, |ch| ch.has_data() || ch.is_closed())
-                            }
-                            EventSourceKind::Timer => {
-                                // Timer 分支：首次检查时启动 timer，后续用缓存的 timer_id
-                                let timer_id = {
-                                    let frame = self.frames.get(fid);
-                                    if let Some((_, tid)) =
-                                        frame.select_timers.iter().find(|(idx, _)| *idx == branch_idx)
-                                    {
-                                        *tid
-                                    } else {
-                                        // 首次：从 event_source_node 取 duration（i32 毫秒）→ 启动 timer
-                                        let duration_ms = event_val.as_i32();
-                                        let tid = self
-                                            .timer_runtime
-                                            .start(std::time::Duration::from_millis(
-                                                duration_ms as u64,
-                                            ));
-                                        // 缓存到 frame.select_timers
-                                        self.frames
-                                            .get_mut(fid)
-                                            .select_timers
-                                            .push((branch_idx, tid));
-                                        tid
-                                    }
-                                };
-                                self.timer_runtime.is_fired(timer_id)
-                            }
-                            _ => false,
-                        };
-                        if is_ready {
-                            ready_branch = Some(branch.subgraph_id);
-                            break;
-                        }
-                    }
-
-                    if let Some(sg_id) = ready_branch {
-                        // 有就绪分支：启动分支子图
-                        let child_fid = self.start_subgraph(fid, gate_local, sg_id, &[]);
-                        self.ready_frames.push_back(child_fid);
-                        // 当前帧挂起等子图完成
-                        self.event_waiters.push((RuntimeEvent::SubgraphComplete(child_fid), fid));
-                        let frame = self.frames.get_mut(fid);
-                        frame.state = FrameState::Suspended;
-                        frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
-                        frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
-                        return;
-                    } else {
-                        // 无就绪分支：注册所有事件等待 + 帧挂起
-                        for (branch_idx, branch) in info.branches.iter().enumerate() {
-                            let event_val = self
-                                .frames
-                                .get(fid)
-                                .get_value_by_global(branch.event_source_node);
-                            match branch.event_kind {
-                                EventSourceKind::Channel => {
-                                    // channel 分支：从 event_source_node 取底层 channel。
-                                    // event_source_node 可能在父帧（通过 root_frame_ptr 访问），
-                                    // 若值为 Null（尚未求值或不可见），跳过该分支的等待注册。
-                                    if let Some(ch) = event_val.heap_obj().and_then(|h| h.channel()) {
-                                        self.event_waiters.push((
-                                            RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id())),
-                                            fid,
-                                        ));
-                                    }
-                                }
-                                EventSourceKind::Timer => {
-                                    // 用已启动的真实 timer_id 注册事件等待
-                                    let timer_id = self
-                                        .frames
-                                        .get(fid)
-                                        .select_timers
-                                        .iter()
-                                        .find(|(idx, _)| *idx == branch_idx)
-                                        .map(|(_, tid)| *tid)
-                                        .expect("select timer should be started above");
-                                    self.event_waiters.push((RuntimeEvent::TimerFired(timer_id), fid));
-                                }
-                                _ => {}
-                            }
-                        }
-                        let frame = self.frames.get_mut(fid);
-                        frame.state = FrameState::Suspended;
-                        frame.suspend_state = SuspendState::WaitingEvent(gate_local);
-                        // select 等多个事件，不设单一 suspend_event
-                        frame.suspend_event = None;
-                        return;
-                    }
-                }
-                }
-                }
-            }
-
-            // 普通节点：写值表 + 检查控制信号 + 通知下游
-            let consumer_count = self.graph.downstreams[graph_node_id.0 as usize].len() as u16;
-            self.frames.get_mut(fid).set_value(local_id, value.clone(), consumer_count);
-
-            // 检查控制信号
-            let signal_kind = self.graph.control_signal_nodes[graph_node_id.0 as usize];
-            if let Some(kind) = signal_kind {
-                let frame = self.frames.get_mut(fid);
-                frame.control_signal = match kind {
-                    SignalKind::Return => ControlSignal::Return(value),
-                    SignalKind::Break => ControlSignal::Break,
-                    SignalKind::Continue => ControlSignal::Continue,
-                };
-                break;
-            }
-
-            // 通知下游（含槽级 RC）
-            self.notify_downstream(fid, local_id, graph_node_id, NodeId(node_start));
-        }
-
-        // 帧挂起：不执行 defer，不标记 Completed
-        if self.frames.get(fid).state == FrameState::Suspended {
-            return;
-        }
-
-        // 帧被取消：执行 defer 清理 + 标记 Failed（spec 5.3）
-        if self.frames.get(fid).state == FrameState::Cancelling {
-            let defer_entries: Vec<DeferEntry> = {
-                let sg_id = self.frames.get(fid).subgraph_id;
-                self.graph.subgraphs[sg_id.0 as usize].defer_table.clone()
-            };
-            for entry in defer_entries.iter().rev() {
-                let defer_fid = self.init_frame(entry.body_subgraph);
-                self.run_ready_nodes(defer_fid);
-            }
-            self.frames.get_mut(fid).state = FrameState::Failed;
-            return;
-        }
-
-        // 执行 defer_stack（LIFO）：任何终止路径都执行 defer
-        let defer_entries: Vec<DeferEntry> = {
-            let sg_id = self.frames.get(fid).subgraph_id;
-            self.graph.subgraphs[sg_id.0 as usize].defer_table.clone()
-        };
-        for entry in defer_entries.iter().rev() {
-            let defer_fid = self.init_frame(entry.body_subgraph);
-            self.run_ready_nodes(defer_fid);
-        }
-
-        // 标记帧完成
-        self.frames.get_mut(fid).state = FrameState::Completed;
-    }
-
-    /// 提取子帧返回值：优先取 control_signal 的 Return 值，否则取 return_node 值。
-    ///
-    /// Break/Continue 信号：循环体帧终止时返回 VOID（循环退出值）。
-    /// 正常 Glue 语义中 continue 不会到达此处（continue 编译为尾递归 Call + Return 信号），
-    /// 但作为防御，Break/Continue 统一返回 VOID。
-    fn extract_child_return(&self, child_fid: FrameId) -> Value {
-        let child = self.frames.get(child_fid);
-        match &child.control_signal {
-            ControlSignal::Return(v) => v.clone(),
-            ControlSignal::Break | ControlSignal::Continue => Value::VOID,
-            ControlSignal::None => {
-                let sg = &self.graph.subgraphs[child.subgraph_id.0 as usize];
-                let rn = sg.return_node;
-                child.get_value_by_global(rn)
-            }
-        }
-    }
-
-    /// 启动子图（call 节点调用）。
-    ///
-    /// 1. 创建子帧
-    /// 2. 参数注入入口节点
-    /// 3. 绑定 caller
-    /// 4. 返回子帧 id
-    pub fn start_subgraph(
-        &mut self,
-        caller_fid: FrameId,
-        call_node: NodeId,
-        subgraph_id: SubGraphId,
-        args: &[Value],
-    ) -> FrameId {
-        let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
-        let node_count = (node_end.0 - node_start.0) as usize;
-        let offset = node_start.0 as usize;
-
-        let child_fid = self.frames.alloc(subgraph_id, node_count);
-
-        // 共享初始化：node_offset + pending_inputs + Const 预填充 + Gate 入就绪队列
-        self.prepare_frame(child_fid, node_start, node_count);
-
-        // 参数注入（前 param_count 个节点，覆盖参数节点的预填充值）
-        // 与 switch_subgraph / LoopBody 复用路径统一：用 param_count 限制注入数量
-        let param_count = self.graph.subgraphs[subgraph_id.0 as usize].param_count as usize;
-        for (i, arg) in args.iter().enumerate().take(param_count) {
-            let local_id = NodeId(i as u32);
-            let consumer_count = self.graph.downstreams[offset + i].len() as u16;
-            let frame = self.frames.get_mut(child_fid);
-            frame.set_value(local_id, arg.clone(), consumer_count);
-            frame.push_ready(local_id);
-        }
-
-        // 绑定 caller
-        self.frames.get_mut(child_fid).caller = Some((caller_fid, call_node));
-
-        // 设置 root_frame_ptr：同函数子图继承函数根帧，跨函数调用设为 null
-        let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
-        let same_function = self.graph.subgraphs[caller_sg_id.0 as usize].function_id
-            == self.graph.subgraphs[subgraph_id.0 as usize].function_id;
-        let caller_root_ptr = self.frames.get(caller_fid).root_frame_ptr;
-        let root_ptr = if same_function {
-            if caller_root_ptr.is_null() {
-                // caller 是函数根帧，指向 caller
-                self.frames.get_mut(caller_fid) as *mut crate::Ir::Frame
-            } else {
-                caller_root_ptr
-            }
-        } else {
-            std::ptr::null_mut()
-        };
-        self.frames.get_mut(child_fid).root_frame_ptr = root_ptr;
-
-        // 设置 parent_frame_ptr：指向直接调用方帧，用于 get_value_by_global 遍历中间帧
-        let parent_ptr = if same_function {
-            self.frames.get_mut(caller_fid) as *mut crate::Ir::Frame
-        } else {
-            std::ptr::null_mut()
-        };
-        self.frames.get_mut(child_fid).parent_frame_ptr = parent_ptr;
-
-        child_fid
-    }
-
-    /// 尾调用图跳转：复用当前帧执行目标子图（帧池零分配）。
-    ///
-    /// 编译期 tail_call_flags 标记的 Call 节点，运行时不再 start_subgraph 分配新帧，
-    /// 而是将当前帧重置为目标子图继续执行。caller 绑定保持不变，使返回值直达原始调用方。
-    /// 这使得循环、尾调、非尾调统一为同一帧池机制：
-    /// - 循环：reset_loop_iteration 复用 body 帧
-    /// - 尾调：switch_subgraph 复用当前帧（图跳转）
-    /// - 非尾调：start_subgraph 分配新帧（帧池回收复用）
-    fn switch_subgraph(&mut self, fid: FrameId, target_sg: SubGraphId, args: &[Value]) {
-        let (node_start, node_count) = {
-            let sg = &self.graph.subgraphs[target_sg.0 as usize];
-            (sg.node_range.0, (sg.node_range.1.0 - sg.node_range.0.0) as usize)
-        };
-
-        // 更新 subgraph_id + 调整数组尺寸
-        let frame = self.frames.get_mut(fid);
-        frame.subgraph_id = target_sg;
-        if frame.value_table.len() != node_count {
-            frame.value_table.resize(node_count);
-        }
-        if frame.pending_inputs.len() != node_count {
-            frame.pending_inputs.resize(node_count, 0);
-        }
-
-        // 清理旧子图状态（prepare_frame 不处理这些字段）
-        frame.body_frame_id = None;
-        frame.defer_stack.clear();
-        frame.select_timers.clear();
-        frame.root_frame_ptr = std::ptr::null_mut();
-        frame.parent_frame_ptr = std::ptr::null_mut();
-        frame.state = FrameState::Ready;
-        frame.suspend_state = SuspendState::NotSuspended;
-        frame.suspend_event = None;
-        frame.pending = None;
-        // caller 保持不变：返回值直达原始调用方的 call 节点
-
-        // prepare_frame：清空 value_table + ready_queue + pending_inputs + Const 预填充
-        self.prepare_frame(fid, node_start, node_count);
-
-        // 参数注入
-        let offset = node_start.0 as usize;
-        let param_count = self.graph.subgraphs[target_sg.0 as usize].param_count as usize;
-        for (i, arg) in args.iter().enumerate().take(param_count) {
-            let local_id = NodeId(i as u32);
-            let consumer_count = self.graph.downstreams[offset + i].len() as u16;
-            let frame = self.frames.get_mut(fid);
-            frame.set_value(local_id, arg.clone(), consumer_count);
-            frame.push_ready(local_id);
-        }
-    }
-
-    /// 子图完成后：回写返回值到调用方 call/gate 节点 + 唤醒调用方。
-    ///
-    /// spec 4.4 on_event_arrived：事件到达→注入值+唤醒。
-    fn complete_and_wake_caller(&mut self, child_fid: FrameId) {
-        // LoopBody 完成检测：循环体子图完成后，重置循环（Continue/None）或退出（Break/Return）
-        let child_sg_id = self.frames.get(child_fid).subgraph_id;
-        let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
-        if child_loop_kind == crate::Ir::LoopKind::LoopBody {
-            let child_signal = self.frames.get(child_fid).control_signal.clone();
-            let (loop_fid, _call_node) = self
-                .frames
-                .get(child_fid)
-                .caller
-                .expect("LoopBody frame missing caller");
-            match child_signal {
-                ControlSignal::Break | ControlSignal::Return(_) => {
-                    // break/return → 循环退出：释放 body 帧，传播信号到循环帧，循环帧正常完成
-                    self.frames.free(child_fid);
-                    self.frames.get_mut(loop_fid).body_frame_id = None;
-                    self.frames.get_mut(loop_fid).control_signal = child_signal;
-                    // 循环帧的 loop_kind 是 While/Loop/For（非 LoopBody），递归走原逻辑
-                    self.complete_and_wake_caller(loop_fid);
-                    return;
-                }
-                ControlSignal::Continue | ControlSignal::None => {
-                    // continue/正常完成 → 循环重置（帧复用）
-                    self.reset_loop_iteration(loop_fid, child_fid);
-                    return;
-                }
-            }
-        }
-
-        let return_value = self.extract_child_return(child_fid);
-        // 获取子帧的控制信号（Return/Break/Continue），用于 Gate 分支子图传播
-        let child_signal = self.frames.get(child_fid).control_signal.clone();
-
-        let caller = self.frames.get(child_fid).caller;
-        if let Some((caller_fid, call_node)) = caller {
-            // 回写返回值到调用方 call/gate 节点
-            let caller_sg_id = self.frames.get(caller_fid).subgraph_id;
-            let caller_offset = self.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
-            let call_graph_id = NodeId(call_node.0 + caller_offset.0);
-            let consumer_count = self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
-
-            let caller_frame = self.frames.get_mut(caller_fid);
-            caller_frame.set_value(call_node, return_value, consumer_count);
-            caller_frame.state = FrameState::Ready;
-            caller_frame.suspend_state = SuspendState::NotSuspended;
-            caller_frame.suspend_event = None;
-
-            // Gate 分支子图的控制信号传播：if/match 分支中的 return/break/continue
-            // 应传播到父帧（分支只是控制流分派，不构成新的函数边界）。
-            // Call 节点的子图是函数调用，Return 信号已被 extract_child_return 消费为返回值，不传播。
-            let is_gate = self.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
-            if is_gate && !matches!(child_signal, ControlSignal::None) {
-                caller_frame.control_signal = child_signal;
-            }
-
-            // 通知 call/gate 节点下游
-            self.notify_downstream(caller_fid, call_node, call_graph_id, caller_offset);
-
-            // 调用方入就绪帧队列
-            self.ready_frames.push_back(caller_fid);
-        }
-
-        // 释放子帧：清空 value_table（堆对象 Arc 自动 decref），spec 4.3 frames.free(child)
-        self.frames.free(child_fid);
-    }
-
-    /// 循环迭代重置：body_sg 完成后重置循环帧（cond + Gate）+ 复用 body_sg 帧。
-    ///
-    /// - 重置循环帧的 cond_node（重新计算 condition）+ Gate（pending=1 等 cond notify）
-    /// - 重置 body_sg 帧（prepare_frame 复用）
-    /// - 循环帧重新入就绪队列
-    fn reset_loop_iteration(&mut self, loop_fid: FrameId, body_fid: FrameId) {
-        let loop_sg_id = self.frames.get(loop_fid).subgraph_id;
-        let (loop_offset, loop_kind, cond_node, return_node, iter_next_node) = {
-            let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
-            (
-                sg.node_range.0 .0,
-                sg.loop_kind,
-                sg.cond_node,
-                sg.return_node,
-                sg.iter_next_node,
-            )
-        };
-
-        // 1. For 循环：额外重置 iter_next_node（next_call），让迭代器重新推进
-        if loop_kind == crate::Ir::LoopKind::For {
-            if let Some(next_node) = iter_next_node {
-                let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
-                self.reset_node_ready(loop_fid, next_local);
-                self.frames.get_mut(loop_fid).push_ready(next_local);
-            }
-        }
-
-        // 2. 重置 cond_node（重新计算 condition）
-        //    For 循环：cond_node(is_null) 依赖 next_call → pending=1 等 notify，不 push_ready
-        //    While/Loop：cond_node 依赖外层变量 → pending=0 直接就绪
-        //    注意：Const cond_node（如 loop {} 的 Const(true)）的 compute_fn 是 noop，
-        //    reset_node_ready 清值后无法重新计算，必须重新预填充。
-        if let Some(cond_node) = cond_node {
-            let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
-            if loop_kind == crate::Ir::LoopKind::For {
-                self.reset_node_pending(loop_fid, cond_local, 1);
-            } else {
-                self.reset_node_ready(loop_fid, cond_local);
-                // Const cond_node 重新预填充（compute_fn 是 noop，值丢失后无法恢复）
-                if self.graph.nodes[cond_node.0 as usize].kind == crate::Ir::NodeKind::Const {
-                    if let Some(cv) = self.graph.const_values[cond_node.0 as usize] {
-                        let handle = self.alloc_const_value(cv);
-                        let consumer_count =
-                            self.graph.downstreams[cond_node.0 as usize].len() as u16;
-                        self.frames.get_mut(loop_fid)
-                            .set_value(cond_local, handle, consumer_count);
-                    }
-                }
-                self.frames.get_mut(loop_fid).push_ready(cond_local);
-            }
-        }
-
-        // 3. 重置 Gate 节点（pending=1，等 cond notify）
-        let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
-        self.reset_node_pending(loop_fid, gate_local, 1);
-
-        // 4. 重置 body_sg 帧（复用）
-        let (body_sg_start, body_node_count) = {
-            let body_sg_id = self.frames.get(body_fid).subgraph_id;
-            let body_sg = &self.graph.subgraphs[body_sg_id.0 as usize];
-            (body_sg.node_range.0, (body_sg.node_range.1 .0 - body_sg.node_range.0 .0) as usize)
-        };
-        self.prepare_frame(body_fid, body_sg_start, body_node_count);
-        // body_sg 帧重新绑定 caller（保持循环帧为 caller）
-        self.frames.get_mut(body_fid).caller =
-            Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
-        // 设置 root_frame_ptr（复用 start_subgraph 的逻辑）
-        let caller_root_ptr = self.frames.get(loop_fid).root_frame_ptr;
-        let body_root_ptr = if caller_root_ptr.is_null() {
-            self.frames.get_mut(loop_fid) as *mut crate::Ir::Frame
-        } else {
-            caller_root_ptr
-        };
-        self.frames.get_mut(body_fid).root_frame_ptr = body_root_ptr;
-        // 设置 parent_frame_ptr：body 帧的直接父帧是循环帧
-        self.frames.get_mut(body_fid).parent_frame_ptr =
-            self.frames.get_mut(loop_fid) as *mut crate::Ir::Frame;
-
-        // 5. 重置循环帧状态 + 重新入就绪队列
-        let frame = self.frames.get_mut(loop_fid);
-        frame.control_signal = ControlSignal::None;
-        frame.state = FrameState::Ready;
-        frame.suspend_state = SuspendState::NotSuspended;
-        frame.suspend_event = None;
-        frame.pending = None;
-        self.ready_frames.push_back(loop_fid);
-    }
-
-    /// 重置节点为就绪状态（pending=0，清值，不入队）。
-    fn reset_node_ready(&mut self, fid: FrameId, node_local: NodeId) {
-        let frame = self.frames.get_mut(fid);
-        let i = node_local.0 as usize;
-        if i < frame.pending_inputs.len() {
-            frame.pending_inputs[i] = 0;
-        }
-        if i < frame.value_table.len() {
-            frame.value_table.reset_slot(i);
-        }
-    }
-
-    /// 重置节点为待定状态（pending=N，清值）。
-    fn reset_node_pending(&mut self, fid: FrameId, node_local: NodeId, pending: u8) {
-        let frame = self.frames.get_mut(fid);
-        let i = node_local.0 as usize;
-        if i < frame.pending_inputs.len() {
-            frame.pending_inputs[i] = pending;
-        }
-        if i < frame.value_table.len() {
-            frame.value_table.reset_slot(i);
-        }
-    }
-
-    /// 解析 await 事件源 id + 检查就绪状态。
-    ///
-    /// spec 4.4：事件源未就绪 → await 未就绪 → 帧挂起。
-    /// 返回 (RuntimeEvent, Option<Value>)：Some=就绪值，None=未就绪需挂起。
-    fn resolve_and_check_await(
-        &mut self,
-        pending: &crate::Ir::PendingAwait,
-    ) -> (RuntimeEvent, Option<Value>) {
-        use crate::Ir::EventSourceKind;
-        match pending.event_kind {
-            EventSourceKind::AsyncJoin => {
-                let async_id = crate::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
-                let event = RuntimeEvent::AsyncJoin(async_id);
-                if let Some(val) = self.async_join_runtime.try_get_result(async_id) {
-                    (event, Some(val))
-                } else {
-                    (event, None)
-                }
-            }
-            EventSourceKind::Channel => {
-                // Channel event_obj 是 ChannelVal/SenderVal/ReceiverVal 之一，
-                // 统一通过 channel() 提取底层 Arc<ChannelValue>。
-                // 已关闭且无数据 → 返回 Null（不挂起，避免永久等待）。
-                let ch = pending.event_obj.heap_obj().and_then(|h| h.channel())
-                    .expect("await on non-channel value");
-                let v = ch.recv().or_else(|| {
-                    if ch.is_closed() { Some(Value::Null) } else { None }
-                });
-                let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
-                (event, v)
-            }
-            EventSourceKind::Timer => {
-                // Timer event_obj 是 Timer record（含 duration_ns 字段）。
-                // 惰性启动 timer：首次 resolve 时从 record 提取 duration 并 start。
-                let duration_ns = match pending.event_obj.heap_obj() {
-                    Some(crate::Value::HeapObj::Record(r)) => {
-                        r.find_field("duration_ns").map(|v| v.as_i64()).unwrap_or(0)
-                    }
-                    _ => pending.event_obj.as_i64(),
-                };
-                let timer_id = self
-                    .timer_runtime
-                    .start(std::time::Duration::from_nanos(duration_ns as u64));
-                let event = RuntimeEvent::TimerFired(timer_id);
-                if self.timer_runtime.is_fired(timer_id) {
-                    (event, Some(Value::VOID))
-                } else {
-                    (event, None)
-                }
-            }
-            EventSourceKind::SubgraphComplete => {
-                panic!("SubgraphComplete should not go through await path");
-            }
-        }
-    }
-
-    /// on_event_arrived：统一事件注入（spec 4.4）。
-    ///
-    /// 事件到达 → 找等待该事件的帧 → 注入值到 await 节点 → 通知下游 → 唤醒。
-    /// channel/timer/async 事件共用此路径。
-    ///
-    /// select 帧：suspend_event 为 None（等多个事件），唤醒时重新 push gate 节点
-    /// 到 ready_queue（不注入值，gate 重新检查就绪状态）。
-    fn on_event_arrived(&mut self, event: RuntimeEvent, value: Value) {
-        let waiters: Vec<FrameId> = self
-            .event_waiters
-            .iter()
-            .filter(|(e, _)| *e == event)
-            .map(|(_, fid)| *fid)
-            .collect();
-        self.event_waiters
-            .retain(|(_, fid)| !waiters.contains(fid));
-
-        for fid in waiters {
-            let await_node = match self.frames.get(fid).suspend_state {
-                SuspendState::WaitingEvent(node) => node,
-                _ => continue,
-            };
-
-            let node_offset = self.frames.get(fid).node_offset;
-            let await_graph_id = NodeId(await_node.0 + node_offset);
-
-            // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
-            let is_select = self.graph.select_infos[await_graph_id.0 as usize].is_some();
-            if is_select {
-                let frame = self.frames.get_mut(fid);
-                frame.state = FrameState::Ready;
-                frame.suspend_state = SuspendState::NotSuspended;
-                frame.suspend_event = None;
-                frame.push_ready(await_node);
-                self.ready_frames.push_back(fid);
-            } else {
-                // 普通 await 帧：注入事件值到 await 节点
-                let consumer_count =
-                    self.graph.downstreams[await_graph_id.0 as usize].len() as u16;
-                let frame = self.frames.get_mut(fid);
-                frame.set_value(await_node, value.clone(), consumer_count);
-                frame.state = FrameState::Ready;
-                frame.suspend_state = SuspendState::NotSuspended;
-                frame.suspend_event = None;
-                self.notify_downstream(fid, await_node, await_graph_id, NodeId(node_offset));
-                self.ready_frames.push_back(fid);
-            }
-        }
-    }
-
-    /// 取消帧：CAS Suspended → Cancelling + 入就绪队列。
-    ///
-    /// spec 5.3：只有挂起态可取消，Running/Completed 不可取消。
-    /// worker 检测到 Cancelling 状态后执行 defer 清理（复用 defer 机制）。
-    pub fn cancel_frame(&mut self, frame_id: FrameId) {
-        let frame = self.frames.get_mut(frame_id);
-        // 只有 Suspended 态可取消
-        if frame.state != FrameState::Suspended {
-            return;
-        }
-        // 移除事件等待注册
-        if let Some(event) = frame.suspend_event {
-            self.event_waiters
-                .retain(|(e, fid)| !(*e == event && *fid == frame_id));
-        } else {
-            // select 帧：suspend_event 为 None（等多个事件），移除该帧所有事件等待
-            self.event_waiters
-                .retain(|(_, fid)| *fid != frame_id);
-        }
-        // CAS Suspended → Cancelling
-        frame.state = FrameState::Cancelling;
-        frame.suspend_state = SuspendState::NotSuspended;
-        frame.suspend_event = None;
-        // 入就绪队列（worker 检测到 Cancelling 后执行 defer 清理）
-        self.ready_frames.push_back(frame_id);
-    }
-
-    /// 全局事件循环：调度就绪帧，处理挂起/完成。
-    ///
-    /// spec 4.2 + 4.4：替代栈嵌套执行，所有 call/gate 走事件驱动。
-    /// 检查到期 timer，触发 TimerFired 事件。
-    ///
-    /// spec 4.4：事件循环每次迭代检查到期 timer。
-    /// 单线程和多 worker 模式共用。
-    pub fn check_timers(&mut self) {
-        let fired_timers = self.timer_runtime.check_and_fire();
-        for timer_id in fired_timers {
-            self.on_event_arrived(RuntimeEvent::TimerFired(timer_id), Value::VOID);
-        }
-    }
-
-    /// 处理一个帧：执行就绪节点 + 处理状态转换。
-    ///
-    /// 返回 `Some(result)` 当顶层帧完成；返回 `None` 当帧仍需继续（挂起/子帧完成/控制信号）。
-    /// 多 worker 模式下每个 worker 调用此方法处理单个帧。
-    pub fn process_frame(&mut self, fid: FrameId) -> Option<Value> {
-        // 执行帧就绪节点
-        self.run_ready_nodes(fid);
-
-        // FrameState 是 Copy，先拷贝状态值，避免 match 分支内持有不可变借用
-        let state = self.frames.get(fid).state;
-        // 是否有调用方（顶层帧无调用方）
-        let has_caller = self.frames.get(fid).caller.is_some();
-        match state {
-            FrameState::Suspended => {
-                // event_waiters 已在 run_ready_nodes 挂起点注册（普通 await 帧 + select 帧）
-                // 此处仅做一致性校验：挂起帧必须有等待登记，否则是异常状态
-                let has_waiter = self.event_waiters.iter().any(|(_, wf)| *wf == fid);
-                if !has_waiter {
-                    panic!("frame {} suspended without event waiter", fid.0);
-                }
-            }
-            FrameState::Completed => {
-                if has_caller {
-                    // 区分 sync call vs async call 子帧完成
-                    // async call 子帧：async_join_runtime 有注册 → 触发 AsyncJoin 事件
-                    // sync call 子帧：走 complete_and_wake_caller
-                    if let Some(async_id) = self.async_join_runtime.find_by_child(fid) {
-                        // async 子帧完成：设置 result + 触发 AsyncJoin 事件
-                        let return_value = self.extract_child_return(fid);
-                        // Value 不再 Copy：set_result 取得所有权存储，on_event_arrived 需 clone 传递给等待帧
-                        self.async_join_runtime.set_result(async_id, return_value.clone());
-                        self.frames.free(fid);
-                        self.on_event_arrived(RuntimeEvent::AsyncJoin(async_id), return_value);
-                    } else {
-                        // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
-                        self.event_waiters.retain(|(e, _)| {
-                            !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                        });
-                        self.complete_and_wake_caller(fid);
-                    }
-                } else {
-                    // 顶层帧完成：返回结果
-                    return Some(self.extract_child_return(fid));
-                }
-            }
-            FrameState::Failed => {
-                if has_caller {
-                    // Failed 子帧（cancel 后）：清理 waiter + 唤醒调用方
-                    self.event_waiters.retain(|(e, _)| {
-                        !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                    });
-                    self.complete_and_wake_caller(fid);
-                } else {
-                    // 顶层帧 Failed：返回 NULL
-                    return Some(Value::NULL);
-                }
-            }
-            _ => {
-                // Ready（控制信号触发但未挂起）：重新入队继续执行
-                self.ready_frames.push_back(fid);
-            }
-        }
-        None
-    }
-
-    /// 全局事件循环：调度就绪帧，处理挂起/完成。
-    ///
-    /// spec 4.2 + 4.4：替代栈嵌套执行，所有 call/gate 走事件驱动。
-    pub fn run_event_loop(&mut self) -> Value {
-        let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
-        let fid = self.init_frame(entry_sg);
-        self.ready_frames.push_back(fid);
-
-        loop {
-            // 检查 timer 事件（spec 4.4：事件循环每次迭代检查到期 timer）
-            self.check_timers();
-
-            let fid = match self.ready_frames.pop_front() {
-                Some(f) => f,
-                None => {
-                    if self.event_waiters.is_empty() {
-                        panic!("event loop exhausted: no ready frames and no pending events");
-                    }
-                    // 有等待者但无就绪帧：可能是 timer 未到期，spin-wait
-                    std::thread::yield_now();
-                    continue;
-                }
-            };
-
-            if let Some(result) = self.process_frame(fid) {
-                return result;
-            }
-        }
-    }
-
-    /// 执行入口子图，返回返回值（单线程模式）。
-    pub fn run_entry(&mut self) -> Value {
-        self.run_event_loop()
-    }
-
-    /// 多 worker 模式执行入口子图（细粒度锁 + 帧无锁执行）。
-    ///
-    /// spec 4.8：N 个 worker 跑任意多协程。
-    /// 使用 crossbeam-deque 实现 work-stealing（LIFO local + FIFO steal），
-    /// parking_lot 实现 park/unpark 避免 busy-wait。
-    ///
-    /// 细粒度锁设计（Phase 6 Task 3）：
-    /// - SharedEngine 持有独立 Mutex 的 runtime（channel/timer/async）
-    /// - 帧从 frames HashMap 取出后独占执行（无锁）
-    /// - 需要访问 runtime 时单独锁对应 Mutex
-    /// - 绝不同时持有两个 Mutex（避免死锁）
-    pub fn run_multi_worker(&mut self, num_workers: usize) -> Value {
-        assert!(num_workers >= 1, "num_workers must be >= 1");
-
-        // 创建入口帧
-        let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
-        let entry_fid = self.init_frame(entry_sg);
-
-        // 创建每个 worker 的本地队列 + stealer 端
-        let mut local_queues: Vec<DequeWorker<FrameId>> = Vec::with_capacity(num_workers);
-        let mut stealers: Vec<Stealer<FrameId>> = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let w = DequeWorker::new_lifo();
-            stealers.push(w.stealer());
-            local_queues.push(w);
-        }
-
-        // 从 Engine 提取状态创建 SharedEngine（调用后 Engine runtime 字段被 take）
-        let shared = Arc::new(SharedEngine::from_engine(self, num_workers));
-        // 注入入口帧到全局队列
-        shared.global_queue.push(entry_fid);
-
-        // 使用 scoped threads（保证线程在 scope 结束时 join）
-        std::thread::scope(|s| {
-            for (worker_id, local_queue) in local_queues.into_iter().enumerate() {
-                let shared = shared.clone();
-                let stealers = stealers.clone();
-
-                s.spawn(move || {
-                    worker_main(worker_id, local_queue, stealers, shared);
-                });
-            }
-        });
-
-        // 提取结果（先存局部变量，避免 MutexGuard 生命周期问题）
-        let result_value = shared
-            .result
-            .lock()
-            .take()
-            .expect("no result produced: all workers exited without completion");
-        result_value
-    }
-}
-
-// =========================================================================
-// SharedEngine — 细粒度锁多 worker 共享状态（spec §4.1, §4.8）
-// =========================================================================
-
-use hashbrown::HashMap;
-use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
-use parking_lot::{Condvar, Mutex as ParkingMutex};
-use std::sync::Arc;
-
-/// 跨 worker 共享状态（Arc，所有 worker 共享）。
-///
-/// 细粒度锁设计：每个 runtime 独立 Mutex，帧执行时无锁（从 frames HashMap
-/// 取出后独占）。需要访问 runtime 时单独锁对应 Mutex。
-///
-/// 死锁对策：绝不同时持有两个 Mutex。按固定顺序获取：frames → runtime。
-pub struct SharedEngine {
-    /// 数据流图（只读共享，Arc 包装供帧共享）
-    pub graph: Arc<DataFlowGraph>,
-    /// 帧表（FrameId → Frame），帧执行时从表中取出独占
-    pub frames: ParkingMutex<HashMap<FrameId, Frame>>,
-    /// 下一个帧 id
-    pub next_frame_id: ParkingMutex<FrameId>,
-    /// 值 arena（vtable 分派用，compute_fn 不使用）
-    pub arena: ParkingMutex<ValueArena>,
-    /// Timer 运行时
-    pub timer_runtime: ParkingMutex<TimerRuntime>,
-    /// AsyncJoin 运行时
-    pub async_join_runtime: ParkingMutex<AsyncJoinRuntime>,
-    /// 事件等待者列表
-    pub event_waiters: ParkingMutex<Vec<(crate::Ir::RuntimeEvent, FrameId)>>,
-    /// 待处理的子图完成事件（caller 帧竞态时暂存，由 process_frame_shared 消费）
-    pub pending_completions: ParkingMutex<HashMap<FrameId, (crate::Ir::NodeId, Value, crate::Ir::ControlSignal)>>,
-    /// 全局注入队列（入口帧 + 挂起恢复帧）
-    pub global_queue: Injector<FrameId>,
-    /// park/unpark 同步原语
-    pub wakeup: (ParkingMutex<()>, Condvar),
-    /// 活跃 worker 计数（归零表示事件循环耗尽）
-    pub active_count: ParkingMutex<usize>,
-    /// 顶层帧返回值
-    pub result: ParkingMutex<Option<Value>>,
-}
-
-/// Safety: SharedEngine 的所有可变字段都在 ParkingMutex 保护下，同一时刻只有一个线程
-/// 访问每个字段。ValueArena 虽然包含 Rc<str>（非 Send），但 ParkingMutex 保证互斥访问。
-/// 这与旧代码的 SyncPtr + ParkingMutex 安全模型一致。
-unsafe impl Send for SharedEngine {}
-unsafe impl Sync for SharedEngine {}
-
-impl SharedEngine {
-    /// 从 Engine 提取状态创建 SharedEngine。
-    ///
-    /// 调用后 Engine 的 runtime 字段被 take 为默认值，不再可用。
-    pub fn from_engine(engine: &mut Engine, num_workers: usize) -> Self {
-        let mut frames_map = HashMap::new();
-        let frames_vec = engine.frames.drain_frames();
-        for frame in frames_vec {
-            frames_map.insert(frame.id, frame);
-        }
-        Self {
-            graph: engine.graph.clone(),
-            frames: ParkingMutex::new(frames_map),
-            next_frame_id: ParkingMutex::new(FrameId(engine.frames.next_id)),
-            arena: ParkingMutex::new(std::mem::take(&mut engine.arena)),
-            timer_runtime: ParkingMutex::new(std::mem::take(&mut engine.timer_runtime)),
-            async_join_runtime: ParkingMutex::new(std::mem::take(&mut engine.async_join_runtime)),
-            event_waiters: ParkingMutex::new(std::mem::take(&mut engine.event_waiters)),
-            pending_completions: ParkingMutex::new(HashMap::new()),
-            global_queue: Injector::new(),
-            wakeup: (ParkingMutex::new(()), Condvar::new()),
-            active_count: ParkingMutex::new(num_workers),
-            result: ParkingMutex::new(None),
-        }
-    }
-
-    /// 分配新帧 id。
-    fn alloc_frame_id(&self) -> FrameId {
-        let mut next = self.next_frame_id.lock();
-        let id = *next;
-        assert!(next.0 < u32::MAX, "FrameId overflow: too many frames allocated");
-        next.0 += 1;
-        id
-    }
-}
-
-// =========================================================================
-// SharedEngine 辅助函数（从 Engine 方法提取，改为基于 SharedEngine）
+// 帧操作辅助函数（纯函数，不依赖 Engine 状态）
 // =========================================================================
 
 /// 将 ConstValue 转换为 Value（不使用 arena，直接构造）。
-fn alloc_const_value_shared(cv: ConstValue) -> Value {
+fn alloc_const_value(cv: ConstValue) -> Value {
     match cv {
         ConstValue::I8(v) => Value::i8(v),
         ConstValue::I16(v) => Value::i16(v),
@@ -4635,7 +3465,7 @@ fn alloc_const_value_shared(cv: ConstValue) -> Value {
         ConstValue::F32(v) => Value::f32(v),
         ConstValue::F64(v) => Value::f64(v),
         ConstValue::Bool(v) => Value::bool_val(v),
-        ConstValue::Char(c) => Value::char_val(char::from_u32(c).unwrap_or('\0')),
+        ConstValue::Char(c) => Value::char_val(char_from_u32_or_nul(c)),
         ConstValue::Null => Value::NULL,
         ConstValue::Void => Value::VOID,
         ConstValue::Str(s) => {
@@ -4646,9 +3476,7 @@ fn alloc_const_value_shared(cv: ConstValue) -> Value {
 }
 
 /// 帧节点初始化：设置 node_offset + pending_inputs + 预填充 Const + Gate 入就绪队列。
-///
-/// 从 Engine::prepare_frame 提取，改为直接操作 frame（无需通过 FramePool）。
-fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
+fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     let sg_id = frame.subgraph_id;
     let (node_start, node_end) = graph.subgraphs[sg_id.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
@@ -4674,22 +3502,19 @@ fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
     // 设置 node_offset
     frame.node_offset = node_start.0;
 
-    // 1. 初始化 pending_inputs
+    // 1. 初始化 pending_inputs（select Gate→0；其他节点按实际 in-frame 输入计数）
     for i in 0..node_count {
         if is_nested((offset + i) as u32) {
-            frame.pending_inputs[i] = u8::MAX;
+            frame.pending_inputs[i] = PENDING_EXTERNAL;
         } else {
             let graph_node = &graph.nodes[offset + i];
             if graph_node.kind == NodeKind::EventSource {
-                frame.pending_inputs[i] = u8::MAX;
-            } else if graph_node.kind == NodeKind::Gate {
-                if graph.select_infos[offset + i].is_some() {
-                    frame.pending_inputs[i] = 0;
-                } else {
-                    frame.pending_inputs[i] = 1;
-                }
+                frame.pending_inputs[i] = PENDING_EXTERNAL;
+            } else if graph_node.kind == NodeKind::Gate
+                && graph.select_infos[offset + i].is_some()
+            {
+                frame.pending_inputs[i] = 0;
             } else {
-                // 只统计当前帧内的输入（外层节点通过 root_frame_ptr 读取，不计入 pending）
                 let inputs = graph.inputs_pool.get(
                     graph_node.inputs_offset,
                     graph_node.input_count,
@@ -4711,7 +3536,7 @@ fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
         let kind = graph.nodes[offset + i].kind;
         if kind == NodeKind::Const {
             if let Some(cv) = graph.const_values[offset + i] {
-                let handle = alloc_const_value_shared(cv);
+                let handle = alloc_const_value(cv);
                 let local_id = NodeId(i as u32);
                 let consumer_count = graph.downstreams[offset + i].len() as u16;
                 frame.set_value(local_id, handle, consumer_count);
@@ -4739,19 +3564,8 @@ fn prepare_frame_shared(frame: &mut Frame, graph: &DataFlowGraph) {
     }
 }
 
-/// 初始化帧：分配 + 预填充。返回 FrameId（帧已插入 frames HashMap）。
-fn init_frame_shared(shared: &SharedEngine, subgraph_id: SubGraphId) -> FrameId {
-    let (node_start, node_end) = shared.graph.subgraphs[subgraph_id.0 as usize].node_range;
-    let node_count = (node_end.0 - node_start.0) as usize;
-    let fid = shared.alloc_frame_id();
-    let mut frame = Frame::new(fid, subgraph_id, node_count, shared.graph.clone());
-    prepare_frame_shared(&mut frame, &shared.graph);
-    shared.frames.lock().insert(fid, frame);
-    fid
-}
-
-/// 通知下游节点：减 pending_inputs，归零则入就绪队列（槽级 RC）。
-fn notify_downstream_shared(
+/// 通知下游节点：减 pending_inputs，归零则入就绪队列（含边界检查 + 槽级 RC）。
+fn notify_downstream(
     frame: &mut Frame,
     graph: &DataFlowGraph,
     producer_local: NodeId,
@@ -4759,14 +3573,23 @@ fn notify_downstream_shared(
     node_start: NodeId,
 ) {
     let downstreams: Vec<NodeId> = graph.downstreams[producer_graph.0 as usize].clone();
+    let pending_len = frame.pending_inputs.len();
     for ds_graph_id in downstreams {
         let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
+        // 边界检查：跳过跨子图下游
+        if ds_local_id.0 as usize >= pending_len {
+            continue;
+        }
 
         let pidx = producer_local.0 as usize;
-        let still_has_consumers = frame.value_table.consume(pidx);
-        if !still_has_consumers && frame.value_table.ready[pidx] {
-            frame.value_table.ready[pidx] = false;
-        }
+        // 消费 producer 的引用计数，但不清除 ready 标记。
+        // ready 标记的语义是"此节点已产出值，不需要重新执行"。
+        // 清除 ready 会导致节点变成 pending_inputs=0 && ready=false 状态，
+        // 当上游被重新触发时，节点会被重新推入 ready_queue 并重复执行，
+        // 造成指数级爆炸（尤其影响 call/closure_call 节点）。
+        // 值保留在 value_table 中，直到帧结束（帧 drop 时自动释放）
+        // 或被 reset_node_ready/reset_node_pending 显式重置（循环体复用场景）。
+        let _still_has_consumers = frame.value_table.consume(pidx);
 
         if frame.pending_inputs[ds_local_id.0 as usize] > 0 {
             frame.pending_inputs[ds_local_id.0 as usize] -= 1;
@@ -4779,44 +3602,8 @@ fn notify_downstream_shared(
     }
 }
 
-/// 启动子图（call 节点调用）。创建子帧 + 注入参数 + 设 caller。
-///
-/// 返回子帧 FrameId（已插入 frames HashMap）。
-fn start_subgraph_shared(
-    shared: &SharedEngine,
-    caller_fid: FrameId,
-    call_node: NodeId,
-    subgraph_id: SubGraphId,
-    args: &[Value],
-) -> FrameId {
-    let (node_start, node_end) = shared.graph.subgraphs[subgraph_id.0 as usize].node_range;
-    let node_count = (node_end.0 - node_start.0) as usize;
-    let offset = node_start.0 as usize;
-
-    let child_fid = shared.alloc_frame_id();
-    let mut child = Frame::new(child_fid, subgraph_id, node_count, shared.graph.clone());
-    prepare_frame_shared(&mut child, &shared.graph);
-
-    // 参数注入（前 param_count 个节点）
-    for (i, arg) in args.iter().enumerate() {
-        let local_id = NodeId(i as u32);
-        let consumer_count = shared.graph.downstreams[offset + i].len() as u16;
-        child.set_value(local_id, arg.clone(), consumer_count);
-        child.push_ready(local_id);
-    }
-
-    // 绑定 caller
-    child.caller = Some((caller_fid, call_node));
-
-    shared.frames.lock().insert(child_fid, child);
-    child_fid
-}
-
-/// 尾调用图跳转（共享版）：复用当前帧执行目标子图（帧池零分配）。
-///
-/// 与 Engine::switch_subgraph 对应，但直接操作 &mut Frame（无 HashMap 查找）。
-/// caller 绑定保持不变，返回值直达原始调用方。
-fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
+/// 尾调用图跳转：复用当前帧执行目标子图（帧池零分配）。
+fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
     let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
 
@@ -4829,7 +3616,7 @@ fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: S
         frame.pending_inputs.resize(node_count, 0);
     }
 
-    // 清空 value_table（prepare_frame_shared 不做此操作）
+    // 清空 value_table（prepare_frame_nodes 不做此操作）
     frame.value_table.reset_all();
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
@@ -4844,8 +3631,8 @@ fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: S
     frame.suspend_event = None;
     // caller 保持不变：返回值直达原始调用方的 call 节点
 
-    // prepare_frame_shared：设置 node_offset + pending_inputs + Const 预填充
-    prepare_frame_shared(frame, graph);
+    // prepare_frame_nodes：设置 node_offset + pending_inputs + Const 预填充
+    prepare_frame_nodes(frame, graph);
 
     // 参数注入
     let offset = node_start.0 as usize;
@@ -4859,770 +3646,1480 @@ fn switch_subgraph_shared(frame: &mut Frame, graph: &DataFlowGraph, target_sg: S
 }
 
 /// 提取子帧返回值：优先取 control_signal 的 Return 值，否则取 return_node 值。
-fn extract_child_return_shared(child: &Frame, graph: &DataFlowGraph) -> Value {
+fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Value {
     match &child.control_signal {
         ControlSignal::Return(v) => v.clone(),
         ControlSignal::Break | ControlSignal::Continue => Value::VOID,
         ControlSignal::None => {
             let sg = &graph.subgraphs[child.subgraph_id.0 as usize];
-            let return_local = NodeId(sg.return_node.0.wrapping_sub(sg.node_range.0 .0));
+            // node_offset = 子图 node_range.0（同函数分支和跨函数调用均如此）
+            let return_local = NodeId(sg.return_node.0.wrapping_sub(child.node_offset));
             child.get_value(return_local)
         }
     }
 }
 
-/// 子图完成后：回写返回值到调用方 + 唤醒调用方。
-///
-/// 子帧不入 frames（等同于 free）。caller 帧从 frames 取出、修改、放回。
-fn complete_and_wake_caller_shared(
-    shared: &SharedEngine,
-    child_frame: &Frame,
-    local_queue: &DequeWorker<FrameId>,
-) {
-    let return_value = extract_child_return_shared(child_frame, &shared.graph);
-    let child_signal = child_frame.control_signal.clone();
-    let caller = child_frame.caller;
+// =========================================================================
+// LockStrategy — 编译期锁策略（单线程 RefCell vs 多线程 ParkingMutex）
+// =========================================================================
 
-    if let Some((caller_fid, call_node)) = caller {
-        // 取出 caller 帧（短临界区）
-        // 竞态处理：caller 帧可能还未被 insert 回 HashMap（run_frame_nodes 设置
-        // Suspended 后 return，insert 发生在 process_frame_shared 中）。
-        // 若 remove 返回 None，将完成信息存入 pending_completions，
-        // 由 process_frame_shared 在处理 Suspended 帧时消费（事件重注册机制）。
-        let mut caller_frame_opt = {
-            let mut frames = shared.frames.lock();
-            frames.remove(&caller_fid)
-        };
+/// 锁策略：编译期决定字段包装方式（单线程 RefCell vs 多线程 ParkingMutex）
+pub trait LockStrategy: 'static {
+    type Mutex<T>: Lockable<T>;
+}
 
-        if caller_frame_opt.is_none() {
-            // 父帧尚未 insert 回 HashMap，存储完成信息等待重试
-            shared.pending_completions.lock().insert(
-                caller_fid,
-                (call_node, return_value, child_signal),
-            );
+/// 可锁定 trait：提供 lock() 方法返回 guard
+pub trait Lockable<T> {
+    type Guard<'a>: DerefMut<Target = T>
+    where
+        Self: 'a;
+    fn lock(&self) -> Self::Guard<'_>;
+}
+
+// 单线程策略：RefCell（borrow flag，~2ns，无系统调用）
+pub struct Single;
+impl LockStrategy for Single {
+    type Mutex<T> = RefCell<T>;
+}
+impl<T> Lockable<T> for RefCell<T> {
+    type Guard<'a>
+        = RefMut<'a, T>
+    where
+        T: 'a;
+    fn lock(&self) -> Self::Guard<'_> {
+        self.borrow_mut()
+    }
+}
+
+// 多线程策略：ParkingMutex（CAS，无竞争时 ~10ns）
+pub struct Multi;
+impl LockStrategy for Multi {
+    type Mutex<T> = ParkingMutex<T>;
+}
+impl<T> Lockable<T> for ParkingMutex<T> {
+    type Guard<'a>
+        = ParkingMutexGuard<'a, T>
+    where
+        T: 'a;
+    fn lock(&self) -> Self::Guard<'_> {
+        self.lock()
+    }
+}
+
+/// 帧队列抽象：Single 用 RefCell<VecDeque>，Multi 用 DequeWorker
+pub enum QueueHandle<'a> {
+    Single(&'a RefCell<std::collections::VecDeque<FrameId>>),
+    Multi(&'a DequeWorker<FrameId>),
+}
+impl QueueHandle<'_> {
+    pub fn push(&self, fid: FrameId) {
+        match self {
+            Self::Single(q) => q.borrow_mut().push_back(fid),
+            Self::Multi(q) => q.push(fid),
+        }
+    }
+}
+
+// =========================================================================
+// Engine<S> — 统一执行引擎（泛型锁策略）
+// =========================================================================
+
+/// 统一引擎：字段类型由 S 决定，业务逻辑只写一份
+pub struct Engine<S: LockStrategy> {
+    pub graph: Arc<DataFlowGraph>,
+    pub frames: S::Mutex<HashMap<FrameId, Box<Frame>>>,
+    pub next_frame_id: S::Mutex<FrameId>,
+    pub arena: S::Mutex<ValueArena>,
+    pub timer_runtime: S::Mutex<TimerRuntime>,
+    pub async_join_runtime: S::Mutex<AsyncJoinRuntime>,
+    pub event_waiters: S::Mutex<Vec<(crate::Ir::RuntimeEvent, FrameId)>>,
+    pub pending_completions:
+        S::Mutex<HashMap<FrameId, (crate::Ir::NodeId, Value, crate::Ir::ControlSignal)>>,
+    pub result: S::Mutex<Option<Value>>,
+    /// 单线程队列（Multi 模式为 None）
+    pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
+    /// 多线程调度（Single 模式为 None）
+    pub global_queue: Option<Injector<FrameId>>,
+    pub wakeup: Option<(ParkingMutex<()>, Condvar)>,
+    pub active_count: Option<ParkingMutex<usize>>,
+    _strategy: std::marker::PhantomData<S>,
+}
+
+// Safety: Frame 含裸指针（root_frame_ptr/parent_frame_ptr），但所有可变字段都在
+// ParkingMutex 保护下，同一时刻只有一个线程访问每个字段。
+unsafe impl Send for Engine<Multi> {}
+unsafe impl Sync for Engine<Multi> {}
+
+// =========================================================================
+// impl<S: LockStrategy> Engine<S> — 合并后的统一方法
+// =========================================================================
+
+impl<S: LockStrategy> Engine<S> {
+    /// 分配帧 id
+    fn alloc_frame_id(&self) -> FrameId {
+        let mut next = self.next_frame_id.lock();
+        let id = *next;
+        assert!(next.0 < u32::MAX, "FrameId overflow: too many frames allocated");
+        next.0 += 1;
+        id
+    }
+
+    /// 初始化帧：分配 + 预填充。返回 FrameId（帧已插入 frames）。
+    fn init_frame(&self, subgraph_id: SubGraphId) -> FrameId {
+        let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
+        let node_count = (node_end.0 - node_start.0) as usize;
+        let fid = self.alloc_frame_id();
+        let mut frame = Frame::new(fid, subgraph_id, node_count, self.graph.clone());
+        self.prepare_frame(&mut frame);
+        self.frames.lock().insert(fid, Box::new(frame));
+        fid
+    }
+
+    /// 帧节点初始化：重置 + 预填充。
+    fn prepare_frame(&self, frame: &mut Frame) {
+        // 重置帧状态（帧复用时必须重置，避免旧值残留）
+        frame.value_table.reset_all();
+        frame.ready_queue.clear();
+        frame.control_signal = ControlSignal::None;
+        frame.pending = None;
+        // 以下用 prepare_frame_nodes 设置 node_offset + pending_inputs + Const 预填充
+        prepare_frame_nodes(frame, &self.graph);
+    }
+
+    /// 执行帧内所有就绪节点，直到就绪队列空或帧挂起。
+    fn run_frame_nodes(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>) {
+        let graph = frame.graph.clone();
+
+        let mut iter_guard: u64 = 0;
+        loop {
+        iter_guard += 1;
+        if iter_guard > 500000 {
             return;
         }
-
-        // 修改 caller 帧（无需持锁）
-        if let Some(caller_frame) = caller_frame_opt.as_mut() {
-            let caller_sg_id = caller_frame.subgraph_id;
-            let caller_offset = shared.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
-            let call_graph_id = NodeId(call_node.0 + caller_offset.0);
-            let consumer_count = shared.graph.downstreams[call_graph_id.0 as usize].len() as u16;
-
-            caller_frame.set_value(call_node, return_value, consumer_count);
-            caller_frame.state = FrameState::Ready;
-            caller_frame.suspend_state = SuspendState::NotSuspended;
-            caller_frame.suspend_event = None;
-
-            // Gate 分支子图的控制信号传播（同 complete_and_wake_caller）
-            let is_gate = shared.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
-            if is_gate && !matches!(child_signal, ControlSignal::None) {
-                caller_frame.control_signal = child_signal;
+            // 检查控制信号（return/break/continue 已触发）
+            if !matches!(frame.control_signal, ControlSignal::None) {
+                break;
+            }
+            // 检查帧是否被取消
+            if frame.state == FrameState::Cancelling {
+                break;
+            }
+            // 检查帧是否挂起
+            if frame.state == FrameState::Suspended {
+                return;
             }
 
-            notify_downstream_shared(
-                caller_frame,
-                &shared.graph,
-                call_node,
-                call_graph_id,
-                caller_offset,
-            );
-        }
-
-        // 放回 caller 帧 + 入队（取所有权）
-        if let Some(caller_frame) = caller_frame_opt {
-            shared.frames.lock().insert(caller_fid, caller_frame);
-            local_queue.push(caller_fid);
-        }
-    }
-    // 子帧已完成，由调用方负责 drop（不放回 frames）
-}
-
-/// on_event_arrived：事件到达 → 注入值到等待帧 → 唤醒。
-///
-/// channel/timer/async 事件共用此路径。
-/// select 帧：重新 push gate 节点（不注入值，gate 重新检查就绪状态）。
-fn on_event_arrived_shared(
-    shared: &SharedEngine,
-    event: RuntimeEvent,
-    value: Value,
-    local_queue: &DequeWorker<FrameId>,
-) {
-    // 找等待该事件的帧（短临界区）
-    let waiters: Vec<FrameId> = {
-        let mut event_waiters = shared.event_waiters.lock();
-        let waiters: Vec<FrameId> = event_waiters
-            .iter()
-            .filter(|(e, _)| *e == event)
-            .map(|(_, fid)| *fid)
-            .collect();
-        event_waiters.retain(|(_, fid)| !waiters.contains(fid));
-        waiters
-    };
-
-    for fid in waiters {
-        // 取出帧（短临界区）
-        let mut frame = {
-            let mut frames = shared.frames.lock();
-            match frames.remove(&fid) {
-                Some(f) => f,
-                None => continue, // 帧正被其他 worker 处理，跳过
-            }
-        };
-
-        let await_node = match frame.suspend_state {
-            SuspendState::WaitingEvent(node) => node,
-            _ => {
-                // 非事件等待帧：放回 + 跳过
-                shared.frames.lock().insert(fid, frame);
+            // SIMD/rayon 批量化
+            if try_batch_nodes(frame, &graph) {
                 continue;
             }
-        };
 
-        let node_offset = frame.node_offset;
-        let await_graph_id = NodeId(await_node.0 + node_offset);
-
-        // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
-        let is_select = shared.graph.select_infos[await_graph_id.0 as usize].is_some();
-        if is_select {
-            frame.state = FrameState::Ready;
-            frame.suspend_state = SuspendState::NotSuspended;
-            frame.suspend_event = None;
-            frame.push_ready(await_node);
-        } else {
-            // 普通 await 帧：注入事件值到 await 节点
-            let consumer_count =
-                shared.graph.downstreams[await_graph_id.0 as usize].len() as u16;
-            frame.set_value(await_node, value.clone(), consumer_count);
-            frame.state = FrameState::Ready;
-            frame.suspend_state = SuspendState::NotSuspended;
-            frame.suspend_event = None;
-            notify_downstream_shared(
-                &mut frame,
-                &shared.graph,
-                await_node,
-                await_graph_id,
-                NodeId(node_offset),
-            );
-        }
-
-        // 放回帧 + 入队
-        shared.frames.lock().insert(fid, frame);
-        local_queue.push(fid);
-    }
-}
-
-/// 解析 await 事件源 id + 检查就绪状态。
-///
-/// 返回 (RuntimeEvent, Option<Value>)：Some=就绪值，None=未就绪需挂起。
-fn resolve_and_check_await_shared(
-    shared: &SharedEngine,
-    pending: &crate::Ir::PendingAwait,
-) -> (RuntimeEvent, Option<Value>) {
-    use crate::Ir::EventSourceKind;
-    match pending.event_kind {
-        EventSourceKind::AsyncJoin => {
-            let async_id = crate::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
-            let event = RuntimeEvent::AsyncJoin(async_id);
-            let val = shared.async_join_runtime.lock().try_get_result(async_id);
-            (event, val)
-        }
-        EventSourceKind::Channel => {
-            // Channel event_obj 是 ChannelVal/SenderVal/ReceiverVal 之一，
-            // 统一通过 channel() 提取底层 Arc<ChannelValue>。
-            // 已关闭且无数据 → 返回 Null（不挂起，避免永久等待）。
-            let ch = pending.event_obj.heap_obj().and_then(|h| h.channel())
-                .expect("await on non-channel value");
-            let v = ch.recv().or_else(|| {
-                if ch.is_closed() { Some(Value::Null) } else { None }
-            });
-            let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
-            (event, v)
-        }
-        EventSourceKind::Timer => {
-            // Timer event_obj 是 Timer record（含 duration_ns 字段）。
-            // 惰性启动 timer：首次 resolve 时从 record 提取 duration 并 start。
-            let duration_ns = match pending.event_obj.heap_obj() {
-                Some(crate::Value::HeapObj::Record(r)) => {
-                    r.find_field("duration_ns").map(|v| v.as_i64()).unwrap_or(0)
-                }
-                _ => pending.event_obj.as_i64(),
+            // 弹出就绪节点（局部 id）
+            let local_id = match frame.pop_ready() {
+                Some(n) => n,
+                None => break,
             };
-            let timer_id = shared
-                .timer_runtime
-                .lock()
-                .start(std::time::Duration::from_nanos(duration_ns as u64));
-            let event = RuntimeEvent::TimerFired(timer_id);
-            let fired = shared.timer_runtime.lock().is_fired(timer_id);
-            if fired {
-                (event, Some(Value::VOID))
+
+            let node_start = frame.node_offset;
+            let graph_node_id = NodeId(local_id.0 + node_start);
+            let node = graph.nodes[graph_node_id.0 as usize];
+
+            // 预填充节点跳过 compute_fn
+            let pre_filled = frame.value_table.ready[local_id.0 as usize];
+            let value = if pre_filled {
+                frame.value_table.values[local_id.0 as usize].clone()
+            } else if graph.safe_op_flags[graph_node_id.0 as usize] {
+                let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
+                if !inputs.is_empty() && matches!(frame.get_value_by_global(inputs[0]), Value::Null) {
+                    Value::Null
+                } else {
+                    let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
+                    compute_fn(frame, graph_node_id)
+                }
             } else {
-                (event, None)
+                let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
+                compute_fn(frame, graph_node_id)
+            };
+
+            // vtable 动态分派
+            if frame.pending.is_none() {
+                if let Some(method_idx) = graph.vtable_call_methods[graph_node_id.0 as usize] {
+                    let n = &graph.nodes[graph_node_id.0 as usize];
+                    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                    let recv_val = frame.get_value_by_global(inputs[0]);
+
+                    let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val
+                        .heap_obj()
+                    {
+                        Some(crate::Value::HeapObj::TraitVal(tv)) => {
+                            let idx = method_idx as usize;
+                            match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
+                                Some(crate::Value::HeapObj::Closure(c)) => {
+                                    (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
+                                }
+                                _ => panic!("vtable method_idx {} is not a Closure", method_idx),
+                            }
+                        }
+                        _ => panic!("vtable call on non-trait value"),
+                    };
+
+                    let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
+                        .saturating_sub(upvalues.len());
+                    let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
+                    for &in_node in inputs.iter().skip(1).take(arity) {
+                        args.push(frame.get_value_by_global(in_node));
+                    }
+                    args.extend(upvalues);
+
+                    let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
+                    frame.pending = Some(Pending::Call(PendingCall {
+                        target_sg,
+                        args,
+                        call_node_local,
+                        is_async: false,
+                        closure_val: None,
+                    }));
+                }
             }
+
+            // 统一消费 pending
+            let pending = frame.pending.take();
+            if let Some(pending) = pending {
+                match pending {
+                    crate::Ir::Pending::Call(pending) => {
+                        // 尾调用图跳转
+                        let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
+                        if graph.tail_call_flags[graph_call_id.0 as usize] {
+                            // 尾调用传播：从 frames 取出 caller 帧并 switch
+                            let caller = frame.caller;
+                            let propagate_to_parent =
+                                if let Some((caller_fid, call_node)) = caller {
+                                    let frames = self.frames.lock();
+                                    if let Some(caller_frame) = frames.get(&caller_fid) {
+                                        let caller_sg_id = caller_frame.subgraph_id;
+                                        let caller_loop_kind =
+                                            graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
+                                        let caller_has_caller = caller_frame.caller.is_some();
+                                        let caller_offset = caller_frame.node_offset;
+                                        let caller_graph_node =
+                                            NodeId(call_node.0 + caller_offset);
+                                        let caller_is_gate = graph.nodes[caller_graph_node.0
+                                            as usize]
+                                            .kind
+                                            == NodeKind::Gate;
+                                        caller_is_gate
+                                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
+                                            && caller_has_caller
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                            if propagate_to_parent {
+                                let (caller_fid, _) = caller.unwrap();
+                                let orig_caller = {
+                                    let mut frames = self.frames.lock();
+                                    frames.remove(&caller_fid).and_then(|cf| cf.caller)
+                                };
+                                self.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
+                                self.pending_completions.lock().remove(&caller_fid);
+                                frame.caller = orig_caller;
+                                switch_subgraph(
+                                    frame,
+                                    &graph,
+                                    pending.target_sg,
+                                    &pending.args,
+                                );
+                            } else {
+                                switch_subgraph(
+                                    frame,
+                                    &graph,
+                                    pending.target_sg,
+                                    &pending.args,
+                                );
+                            }
+                            continue;
+                        }
+
+                        // LoopBody 帧复用（从 Engine 版本移植）
+                        let target_loop_kind =
+                            graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
+                        let child_fid = if target_loop_kind
+                            == crate::Ir::LoopKind::LoopBody
+                        {
+                            if let Some(bfid) = frame.body_frame_id {
+                                // 复用 body_sg 帧：注入参数 + 入就绪队列
+                                let target_sg =
+                                    &graph.subgraphs[pending.target_sg.0 as usize];
+                                let param_count = target_sg.param_count as usize;
+                                let mut body_frame = self.frames.lock().remove(&bfid);
+                                if let Some(bf) = body_frame.as_mut() {
+                                    // 使用 bf.node_offset 计算参数的本地索引：
+                                    // 同函数分支帧的 node_offset 是父函数的 node_start，
+                                    // 参数在值表中的位置 = branch_start - parent_start + i。
+                                    // 跨函数调用时 param_local_offset=0，与原逻辑一致。
+                                    let parent_start = bf.node_offset;
+                                    let branch_start = target_sg.node_range.0 .0;
+                                    let param_local_offset =
+                                        (branch_start.wrapping_sub(parent_start)) as usize;
+                                    for (i, arg) in
+                                        pending.args.iter().enumerate().take(param_count)
+                                    {
+                                        let local_id =
+                                            NodeId((param_local_offset + i) as u32);
+                                        let gid = (branch_start as usize) + i;
+                                        let consumer_count =
+                                            graph.downstreams[gid].len() as u16;
+                                        bf.set_value(local_id, arg.clone(), consumer_count);
+                                        bf.push_ready(local_id);
+                                    }
+                                    bf.caller = Some((fid, pending.call_node_local));
+                                    bf.parent_frame_ptr = std::ptr::null_mut();
+                                    bf.state = FrameState::Ready;
+                                }
+                                if let Some(bf) = body_frame {
+                                    self.frames.lock().insert(bfid, bf);
+                                }
+                                bfid
+                            } else {
+                                // 首次创建 body_sg 帧
+                                let bfid = self.start_subgraph(
+                                    fid,
+                                    pending.call_node_local,
+                                    pending.target_sg,
+                                    &pending.args,
+                                    frame,
+                                    pending.closure_val.clone(),
+                                );
+                                frame.body_frame_id = Some(bfid);
+                                bfid
+                            }
+                        } else {
+                            // 非 LoopBody：正常 start_subgraph
+                            self.start_subgraph(
+                                fid,
+                                pending.call_node_local,
+                                pending.target_sg,
+                                &pending.args,
+                                frame,
+                                pending.closure_val.clone(),
+                            )
+                        };
+
+                        // 子帧入队
+                        queue.push(child_fid);
+
+                        if pending.is_async {
+                            // async call：当前帧不挂起，call 节点写 AsyncHandle + 通知下游
+                            let async_id = self.async_join_runtime.lock().alloc_id();
+                            let async_handle = Value::i32(async_id.0 as i32);
+                            self.async_join_runtime.lock().register(async_id, child_fid);
+
+                            let node_start = frame.node_offset;
+                            let graph_node_id =
+                                NodeId(pending.call_node_local.0 + node_start);
+                            let consumer_count =
+                                graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                            frame.set_value(
+                                pending.call_node_local,
+                                async_handle,
+                                consumer_count,
+                            );
+                            notify_downstream(
+                                frame,
+                                &graph,
+                                pending.call_node_local,
+                                graph_node_id,
+                                NodeId(node_start),
+                            );
+                            continue;
+                        } else {
+                            // sync call：当前帧挂起等 SubgraphComplete 事件
+                            self.event_waiters.lock().push((
+                                RuntimeEvent::SubgraphComplete(child_fid),
+                                fid,
+                            ));
+                            frame.state = FrameState::Suspended;
+                            frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
+                            frame.suspend_event =
+                                Some(RuntimeEvent::SubgraphComplete(child_fid));
+                            return;
+                        }
+                    }
+
+                    crate::Ir::Pending::ChannelNotify(ch_id) => {
+                        self.on_event_arrived(
+                            RuntimeEvent::ChannelReady(ch_id),
+                            Value::VOID,
+                            queue,
+                        );
+                    }
+
+                    crate::Ir::Pending::Await(pending) => {
+                        let (event, ready_value) = self.resolve_and_check_await(&pending);
+
+                        if let Some(value) = ready_value {
+                            let node_start = frame.node_offset;
+                            let graph_node_id =
+                                NodeId(pending.await_node_local.0 + node_start);
+                            let consumer_count =
+                                graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                            frame.set_value(pending.await_node_local, value, consumer_count);
+                            notify_downstream(
+                                frame,
+                                &graph,
+                                pending.await_node_local,
+                                graph_node_id,
+                                NodeId(node_start),
+                            );
+                            continue;
+                        } else {
+                            self.event_waiters.lock().push((event, fid));
+                            frame.state = FrameState::Suspended;
+                            frame.suspend_state =
+                                SuspendState::WaitingEvent(pending.await_node_local);
+                            frame.suspend_event = Some(event);
+                            return;
+                        }
+                    }
+
+                    crate::Ir::Pending::Cancel(async_id) => {
+                        let child_fid = self
+                            .async_join_runtime
+                            .lock()
+                            .find_child_by_async_id(async_id);
+                        if let Some(child_fid) = child_fid {
+                            self.cancel_frame(child_fid, queue);
+                        }
+                        let consumer_count =
+                            graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                        frame.set_value(local_id, Value::VOID, consumer_count);
+                        notify_downstream(
+                            frame,
+                            &graph,
+                            local_id,
+                            graph_node_id,
+                            NodeId(node_start),
+                        );
+                        continue;
+                    }
+
+                    crate::Ir::Pending::SelectWait(gate_local) => {
+                        let info = graph.select_infos[graph_node_id.0 as usize].clone();
+
+                        if let Some(info) = info {
+                            let mut ready_branch: Option<SubGraphId> = None;
+                            for (branch_idx, branch) in info.branches.iter().enumerate() {
+                                let event_val =
+                                    frame.get_value_by_global(branch.event_source_node);
+                                let is_ready = match branch.event_kind {
+                                    EventSourceKind::Channel => {
+                                        event_val
+                                            .heap_obj()
+                                            .and_then(|h| h.channel())
+                                            .map_or(false, |ch| ch.has_data() || ch.is_closed())
+                                    }
+                                    EventSourceKind::Timer => {
+                                        let timer_id = {
+                                            if let Some((_, tid)) = frame
+                                                .select_timers
+                                                .iter()
+                                                .find(|(idx, _)| *idx == branch_idx)
+                                            {
+                                                *tid
+                                            } else {
+                                                let duration_ms = event_val.as_i32();
+                                                let tid = self.timer_runtime.lock().start(
+                                                    std::time::Duration::from_millis(
+                                                        duration_ms as u64,
+                                                    ),
+                                                );
+                                                frame.select_timers.push((branch_idx, tid));
+                                                tid
+                                            }
+                                        };
+                                        self.timer_runtime.lock().is_fired(timer_id)
+                                    }
+                                    _ => false,
+                                };
+                                if is_ready {
+                                    ready_branch = Some(branch.subgraph_id);
+                                    break;
+                                }
+                            }
+
+                            if let Some(sg_id) = ready_branch {
+                                let child_fid =
+                                    self.start_subgraph(fid, gate_local, sg_id, &[], frame, None);
+                                queue.push(child_fid);
+                                self.event_waiters.lock().push((
+                                    RuntimeEvent::SubgraphComplete(child_fid),
+                                    fid,
+                                ));
+                                frame.state = FrameState::Suspended;
+                                frame.suspend_state =
+                                    SuspendState::WaitingSubgraph(child_fid);
+                                frame.suspend_event =
+                                    Some(RuntimeEvent::SubgraphComplete(child_fid));
+                                return;
+                            } else {
+                                for (branch_idx, branch) in info.branches.iter().enumerate() {
+                                    let event_val = frame
+                                        .get_value_by_global(branch.event_source_node);
+                                    let event = match branch.event_kind {
+                                        EventSourceKind::Channel => {
+                                            if let Some(ch) = event_val
+                                                .heap_obj()
+                                                .and_then(|h| h.channel())
+                                            {
+                                                RuntimeEvent::ChannelReady(
+                                                    crate::Ir::ChannelId(ch.id()),
+                                                )
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        EventSourceKind::Timer => {
+                                            let timer_id = frame
+                                                .select_timers
+                                                .iter()
+                                                .find(|(idx, _)| *idx == branch_idx)
+                                                .map(|(_, tid)| *tid)
+                                                .expect(
+                                                    "select timer should be started above",
+                                                );
+                                            RuntimeEvent::TimerFired(timer_id)
+                                        }
+                                        _ => continue,
+                                    };
+                                    self.event_waiters.lock().push((event, fid));
+                                }
+                                frame.state = FrameState::Suspended;
+                                frame.suspend_state =
+                                    SuspendState::WaitingEvent(gate_local);
+                                frame.suspend_event = None;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 普通节点：写值表 + 检查控制信号 + 通知下游
+            let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
+            frame.set_value(local_id, value.clone(), consumer_count);
+
+            // 检查控制信号
+            let signal_kind = graph.control_signal_nodes[graph_node_id.0 as usize];
+            if let Some(kind) = signal_kind {
+                frame.control_signal = match kind {
+                    SignalKind::Return => ControlSignal::Return(value),
+                    SignalKind::Break => ControlSignal::Break,
+                    SignalKind::Continue => ControlSignal::Continue,
+                };
+                break;
+            }
+
+            // 通知下游（含槽级 RC）
+            notify_downstream(frame, &graph, local_id, graph_node_id, NodeId(node_start));
         }
-        EventSourceKind::SubgraphComplete => {
-            panic!("SubgraphComplete should not go through await path");
-        }
-    }
-}
 
-/// 取消帧：CAS Suspended → Cancelling + 入就绪队列。
-fn cancel_frame_shared(
-    shared: &SharedEngine,
-    frame_id: FrameId,
-    local_queue: &DequeWorker<FrameId>,
-) {
-    let mut frame = {
-        let mut frames = shared.frames.lock();
-        match frames.remove(&frame_id) {
-            Some(f) => f,
-            None => return, // 帧正被其他 worker 处理，跳过
-        }
-    };
-
-    if frame.state != FrameState::Suspended {
-        shared.frames.lock().insert(frame_id, frame);
-        return;
-    }
-
-    // 移除事件等待注册
-    if let Some(event) = frame.suspend_event {
-        shared
-            .event_waiters
-            .lock()
-            .retain(|(e, fid)| !(*e == event && *fid == frame_id));
-    } else {
-        // select 帧：移除该帧所有事件等待
-        shared
-            .event_waiters
-            .lock()
-            .retain(|(_, fid)| *fid != frame_id);
-    }
-
-    frame.state = FrameState::Cancelling;
-    frame.suspend_state = SuspendState::NotSuspended;
-    frame.suspend_event = None;
-
-    shared.frames.lock().insert(frame_id, frame);
-    local_queue.push(frame_id);
-}
-
-// =========================================================================
-// run_frame_nodes — 执行帧就绪节点（从 Engine::run_ready_nodes 提取）
-// =========================================================================
-
-/// 执行帧内所有就绪节点，直到就绪队列空或帧挂起。
-///
-/// 从 Engine::run_ready_nodes 提取核心逻辑，改为基于 SharedEngine。
-/// 帧执行时无锁（frame 已从 frames HashMap 取出独占）。
-/// 需要访问 runtime 时单独锁对应 Mutex。
-fn run_frame_nodes(
-    shared: &SharedEngine,
-    frame: &mut Frame,
-    fid: FrameId,
-    local_queue: &DequeWorker<FrameId>,
-) {
-    let graph = frame.graph.clone();
-
-    loop {
-        // 检查控制信号（return/break/continue 已触发）
-        if !matches!(frame.control_signal, ControlSignal::None) {
-            break;
-        }
-
-        // 检查帧是否被取消（spec 5.3：跳过节点执行，走 defer 清理）
-        if frame.state == FrameState::Cancelling {
-            break;
-        }
-
-        // 检查帧是否挂起
+        // 帧挂起：不执行 defer，不标记 Completed
         if frame.state == FrameState::Suspended {
             return;
         }
 
-        // SIMD/rayon 批量化：drain ready_queue → 按 (ScalarTag,BatchOp) 分组 → 批算
-        if try_batch_nodes(frame, &graph) {
-            continue;
-        }
-
-        // 弹出就绪节点（局部 id）
-        let local_id = match frame.pop_ready() {
-            Some(n) => n,
-            None => break,
-        };
-
-        let node_start = frame.node_offset;
-        let graph_node_id = NodeId(local_id.0 + node_start);
-        let node = graph.nodes[graph_node_id.0 as usize];
-
-        // 预填充节点跳过 compute_fn（safe_op 标记：inputs[0] 为 Null 时短路返回 Null）
-        let pre_filled = frame.value_table.ready[local_id.0 as usize];
-        let value = if pre_filled {
-            frame.value_table.values[local_id.0 as usize].clone()
-        } else if graph.safe_op_flags[graph_node_id.0 as usize] {
-            let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
-            if !inputs.is_empty() && matches!(frame.get_value_by_global(inputs[0]), Value::Null) {
-                Value::Null
-            } else {
-                let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
-                compute_fn(frame, graph_node_id)
-            }
-        } else {
-            let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
-            compute_fn(frame, graph_node_id)
-        };
-
-        // vtable 动态分派：Call 节点有 vtable_call_methods 但无 call_target
-        if frame.pending.is_none() {
-            if let Some(method_idx) =
-                graph.vtable_call_methods[graph_node_id.0 as usize]
-            {
-                let n = &graph.nodes[graph_node_id.0 as usize];
-                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-                let recv_val = frame.get_value_by_global(inputs[0]);
-
-                // 从 TraitVal 查方法 Closure，取 subgraph_id + upvalues
-                let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
-                    Some(crate::Value::HeapObj::TraitVal(tv)) => {
-                        let idx = method_idx as usize;
-                        match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                            Some(crate::Value::HeapObj::Closure(c)) => {
-                                (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
-                            }
-                            _ => panic!("vtable method_idx {} is not a Closure", method_idx),
-                        }
-                    }
-                    _ => panic!("vtable call on non-trait value"),
-                };
-
-                // 参数组装：跳过 receiver (inputs[0])，取方法实参 (inputs[1..1+arity])，
-                // 再追加 Closure 携带的 upvalues，与子图参数节点顺序一致。
-                let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
-                    .saturating_sub(upvalues.len());
-                let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
-                for &in_node in inputs.iter().skip(1).take(arity) {
-                    args.push(frame.get_value_by_global(in_node));
-                }
-                args.extend(upvalues);
-
-                let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
-                frame.pending = Some(Pending::Call(PendingCall {
-                    target_sg,
-                    args,
-                    call_node_local,
-                    is_async: false,
-                }));
-            }
-        }
-
-        // 统一消费 pending（compute_fn 产出，调度器消费）
-        let pending = frame.pending.take();
-        if let Some(pending) = pending {
-            match pending {
-            crate::Ir::Pending::Call(pending) => {
-
-            // 尾调用图跳转：编译期标记的尾调用复用当前帧（帧池零分配）
-            let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
-            if graph.tail_call_flags[graph_call_id.0 as usize] {
-                // 分支中的尾调用传播（与非共享路径同逻辑）
-                let caller = frame.caller;
-                let propagate_to_parent = if let Some((caller_fid, call_node)) = caller {
-                    let frames = shared.frames.lock();
-                    if let Some(caller_frame) = frames.get(&caller_fid) {
-                        let caller_sg_id = caller_frame.subgraph_id;
-                        let caller_loop_kind = graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
-                        let caller_has_caller = caller_frame.caller.is_some();
-                        let caller_offset = caller_frame.node_offset;
-                        let caller_graph_node = NodeId(call_node.0 + caller_offset);
-                        let caller_is_gate = graph.nodes[caller_graph_node.0 as usize].kind == NodeKind::Gate;
-                        caller_is_gate
-                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
-                            && caller_has_caller
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if propagate_to_parent {
-                    let (caller_fid, _) = caller.unwrap();
-                    let orig_caller = {
-                        let mut frames = shared.frames.lock();
-                        frames.remove(&caller_fid).and_then(|cf| cf.caller)
-                    };
-                    shared.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
-                    shared.pending_completions.lock().remove(&caller_fid);
-                    frame.caller = orig_caller;
-                    switch_subgraph_shared(frame, &graph, pending.target_sg, &pending.args);
-                } else {
-                    switch_subgraph_shared(frame, &graph, pending.target_sg, &pending.args);
-                }
-                continue;
-            }
-
-            // Call/Gate/AsyncCall 节点：执行 start_subgraph
-            let child_fid = start_subgraph_shared(
-                shared,
-                fid,
-                pending.call_node_local,
-                pending.target_sg,
-                &pending.args,
-            );
-
-            // 子帧入本地队列
-            local_queue.push(child_fid);
-
-            if pending.is_async {
-                // async call：当前帧不挂起，call 节点写 AsyncHandle + 通知下游
-                let async_id = shared.async_join_runtime.lock().alloc_id();
-                let async_handle = Value::i32(async_id.0 as i32);
-                shared.async_join_runtime.lock().register(async_id, child_fid);
-
-                let node_start = frame.node_offset;
-                let graph_node_id = NodeId(pending.call_node_local.0 + node_start);
-                let consumer_count =
-                    graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                frame.set_value(pending.call_node_local, async_handle, consumer_count);
-                notify_downstream_shared(
-                    frame,
-                    &graph,
-                    pending.call_node_local,
-                    graph_node_id,
-                    NodeId(node_start),
-                );
-                continue;
-            } else {
-                // sync call：当前帧挂起等 SubgraphComplete 事件
-                shared.event_waiters.lock().push((RuntimeEvent::SubgraphComplete(child_fid), fid));
-                frame.state = FrameState::Suspended;
-                frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
-                frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
-                return;
-            }
-            }
-
-            crate::Ir::Pending::ChannelNotify(ch_id) => {
-                on_event_arrived_shared(
-                shared,
-                RuntimeEvent::ChannelReady(ch_id),
-                Value::VOID,
-                local_queue,
-                );
-
-            }
-
-            crate::Ir::Pending::Await(pending) => {
-
-            let (event, ready_value) = resolve_and_check_await_shared(shared, &pending);
-
-            if let Some(value) = ready_value {
-                // 就绪：注入值到 await 节点 + 通知下游 + 继续执行
-                let node_start = frame.node_offset;
-                let graph_node_id = NodeId(pending.await_node_local.0 + node_start);
-                let consumer_count =
-                    graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                frame.set_value(pending.await_node_local, value, consumer_count);
-                notify_downstream_shared(
-                    frame,
-                    &graph,
-                    pending.await_node_local,
-                    graph_node_id,
-                    NodeId(node_start),
-                );
-                continue;
-            } else {
-                // 未就绪：帧挂起，立即注册 event_waiters（与单线程版一致）
-                shared.event_waiters.lock().push((event, fid));
-                frame.state = FrameState::Suspended;
-                frame.suspend_state = SuspendState::WaitingEvent(pending.await_node_local);
-                frame.suspend_event = Some(event);
-                return;
-            }
-            }
-
-            crate::Ir::Pending::Cancel(async_id) => {
-            let child_fid = shared
-                .async_join_runtime
-                .lock()
-                .find_child_by_async_id(async_id);
-            if let Some(child_fid) = child_fid {
-                cancel_frame_shared(shared, child_fid, local_queue);
-            }
-            let consumer_count =
-                graph.downstreams[graph_node_id.0 as usize].len() as u16;
-            frame.set_value(local_id, Value::VOID, consumer_count);
-            notify_downstream_shared(frame, &graph, local_id, graph_node_id, NodeId(node_start));
-                continue;
-            }
-
-            crate::Ir::Pending::SelectWait(gate_local) => {
-
-            let info = graph.select_infos[graph_node_id.0 as usize].clone();
-
-            if let Some(info) = info {
-                let mut ready_branch: Option<SubGraphId> = None;
-                for (branch_idx, branch) in info.branches.iter().enumerate() {
-                    let event_val = frame.get_value_by_global(branch.event_source_node);
-                    let is_ready = match branch.event_kind {
-                        EventSourceKind::Channel => {
-                            // channel 就绪条件：有数据 OR 已关闭（closed+空 → recv 返回 null，分支立即就绪）
-                            event_val.heap_obj()
-                                .and_then(|h| h.channel())
-                                .map_or(false, |ch| ch.has_data() || ch.is_closed())
-                        }
-                        EventSourceKind::Timer => {
-                            let timer_id = {
-                                if let Some((_, tid)) =
-                                    frame.select_timers.iter().find(|(idx, _)| *idx == branch_idx)
-                                {
-                                    *tid
-                                } else {
-                                    let duration_ms = event_val.as_i32();
-                                    let tid = shared.timer_runtime.lock().start(
-                                        std::time::Duration::from_millis(duration_ms as u64),
-                                    );
-                                    frame.select_timers.push((branch_idx, tid));
-                                    tid
-                                }
-                            };
-                            shared.timer_runtime.lock().is_fired(timer_id)
-                        }
-                        _ => false,
-                    };
-                    if is_ready {
-                        ready_branch = Some(branch.subgraph_id);
-                        break;
-                    }
-                }
-
-                if let Some(sg_id) = ready_branch {
-                    // 有就绪分支：启动分支子图
-                    let child_fid = start_subgraph_shared(shared, fid, gate_local, sg_id, &[]);
-                    local_queue.push(child_fid);
-                    shared.event_waiters.lock().push((RuntimeEvent::SubgraphComplete(child_fid), fid));
-                    frame.state = FrameState::Suspended;
-                    frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
-                    frame.suspend_event = Some(RuntimeEvent::SubgraphComplete(child_fid));
-                    return;
-                } else {
-                    // 无就绪分支：注册所有事件等待 + 帧挂起
-                    for (branch_idx, branch) in info.branches.iter().enumerate() {
-                        let event_val = frame.get_value_by_global(branch.event_source_node);
-                        let event = match branch.event_kind {
-                            EventSourceKind::Channel => {
-                                let ch = event_val.heap_obj().and_then(|h| h.channel())
-                                    .expect("select channel branch event_obj is not a ChannelValue");
-                                RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()))
-                            }
-                            EventSourceKind::Timer => {
-                                let timer_id = frame
-                                    .select_timers
-                                    .iter()
-                                    .find(|(idx, _)| *idx == branch_idx)
-                                    .map(|(_, tid)| *tid)
-                                    .expect("select timer should be started above");
-                                RuntimeEvent::TimerFired(timer_id)
-                            }
-                            _ => continue,
-                        };
-                        shared.event_waiters.lock().push((event, fid));
-                    }
-                    frame.state = FrameState::Suspended;
-                    frame.suspend_state = SuspendState::WaitingEvent(gate_local);
-                    frame.suspend_event = None;
-                    return;
-                }
-            }
-            }
-            }
-        }
-
-        // 普通节点：写值表 + 检查控制信号 + 通知下游
-        let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
-        frame.set_value(local_id, value.clone(), consumer_count);
-
-        // 检查控制信号
-        let signal_kind = graph.control_signal_nodes[graph_node_id.0 as usize];
-        if let Some(kind) = signal_kind {
-            frame.control_signal = match kind {
-                SignalKind::Return => ControlSignal::Return(value),
-                SignalKind::Break => ControlSignal::Break,
-                SignalKind::Continue => ControlSignal::Continue,
+        // 帧被取消：执行 defer 清理 + 标记 Failed（spec 5.3）
+        if frame.state == FrameState::Cancelling {
+            let defer_entries: Vec<DeferEntry> = {
+                let sg_id = frame.subgraph_id;
+                graph.subgraphs[sg_id.0 as usize].defer_table.clone()
             };
-            break;
+            for entry in defer_entries.iter().rev() {
+                let defer_fid = self.init_frame(entry.body_subgraph);
+                let mut defer_frame = self.frames.lock().remove(&defer_fid);
+                if let Some(df) = defer_frame.as_deref_mut() {
+                    self.run_frame_nodes(df, defer_fid, queue);
+                }
+                if let Some(df) = defer_frame {
+                    if df.state != FrameState::Completed {
+                        self.frames.lock().insert(defer_fid, df);
+                    }
+                }
+            }
+            frame.state = FrameState::Failed;
+            return;
         }
 
-        // 通知下游（含槽级 RC）
-        notify_downstream_shared(frame, &graph, local_id, graph_node_id, NodeId(node_start));
-    }
-
-    // 帧挂起：不执行 defer，不标记 Completed
-    if frame.state == FrameState::Suspended {
-        return;
-    }
-
-    // 帧被取消：执行 defer 清理 + 标记 Failed（spec 5.3）
-    if frame.state == FrameState::Cancelling {
+        // 执行 defer（LIFO）：任何终止路径都执行 defer
         let defer_entries: Vec<DeferEntry> = {
             let sg_id = frame.subgraph_id;
             graph.subgraphs[sg_id.0 as usize].defer_table.clone()
         };
         for entry in defer_entries.iter().rev() {
-            let defer_fid = init_frame_shared(shared, entry.body_subgraph);
-            let mut defer_frame = shared.frames.lock().remove(&defer_fid);
-            if let Some(defer_frame) = defer_frame.as_mut() {
-                run_frame_nodes(shared, defer_frame, defer_fid, local_queue);
+            let defer_fid = self.init_frame(entry.body_subgraph);
+            let mut defer_frame = self.frames.lock().remove(&defer_fid);
+            if let Some(df) = defer_frame.as_deref_mut() {
+                self.run_frame_nodes(df, defer_fid, queue);
+            }
+            if let Some(df) = defer_frame {
+                if df.state != FrameState::Completed {
+                    self.frames.lock().insert(defer_fid, df);
+                }
             }
         }
-        frame.state = FrameState::Failed;
-        return;
+
+        // 标记帧完成
+        frame.state = FrameState::Completed;
     }
 
-    // 执行 defer（LIFO）：任何终止路径都执行 defer
-    let defer_entries: Vec<DeferEntry> = {
-        let sg_id = frame.subgraph_id;
-        graph.subgraphs[sg_id.0 as usize].defer_table.clone()
-    };
-    for entry in defer_entries.iter().rev() {
-        let defer_fid = init_frame_shared(shared, entry.body_subgraph);
-        let mut defer_frame = shared.frames.lock().remove(&defer_fid);
-        if let Some(defer_frame) = defer_frame.as_mut() {
-            run_frame_nodes(shared, defer_frame, defer_fid, local_queue);
-        }
-    }
+    /// 启动子图：创建子帧 + 参数注入 + 绑定 caller。
+    /// 同函数分支子图（if-else/match arm）：值表扩展到父函数大小，复制父帧值，
+    /// 使分支节点可直接通过 get_value_by_global 访问外层变量（无需帧链指针）。
+    fn start_subgraph(
+        &self,
+        caller_fid: FrameId,
+        call_node: NodeId,
+        subgraph_id: SubGraphId,
+        args: &[Value],
+        parent_frame: &Frame,
+        closure_val: Option<Value>,
+    ) -> FrameId {
+        let child_fid = self.alloc_frame_id();
+        let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
+        let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
+        let same_function = parent_sg.function_id == child_sg.function_id;
 
-    // 标记帧完成
-    frame.state = FrameState::Completed;
-}
+        if same_function {
+            // 同函数分支：值表扩展到父帧大小，复制父帧值。
+            // 使用父帧的 node_offset/value_table.len() 而非 parent_sg.node_range，
+            // 因为嵌套闭包帧的布局由祖父帧决定（如 outer 帧的 node_offset 是 main 的
+            // node_start，而非 outer 子图的 node_range.0），使用 subgraph.node_range
+            // 会导致值表索引错位、节点被误标记为 ready 从而跳过 compute_fn。
+            let parent_start = parent_frame.node_offset;
+            let parent_node_count = parent_frame.value_table.len();
+            let (branch_start, _branch_end) = child_sg.node_range;
+            let branch_param_count = child_sg.param_count as usize;
 
-// =========================================================================
-// process_frame_shared — 处理一个帧（从 Engine::process_frame 提取）
-// =========================================================================
+            let mut child = Frame::new(child_fid, subgraph_id, parent_node_count, self.graph.clone());
+            child.node_offset = parent_start;
 
-/// 处理一个帧：执行就绪节点 + 处理状态转换。
-///
-/// 帧从 frames HashMap 取出后独占执行（无锁），完成后根据状态放回或释放。
-fn process_frame_shared(
-    shared: &Arc<SharedEngine>,
-    local_queue: &DequeWorker<FrameId>,
-    fid: FrameId,
-) {
-    // 检查 timer 事件
-    let fired_timers = shared.timer_runtime.lock().check_and_fire();
-    for tid in fired_timers {
-        on_event_arrived_shared(shared, RuntimeEvent::TimerFired(tid), Value::VOID, local_queue);
-    }
-
-    // 取出帧（短临界区）
-    let mut frame = {
-        let mut frames = shared.frames.lock();
-        match frames.remove(&fid) {
-            Some(f) => f,
-            None => return,
-        }
-    };
-
-    // 执行帧就绪节点（无锁）
-    run_frame_nodes(shared, &mut frame, fid, local_queue);
-
-    // 处理帧状态
-    let state = frame.state;
-    let has_caller = frame.caller.is_some();
-
-    match state {
-        FrameState::Suspended => {
-            let event = frame.suspend_event;
-            // 在 insert 前检查是否有 pending completion（子帧先完成但父帧尚未 insert 的竞态）
-            let pending = shared.pending_completions.lock().remove(&fid);
-            if let Some((call_node, return_value, child_signal)) = pending {
-                // 有 pending completion：直接消费完成事件，注入返回值并唤醒
-                // 挂起点已注册 event_waiters，消费完成事件需清理对应等待项（避免泄露）
-                if let Some(e) = event {
-                    shared.event_waiters.lock().retain(|(we, wf)| !(*we == e && *wf == fid));
-                } else {
-                    shared.event_waiters.lock().retain(|(_, wf)| *wf != fid);
+            // 复制父帧已就绪的值（refcount 设 0 = 永不回收，帧结束时统一释放）
+            // 跳过 child_sg 范围内的节点：递归调用时 child_sg 是函数体子图，
+            // 分支内节点（如 n-1）的旧计算结果不能复制，否则子帧不会重新计算，
+            // 导致递归参数不递减（fact(n-1) 反复传入相同的旧 n-1 值）。
+            for i in 0..parent_node_count {
+                let gid = (parent_start as usize + i) as u32;
+                let in_child = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
+                if in_child {
+                    continue;
                 }
-                let _ = child_signal; // 控制信号已在 complete_and_wake_caller_shared 中处理
-                let caller_sg_id = frame.subgraph_id;
-                let caller_offset = shared.graph.subgraphs[caller_sg_id.0 as usize].node_range.0;
+                if parent_frame.value_table.ready[i] {
+                    child.value_table.values[i] = parent_frame.value_table.values[i].clone();
+                    child.value_table.ready[i] = true;
+                    child.value_table.refcounts[i] = 0;
+                }
+            }
+
+            // 收集分支内嵌套子图范围
+            let nested_ranges: Vec<(u32, u32)> = self.graph.subgraphs.iter()
+                .filter(|sg| sg.id != subgraph_id
+                    && sg.node_range.0 .0 >= branch_start.0
+                    && sg.node_range.1 .0 <= child_sg.node_range.1 .0)
+                .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
+                .collect();
+            let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
+
+            // 设置 pending_inputs：分支节点按实际未就绪输入计数，非分支节点标记 EXTERNAL
+            for i in 0..parent_node_count {
+                let gid = (parent_start as usize + i) as u32;
+                let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
+                if !in_branch || is_nested(gid) {
+                    child.pending_inputs[i] = PENDING_EXTERNAL;
+                    continue;
+                }
+                let node = &self.graph.nodes[gid as usize];
+                if node.kind == NodeKind::EventSource {
+                    child.pending_inputs[i] = PENDING_EXTERNAL;
+                } else if node.kind == NodeKind::Gate && self.graph.select_infos[gid as usize].is_some() {
+                    child.pending_inputs[i] = 0;
+                } else {
+                    // Gate（非 select）和普通节点统一：按实际 in-frame 未就绪输入计数
+                    let inputs = self.graph.inputs_pool.get(node.inputs_offset, node.input_count);
+                    let mut pending = 0u8;
+                    for &inp in inputs {
+                        let il = inp.0.wrapping_sub(parent_start) as usize;
+                        if il < parent_node_count {
+                            if !child.value_table.ready[il] { pending += 1; }
+                        } else { pending += 1; }
+                    }
+                    child.pending_inputs[i] = pending;
+                }
+            }
+
+            // 预填充分支内 Const 节点
+            for i in 0..parent_node_count {
+                let gid = (parent_start as usize + i) as u32;
+                let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
+                if !in_branch || is_nested(gid) { continue; }
+                if self.graph.nodes[gid as usize].kind == NodeKind::Const {
+                    if let Some(cv) = self.graph.const_values[gid as usize] {
+                        let handle = alloc_const_value(cv);
+                        let cc = self.graph.downstreams[gid as usize].len() as u16;
+                        child.set_value(NodeId(i as u32), handle, cc);
+                        child.push_ready(NodeId(i as u32));
+                    }
+                }
+            }
+
+            // 参数注入（local 索引 = branch_start - parent_start + i）
+            // 实际参数注入调用方传入的 arg 值；
+            // upvalue 参数注入当前父帧值（引用捕获语义），使 same_function 调用
+            // 能看到外层变量的最新值（而非闭包构造时的快照）。
+            let param_local_offset = branch_start.0.wrapping_sub(parent_start) as usize;
+            let actual_param_count = branch_param_count
+                .saturating_sub(child_sg.upvalue_count as usize);
+            // 实际参数
+            for (i, arg) in args.iter().enumerate().take(actual_param_count) {
+                let lid = NodeId((param_local_offset + i) as u32);
+                let gid = branch_start.0 as usize + i;
+                let cc = self.graph.downstreams[gid].len() as u16;
+                child.set_value(lid, arg.clone(), cc);
+                child.push_ready(lid);
+            }
+            // upvalue 参数：优先从父帧读取（引用捕获语义，使 same_function 调用
+            // 能看到外层变量的最新值），父帧无此值时回退到 args 中的 Cell 解包值
+            // （逃逸闭包场景：upvalue 来自已销毁的帧，如循环体局部变量）。
+            for (i, &outer_node) in child_sg.upvalue_outer_nodes.iter().enumerate() {
+                let arg_idx = actual_param_count + i;
+                if arg_idx >= branch_param_count { break; }
+                let lid = NodeId((param_local_offset + arg_idx) as u32);
+                let gid = branch_start.0 as usize + arg_idx;
+                let cc = self.graph.downstreams[gid].len() as u16;
+                // 直接检查父帧是否就绪：get_value_by_global 在 pending_inputs=0
+                // 且未就绪时会返回未初始化的值表内容（非 NULL），不能用 is_null 判断。
+                let parent_local = outer_node.0.wrapping_sub(parent_frame.node_offset);
+                let parent_ready = (parent_local as usize) < parent_frame.value_table.len()
+                    && parent_frame.value_table.ready[parent_local as usize];
+                let val = if parent_ready {
+                    parent_frame.get_value_by_global(outer_node)
+                } else if arg_idx < args.len() {
+                    args[arg_idx].clone()
+                } else {
+                    parent_frame.get_value_by_global(outer_node)
+                };
+                child.set_value(lid, val, cc);
+                child.push_ready(lid);
+            }
+
+            // 分支内 0-input 非 Const 非 Param 节点入队
+            for i in 0..parent_node_count {
+                let gid = (parent_start as usize + i) as u32;
+                let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
+                if !in_branch || is_nested(gid) { continue; }
+                let local_in_branch = (gid - branch_start.0) as usize;
+                if local_in_branch < branch_param_count { continue; }
+                if self.graph.nodes[gid as usize].kind == NodeKind::Const { continue; }
+                if child.pending_inputs[i] == 0 && !child.value_table.ready[i] {
+                    child.push_ready(NodeId(i as u32));
+                }
+            }
+
+            child.caller = Some((caller_fid, call_node));
+
+            // 帧链指针在 process_frame 的 setup_frame_chain 中设置
+            child.root_frame_ptr = std::ptr::null_mut();
+            child.parent_frame_ptr = std::ptr::null_mut();
+            child.closure_val = closure_val;
+
+            self.frames.lock().insert(child_fid, Box::new(child));
+            child_fid
+        } else {
+            // 跨函数调用：原有逻辑
+            let (node_start, node_end) = child_sg.node_range;
+            let node_count = (node_end.0 - node_start.0) as usize;
+            let offset = node_start.0 as usize;
+
+            let mut child = Frame::new(child_fid, subgraph_id, node_count, self.graph.clone());
+            self.prepare_frame(&mut child);
+
+            let param_count = child_sg.param_count as usize;
+            for (i, arg) in args.iter().enumerate().take(param_count) {
+                let local_id = NodeId(i as u32);
+                let consumer_count = self.graph.downstreams[offset + i].len() as u16;
+                child.set_value(local_id, arg.clone(), consumer_count);
+                child.push_ready(local_id);
+            }
+
+            child.caller = Some((caller_fid, call_node));
+            child.root_frame_ptr = std::ptr::null_mut();
+            child.parent_frame_ptr = std::ptr::null_mut();
+            child.closure_val = closure_val;
+
+            self.frames.lock().insert(child_fid, Box::new(child));
+            child_fid
+        }
+    }
+
+    /// 子图完成后：回写返回值到调用方 + 唤醒调用方。
+    /// 含 LoopBody 完成检测 + pending_completions 竞态处理。
+    fn complete_and_wake_caller(&self, child_frame: Frame, queue: &QueueHandle<'_>) {
+        // LoopBody 完成检测（从 Engine 版本移植）
+        let child_sg_id = child_frame.subgraph_id;
+        let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
+        if child_loop_kind == crate::Ir::LoopKind::LoopBody {
+            let child_signal = child_frame.control_signal.clone();
+            let (loop_fid, _call_node) = child_frame
+                .caller
+                .expect("LoopBody frame missing caller");
+            match child_signal {
+                ControlSignal::Break | ControlSignal::Return(_) => {
+                    // break/return → 循环退出
+                    let mut loop_frame = self.frames.lock().remove(&loop_fid);
+                    if let Some(lf) = loop_frame.as_deref_mut() {
+                        lf.body_frame_id = None;
+                        lf.control_signal = child_signal;
+                    }
+                    // 递归处理 loop_frame（loop_kind 是 While/Loop/For，非 LoopBody）
+                    if let Some(lf) = loop_frame {
+                        self.complete_and_wake_caller(*lf, queue);
+                    }
+                    // child_frame (body) 已 drop，不放回
+                    return;
+                }
+                ControlSignal::Continue | ControlSignal::None => {
+                    // continue/正常完成 → 循环重置（帧复用）
+                    let mut loop_frame = self.frames.lock().remove(&loop_fid);
+                    let mut child = child_frame; // 取得所有权以便修改
+                    if let Some(lf) = loop_frame.as_deref_mut() {
+                        self.reset_loop_iteration(lf, loop_fid, &mut child);
+                    }
+                    if let Some(lf) = loop_frame {
+                        self.frames.lock().insert(loop_fid, lf);
+                        queue.push(loop_fid);
+                    }
+                    // body 帧已重置，放回 HashMap（不入队）。
+                    // body 的重新执行只应由 loop 帧在 cond 为真时通过
+                    // 帧复用路径（start_subgraph / queue.push）触发。
+                    // 若在此入队，会导致 body 双重执行 + 循环退出后
+                    // stale caller 引用（loop 帧已 drop）。
+                    let body_id = child.id;
+                    self.frames.lock().insert(body_id, Box::new(child));
+                    return;
+                }
+            }
+        }
+
+        // 非 LoopBody：回写返回值 + 唤醒 caller（含 pending_completions 竞态处理）
+        let return_value = extract_child_return(&child_frame, &self.graph);
+        let child_signal = child_frame.control_signal.clone();
+        let caller = child_frame.caller;
+        // child_frame 在此之后 drop
+
+        if let Some((caller_fid, call_node)) = caller {
+            let mut caller_frame_opt = self.frames.lock().remove(&caller_fid);
+            if caller_frame_opt.is_none() {
+                // 父帧尚未 insert 回 HashMap，存储完成信息等待重试
+                self.pending_completions.lock().insert(
+                    caller_fid,
+                    (call_node, return_value, child_signal),
+                );
+                return;
+            }
+            if let Some(caller_frame) = caller_frame_opt.as_deref_mut() {
+                // 使用 caller_frame.node_offset 而非 subgraph.node_range.0：
+                // 同函数分支帧的 node_offset 是父函数的 node_start，
+                // 而 subgraph.node_range.0 是分支子图的 node_start，两者不同。
+                // 用错会导致 call_graph_id 偏移错误 → notify_downstream 找不到下游
+                // → 下游节点 ready 标记永远不被设置 → 帧挂起。
+                let caller_offset = NodeId(caller_frame.node_offset);
                 let call_graph_id = NodeId(call_node.0 + caller_offset.0);
-                let consumer_count = shared.graph.downstreams[call_graph_id.0 as usize].len() as u16;
-                frame.set_value(call_node, return_value, consumer_count);
-                frame.state = FrameState::Ready;
-                frame.suspend_state = SuspendState::NotSuspended;
-                frame.suspend_event = None;
-                notify_downstream_shared(
-                    &mut frame,
-                    &shared.graph,
+                let consumer_count =
+                    self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
+
+                caller_frame.set_value(call_node, return_value, consumer_count);
+                caller_frame.state = FrameState::Ready;
+                caller_frame.suspend_state = SuspendState::NotSuspended;
+                caller_frame.suspend_event = None;
+
+                // Gate 分支子图的控制信号传播
+                let is_gate =
+                    self.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
+                if is_gate && !matches!(child_signal, ControlSignal::None) {
+                    caller_frame.control_signal = child_signal;
+                }
+
+                notify_downstream(
+                    caller_frame,
+                    &self.graph,
                     call_node,
                     call_graph_id,
                     caller_offset,
                 );
-                shared.frames.lock().insert(fid, frame);
-                local_queue.push(fid);
-            } else {
-                // event_waiters 已在 run_frame_nodes 挂起点注册，此处仅 insert 帧
-                shared.frames.lock().insert(fid, frame);
+            }
+            if let Some(caller_frame) = caller_frame_opt {
+                self.frames.lock().insert(caller_fid, caller_frame);
+                queue.push(caller_fid);
             }
         }
-        FrameState::Completed => {
-            if has_caller {
-                // 区分 sync call vs async call 子帧完成
-                let async_id = shared.async_join_runtime.lock().find_by_child(fid);
-                if let Some(async_id) = async_id {
-                    // async 子帧完成：设置 result + 触发 AsyncJoin 事件
-                    let return_value = extract_child_return_shared(&frame, &shared.graph);
-                    shared
-                        .async_join_runtime
-                        .lock()
-                        .set_result(async_id, return_value.clone());
-                    // 不放回 frame（free）
-                    on_event_arrived_shared(
-                        shared,
-                        RuntimeEvent::AsyncJoin(async_id),
-                        return_value,
-                        local_queue,
-                    );
+        // 子帧已完成，由调用方负责 drop（不放回 frames）
+    }
+
+    /// 循环迭代重置：body_sg 完成后重置循环帧 + 复用 body_sg 帧。
+    /// 从 Engine 版本移植，改为 &self + &mut Frame 参数
+    fn reset_loop_iteration(
+        &self,
+        loop_frame: &mut Frame,
+        loop_fid: FrameId,
+        body_frame: &mut Frame,
+    ) {
+        let loop_sg_id = loop_frame.subgraph_id;
+        let (loop_kind, cond_node, return_node, iter_next_node) = {
+            let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
+            (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node)
+        };
+        // 使用 loop_frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
+        let loop_offset = loop_frame.node_offset;
+
+        // 1. For 循环：额外重置 iter_next_node
+        if loop_kind == crate::Ir::LoopKind::For {
+            if let Some(next_node) = iter_next_node {
+                let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
+                Self::reset_node_ready(loop_frame, next_local);
+                loop_frame.push_ready(next_local);
+            }
+        }
+
+        // 2. 重置 cond_node
+        if let Some(cond_node) = cond_node {
+            let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
+            if loop_kind == crate::Ir::LoopKind::For {
+                Self::reset_node_pending(loop_frame, cond_local, 1);
+            } else {
+                Self::reset_node_ready(loop_frame, cond_local);
+                // Const cond_node 重新预填充
+                if self.graph.nodes[cond_node.0 as usize].kind == crate::Ir::NodeKind::Const {
+                    if let Some(cv) = self.graph.const_values[cond_node.0 as usize] {
+                        let handle = alloc_const_value(cv);
+                        let consumer_count =
+                            self.graph.downstreams[cond_node.0 as usize].len() as u16;
+                        loop_frame.set_value(cond_local, handle, consumer_count);
+                    }
+                }
+                loop_frame.push_ready(cond_local);
+            }
+        }
+
+        // 3. 重置 Gate 节点（pending=1，等 cond notify）
+        let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
+        Self::reset_node_pending(loop_frame, gate_local, 1);
+
+        // 4. 重置 body_sg 帧（复用）
+        body_frame.value_table.reset_all();
+        body_frame.ready_queue.clear();
+        body_frame.control_signal = ControlSignal::None;
+        body_frame.pending = None;
+        prepare_frame_nodes(body_frame, &self.graph);
+        // body_sg 帧重新绑定 caller
+        body_frame.caller =
+            Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
+        // 帧链指针设为 null（HashMap 地址不稳定）
+        body_frame.root_frame_ptr = std::ptr::null_mut();
+        body_frame.parent_frame_ptr = std::ptr::null_mut();
+
+        // 5. 重置循环帧状态
+        loop_frame.control_signal = ControlSignal::None;
+        loop_frame.state = FrameState::Ready;
+        loop_frame.suspend_state = SuspendState::NotSuspended;
+        loop_frame.suspend_event = None;
+        loop_frame.pending = None;
+    }
+
+    /// 重置节点为就绪状态（pending=0，清值，不入队）。关联函数。
+    fn reset_node_ready(frame: &mut Frame, node_local: NodeId) {
+        let i = node_local.0 as usize;
+        if i < frame.pending_inputs.len() {
+            frame.pending_inputs[i] = 0;
+        }
+        if i < frame.value_table.len() {
+            frame.value_table.reset_slot(i);
+        }
+    }
+
+    /// 重置节点为待定状态（pending=N，清值）。关联函数。
+    fn reset_node_pending(frame: &mut Frame, node_local: NodeId, pending: u8) {
+        let i = node_local.0 as usize;
+        if i < frame.pending_inputs.len() {
+            frame.pending_inputs[i] = pending;
+        }
+        if i < frame.value_table.len() {
+            frame.value_table.reset_slot(i);
+        }
+    }
+
+    /// 解析 await 事件源 + 检查就绪。
+    fn resolve_and_check_await(
+        &self,
+        pending: &crate::Ir::PendingAwait,
+    ) -> (RuntimeEvent, Option<Value>) {
+        use crate::Ir::EventSourceKind;
+        match pending.event_kind {
+            EventSourceKind::AsyncJoin => {
+                let async_id = crate::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
+                let event = RuntimeEvent::AsyncJoin(async_id);
+                let val = self.async_join_runtime.lock().try_get_result(async_id);
+                (event, val)
+            }
+            EventSourceKind::Channel => {
+                let ch = pending
+                    .event_obj
+                    .heap_obj()
+                    .and_then(|h| h.channel())
+                    .expect("await on non-channel value");
+                let v = ch.recv().or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
+                let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
+                (event, v)
+            }
+            EventSourceKind::Timer => {
+                let duration_ns = match pending.event_obj.heap_obj() {
+                    Some(crate::Value::HeapObj::Record(r)) => {
+                        r.find_field(TIMER_DURATION_NS_FIELD)
+                            .map(|v| v.as_i64())
+                            .expect("timer event record missing duration_ns field")
+                    }
+                    _ => pending.event_obj.as_i64(),
+                };
+                let timer_id = self
+                    .timer_runtime
+                    .lock()
+                    .start(std::time::Duration::from_nanos(duration_ns as u64));
+                let event = RuntimeEvent::TimerFired(timer_id);
+                let fired = self.timer_runtime.lock().is_fired(timer_id);
+                if fired {
+                    (event, Some(Value::VOID))
                 } else {
-                    // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
-                    shared.event_waiters.lock().retain(|(e, _)| {
+                    (event, None)
+                }
+            }
+            EventSourceKind::SubgraphComplete => {
+                panic!("SubgraphComplete should not go through await path");
+            }
+        }
+    }
+
+    /// 事件到达：注入值到等待帧 + 唤醒。
+    fn on_event_arrived(&self, event: RuntimeEvent, value: Value, queue: &QueueHandle<'_>) {
+        // 找等待该事件的帧（短临界区）
+        let waiters: Vec<FrameId> = {
+            let mut event_waiters = self.event_waiters.lock();
+            let waiters: Vec<FrameId> = event_waiters
+                .iter()
+                .filter(|(e, _)| *e == event)
+                .map(|(_, fid)| *fid)
+                .collect();
+            event_waiters.retain(|(_, fid)| !waiters.contains(fid));
+            waiters
+        };
+
+        for fid in waiters {
+            // 取出帧（保持 Box 不 unbox 以维持地址稳定）
+            let mut frame_box = {
+                let mut frames = self.frames.lock();
+                match frames.remove(&fid) {
+                    Some(b) => b,
+                    None => continue, // 帧正被其他 worker 处理，跳过
+                }
+            };
+            let frame: &mut Frame = &mut *frame_box;
+
+            let await_node = match frame.suspend_state {
+                SuspendState::WaitingEvent(node) => node,
+                _ => {
+                    // 非事件等待帧：放回 + 跳过
+                    self.frames.lock().insert(fid, frame_box);
+                    continue;
+                }
+            };
+
+            let node_offset = frame.node_offset;
+            let await_graph_id = NodeId(await_node.0 + node_offset);
+
+            // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
+            let is_select = self.graph.select_infos[await_graph_id.0 as usize].is_some();
+            if is_select {
+                frame.state = FrameState::Ready;
+                frame.suspend_state = SuspendState::NotSuspended;
+                frame.suspend_event = None;
+                frame.push_ready(await_node);
+            } else {
+                // 普通 await 帧：注入事件值到 await 节点
+                let consumer_count =
+                    self.graph.downstreams[await_graph_id.0 as usize].len() as u16;
+                frame.set_value(await_node, value.clone(), consumer_count);
+                frame.state = FrameState::Ready;
+                frame.suspend_state = SuspendState::NotSuspended;
+                frame.suspend_event = None;
+                notify_downstream(
+                    frame,
+                    &self.graph,
+                    await_node,
+                    await_graph_id,
+                    NodeId(node_offset),
+                );
+            }
+
+            // 放回帧 + 入队（同一个 Box，地址不变）
+            self.frames.lock().insert(fid, frame_box);
+            queue.push(fid);
+        }
+    }
+
+    /// 取消帧：Suspended → Cancelling + 入就绪队列。
+    fn cancel_frame(&self, frame_id: FrameId, queue: &QueueHandle<'_>) {
+        let mut frame_box = {
+            let mut frames = self.frames.lock();
+            match frames.remove(&frame_id) {
+                Some(b) => b,
+                None => return, // 帧正被其他 worker 处理，跳过
+            }
+        };
+        let frame: &mut Frame = &mut *frame_box;
+
+        if frame.state != FrameState::Suspended {
+            self.frames.lock().insert(frame_id, frame_box);
+            return;
+        }
+
+        // 移除事件等待注册
+        if let Some(event) = frame.suspend_event {
+            self.event_waiters
+                .lock()
+                .retain(|(e, fid)| !(*e == event && *fid == frame_id));
+        } else {
+            // select 帧：移除该帧所有事件等待
+            self.event_waiters
+                .lock()
+                .retain(|(_, fid)| *fid != frame_id);
+        }
+
+        frame.state = FrameState::Cancelling;
+        frame.suspend_state = SuspendState::NotSuspended;
+        frame.suspend_event = None;
+
+        self.frames.lock().insert(frame_id, frame_box);
+        queue.push(frame_id);
+    }
+
+    /// 检查 timer 事件
+    fn check_timers(&self, queue: &QueueHandle<'_>) {
+        let fired_timers = self.timer_runtime.lock().check_and_fire();
+        for tid in fired_timers {
+            self.on_event_arrived(RuntimeEvent::TimerFired(tid), Value::VOID, queue);
+        }
+    }
+
+    /// 设置帧链指针：从 HashMap 中查找 caller 链，设置 parent_frame_ptr/root_frame_ptr。
+    ///
+    /// 必须在帧从 HashMap remove 后、执行前调用（此时所有父帧仍在 HashMap 中，
+    /// Box<Frame> 的堆地址稳定，即使 HashMap rehash 也不会移动）。
+    ///
+    /// 同函数子图（if-else/match arm/loop body）：parent_frame_ptr 指向直接调用方帧，
+    /// root_frame_ptr 指向函数根帧（沿 caller 链向上查找同函数的最远帧）。
+    /// 跨函数调用：两个指针均为 null（不允许跨函数访问外层变量）。
+    ///
+    /// 如果 caller 帧不在 HashMap 中（正在被其他 worker 执行），保持已有指针不变
+    /// （start_subgraph 已在创建时设置了初始指针）。
+    fn setup_frame_chain(&self, frame: &mut Frame) {
+        let Some((caller_fid, _)) = frame.caller else {
+            return; // 顶层帧，无父帧
+        };
+
+        let frames = self.frames.lock();
+        let Some(caller_box) = frames.get(&caller_fid) else {
+            return; // caller 不在 HashMap 中（正在执行），保持已有指针
+        };
+
+        let frame_fn_id = self.graph.subgraphs[frame.subgraph_id.0 as usize].function_id;
+        let caller_fn_id =
+            self.graph.subgraphs[caller_box.subgraph_id.0 as usize].function_id;
+
+        // 跨函数调用：不设置帧链指针
+        if caller_fn_id != frame_fn_id {
+            return;
+        }
+
+        let caller_ptr = caller_box.as_ref() as *const Frame as *mut Frame;
+        frame.parent_frame_ptr = caller_ptr;
+
+        // root_frame_ptr：沿 caller 链向上查找同函数的最远帧
+        let mut root_ptr = caller_ptr;
+        let mut current_box = caller_box;
+        loop {
+            match current_box.caller {
+                Some((grandparent_fid, _)) => {
+                    match frames.get(&grandparent_fid) {
+                        Some(gp_box) => {
+                            let gp_fn_id =
+                                self.graph.subgraphs[gp_box.subgraph_id.0 as usize].function_id;
+                            if gp_fn_id != frame_fn_id {
+                                break; // 跨函数边界
+                            }
+                            root_ptr = gp_box.as_ref() as *const Frame as *mut Frame;
+                            current_box = gp_box;
+                        }
+                        None => break, // 祖父帧不在 HashMap 中
+                    }
+                }
+                None => break, // 到达同函数链顶
+            }
+        }
+        frame.root_frame_ptr = root_ptr;
+    }
+
+    /// 处理一帧：timer 检查 + run_frame_nodes + 状态转换。
+    /// 返回 ()，结果通过 self.result.lock() 传递
+    fn process_frame(&self, fid: FrameId, queue: &QueueHandle<'_>) {
+        // 检查 timer 事件
+        self.check_timers(queue);
+
+        // 取出帧（保持 Box 不 unbox：堆地址在 remove/insert 周期中保持稳定，
+        // 使其他帧持有的 parent_frame_ptr/root_frame_ptr 不会悬挂）
+        let mut frame_box = match self.frames.lock().remove(&fid) {
+            Some(b) => b,
+            None => return,
+        };
+        let frame: &mut Frame = &mut *frame_box;
+
+        // 设置帧链指针：从 HashMap 中查找 caller 链，设置 parent_frame_ptr/root_frame_ptr。
+        // 此时所有父帧仍在 HashMap 中（Box 地址稳定）。
+        self.setup_frame_chain(frame);
+
+        // 执行帧就绪节点（无锁）
+        self.run_frame_nodes(frame, fid, queue);
+
+        // 处理帧状态
+        let state = frame.state;
+        let has_caller = frame.caller.is_some();
+
+        match state {
+            FrameState::Suspended => {
+                let event = frame.suspend_event;
+                // 检查 pending_completions（子帧先完成但父帧尚未 insert 的竞态）
+                let pending = self.pending_completions.lock().remove(&fid);
+                if let Some((call_node, return_value, child_signal)) = pending {
+                    // 有 pending completion：直接消费完成事件
+                    if let Some(e) = event {
+                        self.event_waiters
+                            .lock()
+                            .retain(|(we, wf)| !(*we == e && *wf == fid));
+                    } else {
+                        self.event_waiters
+                            .lock()
+                            .retain(|(_, wf)| *wf != fid);
+                    }
+                    let _ = child_signal;
+                    // 使用 frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
+                    let caller_offset = NodeId(frame.node_offset);
+                    let call_graph_id = NodeId(call_node.0 + caller_offset.0);
+                    let consumer_count =
+                        self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
+                    frame.set_value(call_node, return_value, consumer_count);
+                    frame.state = FrameState::Ready;
+                    frame.suspend_state = SuspendState::NotSuspended;
+                    frame.suspend_event = None;
+                    notify_downstream(
+                        frame,
+                        &self.graph,
+                        call_node,
+                        call_graph_id,
+                        caller_offset,
+                    );
+                    // 放回同一个 Box（地址不变）
+                    self.frames.lock().insert(fid, frame_box);
+                    queue.push(fid);
+                } else {
+                    self.frames.lock().insert(fid, frame_box);
+                }
+            }
+            FrameState::Completed => {
+                if has_caller {
+                    // 区分 sync call vs async call 子帧完成
+                    let async_id = self.async_join_runtime.lock().find_by_child(fid);
+                    if let Some(async_id) = async_id {
+                        // async 子帧完成：设置 result + 触发 AsyncJoin 事件
+                        let return_value =
+                            extract_child_return(frame, &self.graph);
+                        self.async_join_runtime
+                            .lock()
+                            .set_result(async_id, return_value.clone());
+                        // frame_box drop（不放回）
+                        self.on_event_arrived(
+                            RuntimeEvent::AsyncJoin(async_id),
+                            return_value,
+                            queue,
+                        );
+                    } else {
+                        // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
+                        self.event_waiters.lock().retain(|(e, _)| {
+                            !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
+                        });
+                        // 帧被消费：unbox 传给 complete_and_wake_caller
+                        self.complete_and_wake_caller(*frame_box, queue);
+                    }
+                } else {
+                    // 顶层帧完成：返回结果
+                    let ret = extract_child_return(frame, &self.graph);
+                    *self.result.lock() = Some(ret);
+                }
+            }
+            FrameState::Failed => {
+                if has_caller {
+                    // Failed 子帧（cancel 后）：清理 waiter + 唤醒调用方
+                    self.event_waiters.lock().retain(|(e, _)| {
                         !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
                     });
-                    complete_and_wake_caller_shared(shared, &frame, local_queue);
+                    self.complete_and_wake_caller(*frame_box, queue);
+                } else {
+                    // 顶层帧 Failed：返回 NULL
+                    *self.result.lock() = Some(Value::NULL);
                 }
-            } else {
-                // 顶层帧完成：返回结果
-                let ret = extract_child_return_shared(&frame, &shared.graph);
-                *shared.result.lock() = Some(ret);
-                // 不放回 frame（帧已完成）
-                return;
             }
-        }
-        FrameState::Failed => {
-            if has_caller {
-                // Failed 子帧（cancel 后）：清理 waiter + 唤醒调用方
-                shared.event_waiters.lock().retain(|(e, _)| {
-                    !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                });
-                complete_and_wake_caller_shared(shared, &frame, local_queue);
-            } else {
-                // 顶层帧 Failed：返回 NULL
-                *shared.result.lock() = Some(Value::NULL);
-                return;
+            _ => {
+                // Ready（控制信号触发但未挂起）：放回 + 重新入队
+                self.frames.lock().insert(fid, frame_box);
+                queue.push(fid);
             }
-        }
-        _ => {
-            // Ready（控制信号触发但未挂起）：放回 + 重新入队
-            shared.frames.lock().insert(fid, frame);
-            local_queue.push(fid);
         }
     }
 }
 
 // =========================================================================
-// work-stealing worker 主循环（自由函数，供 run_multi_worker 使用）
+// impl Engine<Single> — 单线程模式
+// =========================================================================
+
+impl Engine<Single> {
+    /// 创建单线程 Engine（用 RefCell 包装所有字段）
+    fn new_single(graph: DataFlowGraph) -> Self {
+        let graph = Arc::new(graph);
+        Self {
+            graph: graph.clone(),
+            frames: RefCell::new(HashMap::new()),
+            next_frame_id: RefCell::new(FrameId(0)),
+            arena: RefCell::new(ValueArena::new()),
+            timer_runtime: RefCell::new(TimerRuntime::new()),
+            async_join_runtime: RefCell::new(AsyncJoinRuntime::new()),
+            event_waiters: RefCell::new(Vec::new()),
+            pending_completions: RefCell::new(HashMap::new()),
+            result: RefCell::new(None),
+            ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
+            global_queue: None,
+            wakeup: None,
+            active_count: None,
+            _strategy: std::marker::PhantomData,
+        }
+    }
+
+    /// 单线程事件循环（替代 run_event_loop + run_entry）
+    fn run_single(&self) -> Value {
+        let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
+        let fid = self.init_frame(entry_sg);
+        let rq = self.ready_frames.as_ref().unwrap();
+        rq.borrow_mut().push_back(fid);
+
+        let mut loop_guard: u64 = 0;
+        loop {
+            loop_guard += 1;
+            if loop_guard > 20000000 {
+                panic!("event loop stuck: guard={}", loop_guard);
+            }
+            let queue = QueueHandle::Single(rq);
+            let fid = match rq.borrow_mut().pop_front() {
+                Some(f) => f,
+                None => {
+                    // 队列空时检查 timer（可能触发事件唤醒挂起帧）
+                    self.check_timers(&queue);
+                    let ew = self.event_waiters.lock();
+                    if ew.is_empty() {
+                        panic!(
+                            "event loop exhausted: no ready frames and no pending events"
+                        );
+                    }
+                    drop(ew);
+                    std::thread::yield_now();
+                    continue;
+                }
+            };
+            self.process_frame(fid, &queue);
+            if let Some(result) = self.result.lock().take() {
+                return result;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// impl Engine<Multi> — 多 worker 模式
+// =========================================================================
+
+impl Engine<Multi> {
+    /// 创建多线程 Engine（用 ParkingMutex 包装所有字段）
+    fn new_multi(graph: DataFlowGraph, num_workers: usize) -> Self {
+        let graph = Arc::new(graph);
+        Self {
+            graph: graph.clone(),
+            frames: ParkingMutex::new(HashMap::new()),
+            next_frame_id: ParkingMutex::new(FrameId(0)),
+            arena: ParkingMutex::new(ValueArena::new()),
+            timer_runtime: ParkingMutex::new(TimerRuntime::new()),
+            async_join_runtime: ParkingMutex::new(AsyncJoinRuntime::new()),
+            event_waiters: ParkingMutex::new(Vec::new()),
+            pending_completions: ParkingMutex::new(HashMap::new()),
+            result: ParkingMutex::new(None),
+            ready_frames: None,
+            global_queue: Some(Injector::new()),
+            wakeup: Some((ParkingMutex::new(()), Condvar::new())),
+            active_count: Some(ParkingMutex::new(num_workers)),
+            _strategy: std::marker::PhantomData,
+        }
+    }
+
+    /// 多 worker 模式执行入口子图（替代 run_multi_worker）
+    fn run_multi(self: Arc<Self>) -> Value {
+        let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
+        let entry_fid = self.init_frame(entry_sg);
+
+        let num_workers = *self.active_count.as_ref().unwrap().lock();
+        let mut local_queues: Vec<DequeWorker<FrameId>> = Vec::with_capacity(num_workers);
+        let mut stealers: Vec<Stealer<FrameId>> = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let w = DequeWorker::new_lifo();
+            stealers.push(w.stealer());
+            local_queues.push(w);
+        }
+
+        self.global_queue.as_ref().unwrap().push(entry_fid);
+
+        std::thread::scope(|s| {
+            for (worker_id, local_queue) in local_queues.into_iter().enumerate() {
+                let shared = self.clone();
+                let stealers = stealers.clone();
+                s.spawn(move || {
+                    worker_main(worker_id, local_queue, stealers, shared);
+                });
+            }
+        });
+
+        self.result
+            .lock()
+            .take()
+            .expect("no result produced: all workers exited without completion")
+    }
+}
+
+// =========================================================================
+// work-stealing worker 主循环（自由函数，供 run_multi 使用）
 // =========================================================================
 
 /// Worker 主循环：pop_local → try_steal → try_global → park。
@@ -5630,10 +5127,9 @@ fn worker_main(
     worker_id: usize,
     local_queue: DequeWorker<FrameId>,
     stealers: Vec<Stealer<FrameId>>,
-    shared: Arc<SharedEngine>,
+    shared: Arc<Engine<Multi>>,
 ) {
-    // 每个 worker 用 thread-local 随机种子选 steal victim
-    let mut steal_seed: u64 = worker_id as u64 ^ 0x9E3779B97F4A7C15;
+    let mut steal_seed: u64 = worker_id as u64 ^ GOLDEN_RATIO_64;
 
     loop {
         // 结果已产生：退出
@@ -5643,75 +5139,69 @@ fn worker_main(
 
         // 1. pop_local（LIFO，缓存友好）
         if let Some(fid) = local_queue.pop() {
-            process_frame_shared(&shared, &local_queue, fid);
-            // 锁 wakeup mutex 再 notify，防止 park 方丢失唤醒
+            let queue = QueueHandle::Multi(&local_queue);
+            shared.process_frame(fid, &queue);
             {
-                let _g = shared.wakeup.0.lock();
-                shared.wakeup.1.notify_all();
+                let _g = shared.wakeup.as_ref().unwrap().0.lock();
+                shared.wakeup.as_ref().unwrap().1.notify_all();
             }
             continue;
         }
 
         // 2. try_steal（随机 victim，FIFO 窃取）
         if let Some(fid) = try_steal(&stealers, worker_id, &mut steal_seed) {
-            process_frame_shared(&shared, &local_queue, fid);
+            let queue = QueueHandle::Multi(&local_queue);
+            shared.process_frame(fid, &queue);
             {
-                let _g = shared.wakeup.0.lock();
-                shared.wakeup.1.notify_all();
+                let _g = shared.wakeup.as_ref().unwrap().0.lock();
+                shared.wakeup.as_ref().unwrap().1.notify_all();
             }
             continue;
         }
 
         // 3. try_global（全局注入队列）
-        if let Some(fid) = shared.global_queue.steal().success() {
-            process_frame_shared(&shared, &local_queue, fid);
+        if let Some(fid) = shared.global_queue.as_ref().unwrap().steal().success() {
+            let queue = QueueHandle::Multi(&local_queue);
+            shared.process_frame(fid, &queue);
             {
-                let _g = shared.wakeup.0.lock();
-                shared.wakeup.1.notify_all();
+                let _g = shared.wakeup.as_ref().unwrap().0.lock();
+                shared.wakeup.as_ref().unwrap().1.notify_all();
             }
             continue;
         }
 
         // 4. 无工作：减少活跃计数，检查是否全部空闲
         {
-            let mut active = shared.active_count.lock();
+            let mut active = shared.active_count.as_ref().unwrap().lock();
             *active -= 1;
             if *active == 0 {
-                // 所有 worker 空闲 + 无就绪帧：事件循环耗尽
                 drop(active);
                 {
-                    let _g = shared.wakeup.0.lock();
-                    shared.wakeup.1.notify_all();
+                    let _g = shared.wakeup.as_ref().unwrap().0.lock();
+                    shared.wakeup.as_ref().unwrap().1.notify_all();
                 }
                 return;
             }
         }
 
         // 5. park（等待唤醒，避免 busy-wait）
-        // 使用 wait_timeout 定期醒来检查 timer 事件，防止所有 worker park 时
-        // timer 到期事件被忽略导致死锁。
         {
-            let mut guard = shared.wakeup.0.lock();
-            // 重新检查 result（可能其他 worker 刚设置）
+            let mut guard = shared.wakeup.as_ref().unwrap().0.lock();
             if shared.result.lock().is_some() {
-                let mut active = shared.active_count.lock();
+                let mut active = shared.active_count.as_ref().unwrap().lock();
                 *active += 1;
                 return;
             }
-            // 重新检查工作队列（不消费，只检查非空）
-            if !local_queue.is_empty() || !shared.global_queue.is_empty() {
-                // 有工作：不 park，恢复活跃计数
-                let mut active = shared.active_count.lock();
+            if !local_queue.is_empty() || !shared.global_queue.as_ref().unwrap().is_empty() {
+                let mut active = shared.active_count.as_ref().unwrap().lock();
                 *active += 1;
                 continue;
             }
-            // 确认无工作：park with timeout（定期醒来检查 timer）
             let park_timeout = std::time::Duration::from_millis(10);
-            shared.wakeup.1.wait_for(&mut guard, park_timeout);
+            shared.wakeup.as_ref().unwrap().1.wait_for(&mut guard, park_timeout);
         }
-        // 被唤醒：恢复活跃计数
         {
-            let mut active = shared.active_count.lock();
+            let mut active = shared.active_count.as_ref().unwrap().lock();
             *active += 1;
         }
     }
@@ -5744,4 +5234,33 @@ fn try_steal(
         }
     }
     None
+}
+
+// =========================================================================
+// EngineRef — 统一工厂（根据 workers 数决定编译期策略）
+// =========================================================================
+
+/// 统一工厂：根据 workers 数决定编译期策略
+pub enum EngineRef {
+    Single(Engine<Single>),
+    Multi(Arc<Engine<Multi>>),
+}
+
+impl EngineRef {
+    /// 创建引擎：workers <= 1 用单线程，> 1 用多 worker
+    pub fn new(graph: DataFlowGraph, workers: usize) -> Self {
+        if workers <= 1 {
+            Self::Single(Engine::<Single>::new_single(graph))
+        } else {
+            Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph, workers)))
+        }
+    }
+
+    /// 运行引擎，返回结果值
+    pub fn run(self) -> Value {
+        match self {
+            Self::Single(e) => e.run_single(),
+            Self::Multi(e) => Engine::<Multi>::run_multi(e),
+        }
+    }
 }

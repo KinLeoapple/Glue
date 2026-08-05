@@ -15,12 +15,14 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-use glue::Ast::{ErrorCollector, Lexer, Module, Parser as GlueParser, Printer, Token, TokenCollector};
-use glue::Engine::Engine;
-use glue::Analyzer;
+use glue::ast::Ast::{Module, Printer};
+use glue::ast::Parser::{ErrorCollector, Lexer, Parser as GlueParser, Token, TokenCollector};
+use glue::Engine::EngineRef;
+use glue::sema::Analyzer;
 use glue::Ir::IrBuilder;
 use glue::ModuleLoader::ModuleLoader;
-use glue::Sema::{populate_module, InferContext, SemaResult, TypeArena};
+use glue::sema::Sema::{populate_module, SemaResult, TypeArena};
+use glue::sema::Inference::InferContext;
 
 /// Glue 语言 Rust 实现 CLI
 #[derive(Parser)]
@@ -661,21 +663,15 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
 
     // 5. Engine 执行
-    let mut engine = Engine::new(graph);
-    let result = match workers {
-        Some(n) if n > 1 => {
-            if debug {
-                eprintln!("  Mode: multi-worker ({} workers)", n);
-            }
-            engine.run_multi_worker(n)
+    let w = workers.unwrap_or(1);
+    if debug {
+        if w > 1 {
+            eprintln!("  Mode: multi-worker ({} workers)", w);
+        } else {
+            eprintln!("  Mode: single-thread");
         }
-        _ => {
-            if debug {
-                eprintln!("  Mode: single-thread");
-            }
-            engine.run_entry()
-        }
-    };
+    }
+    let result = EngineRef::new(graph, w).run();
 
     if debug {
         eprintln!("  Result: {:?}", result);

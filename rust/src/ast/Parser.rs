@@ -1,1396 +1,41 @@
-//! Ast.rs — Glue 语法树（合并 8 个子模块）
+//! Parser.rs — Glue lexical and syntax analysis
+//!
+//! Split from Ast.rs. Contains: BinaryOp precedence table, Lexer (TokenKind/Token/TokenSink/Lexer),
+//! ParseError/ParseErrorHandler, recursive-descent + Pratt Parser, and related helper functions.
+//! Depends on crate::Ast (AST data model + AstArena + node enums).
 
-// AST 源码位置与节点包装
-
-/// 源码位置：行号与列号，用于错误定位
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub line: u32,
-    pub column: u32,
-}
-
-impl Span {
-    pub fn new(line: u32, column: u32) -> Self {
-        Self { line, column }
-    }
-}
-
-/// AST 节点包装：将源码位置与节点本体绑定
-#[derive(Debug, Clone, PartialEq)]
-pub struct Spanned<T> {
-    pub span: Span,
-    pub node: T,
-}
-
-impl<T> Spanned<T> {
-    pub fn new(span: Span, node: T) -> Self {
-        Self { span, node }
-    }
-
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Spanned<U> {
-        Spanned {
-            span: self.span,
-            node: f(self.node),
-        }
-    }
-
-    pub fn as_ref(&self) -> Spanned<&T> {
-        Spanned {
-            span: self.span,
-            node: &self.node,
-        }
-    }
-}
-
-// =========================================================================
-// NodeId — 节点索引（u32，替代 &'a Spanned<T> 引用）
-// =========================================================================
-
-/// 表达式节点索引
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExprId(pub u32);
-/// 语句节点索引
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StmtId(pub u32);
-/// 类型节点索引
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeId(pub u32);
-/// 模式节点索引
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PatternId(pub u32);
-
-// =========================================================================
-// AstArena — 统一节点存储（替代 bumpalo arena + 引用）
+use crate::ast::Ast::{
+    AstArena, AssociatedType, Attribute, BinaryOp, CompoundAssignOp, ConstructorDef,
+    ConstructorField, Decl, DelegateInfo, Expr, ExprRef, ImportItem,
+    InterpolationPart, Kind, LambdaBody, MatchArm, MethodDecl, Module, Param,
+    Pattern, PatternLiteral, PatternRecordField, PatternRef,
+    RecordFieldExpr, RecordFieldType, SelectArm, Span, Spanned, Stmt,
+    StmtRef, TraitBound, TypeConstraint, TypeDef, TypeNode, TypeParam,
+    TypeRef, UnaryOp, Visibility,
+};
+// BinaryOp precedence table
 //
-// 4 种节点类型各一个 Vec<Spanned<T>>。节点通过 NodeId(u32) 索引引用，
-// 消除节点间的生命周期参数。字符串字段仍为 &'a str（零拷贝）。
-// =========================================================================
-
-/// AST 节点统一存储
-#[derive(Debug, Clone, PartialEq)]
-pub struct AstArena<'a> {
-    pub exprs: Vec<Spanned<Expr<'a>>>,
-    pub stmts: Vec<Spanned<Stmt<'a>>>,
-    pub types: Vec<Spanned<TypeNode<'a>>>,
-    pub patterns: Vec<Spanned<Pattern<'a>>>,
-}
-
-impl<'a> AstArena<'a> {
-    pub fn new() -> Self {
-        Self {
-            exprs: Vec::new(),
-            stmts: Vec::new(),
-            types: Vec::new(),
-            patterns: Vec::new(),
-        }
-    }
-
-    pub fn alloc_expr(&mut self, span: Span, node: Expr<'a>) -> ExprId {
-        let id = ExprId(self.exprs.len() as u32);
-        self.exprs.push(Spanned { span, node });
-        id
-    }
-
-    pub fn alloc_stmt(&mut self, span: Span, node: Stmt<'a>) -> StmtId {
-        let id = StmtId(self.stmts.len() as u32);
-        self.stmts.push(Spanned { span, node });
-        id
-    }
-
-    pub fn alloc_type(&mut self, span: Span, node: TypeNode<'a>) -> TypeId {
-        let id = TypeId(self.types.len() as u32);
-        self.types.push(Spanned { span, node });
-        id
-    }
-
-    pub fn alloc_pattern(&mut self, span: Span, node: Pattern<'a>) -> PatternId {
-        let id = PatternId(self.patterns.len() as u32);
-        self.patterns.push(Spanned { span, node });
-        id
-    }
-
-    /// 索引访问（带边界检查）
-    pub fn expr(&self, id: ExprId) -> &Spanned<Expr<'a>> {
-        &self.exprs[id.0 as usize]
-    }
-
-    pub fn stmt(&self, id: StmtId) -> &Spanned<Stmt<'a>> {
-        &self.stmts[id.0 as usize]
-    }
-
-    pub fn ty(&self, id: TypeId) -> &Spanned<TypeNode<'a>> {
-        &self.types[id.0 as usize]
-    }
-
-    pub fn pattern(&self, id: PatternId) -> &Spanned<Pattern<'a>> {
-        &self.patterns[id.0 as usize]
-    }
-}
-
-impl<'a> Default for AstArena<'a> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// 运算符枚举、Kind 类型系统与 AST 辅助类型
-
-
-// =========================================================================
-// 运算符枚举
-// =========================================================================
-
-/// 二元运算符种类
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Eq,
-    NotEq,
-    RefEq,
-    RefNeq,
-    Lt,
-    Gt,
-    LtEq,
-    GtEq,
-    And,
-    Or,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
-    ConcatList,
-    Range,
-    RangeInclusive,
-    Elvis,
-}
-
-/// 复合赋值运算符种类（如 +=、-=）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CompoundAssignOp {
-    AddAssign,
-    SubAssign,
-    MulAssign,
-    DivAssign,
-    ModAssign,
-    BitAndAssign,
-    BitOrAssign,
-    BitXorAssign,
-    ShlAssign,
-    ShrAssign,
-}
-
-/// 一元运算符种类
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum UnaryOp {
-    Not,
-    Neg,
-    BitNot,
-}
-
-/// 可见性修饰：区分私有与公开声明
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Visibility {
-    Private,
-    Public,
-}
-
-// =========================================================================
-// Kind 类型系统
-// =========================================================================
-
-/// 类型种类（kind）：用于高阶类型标注，支持星类型与箭头类型
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Kind {
-    Star,
-    Arrow { param: Box<Kind>, result: Box<Kind> },
-}
-
-// =========================================================================
-// 辅助结构体
-// =========================================================================
-
-/// 模式匹配中的字面量模式
-#[derive(Debug, Clone, PartialEq)]
-pub enum PatternLiteral<'a> {
-    Int(&'a str),
-    Float(&'a str),
-    Bool(bool),
-    Char(u32),
-    String(&'a str),
-    Null,
-}
-
-/// 记录模式中的字段：字段名与对应子模式
-#[derive(Debug, Clone, PartialEq)]
-pub struct PatternRecordField<'a> {
-    pub name: &'a str,
-    pub pattern: PatternRef,
-}
-
-/// 函数/lambda 参数
-#[derive(Debug, Clone, PartialEq)]
-pub struct Param<'a> {
-    pub name: &'a str,
-    pub type_annotation: Option<TypeRef>,
-}
-
-/// 类型参数：携带名称、kind 约束与 trait 约束
-#[derive(Debug, Clone, PartialEq)]
-pub struct TypeParam<'a> {
-    pub name: &'a str,
-    pub kind: Option<Box<Kind>>,
-    pub bounds: Vec<TraitBound<'a>>,
-}
-
-/// trait 约束：trait 名与类型实参
-#[derive(Debug, Clone, PartialEq)]
-pub struct TraitBound<'a> {
-    pub trait_name: &'a str,
-    pub type_args: Vec<TypeRef>,
-}
-
-/// 类型约束：将类型参数绑定到具体类型
-#[derive(Debug, Clone, PartialEq)]
-pub struct TypeConstraint<'a> {
-    pub type_param: &'a str,
-    pub concrete_type: TypeRef,
-}
-
-/// 记录类型字段：字段名与字段类型
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecordFieldType<'a> {
-    pub name: &'a str,
-    pub ty: TypeRef,
-}
-
-/// 记录字面量字段：字段名与字段值表达式
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecordFieldExpr<'a> {
-    pub name: &'a str,
-    pub value: ExprRef,
-}
-
-/// 构造器字段：可选字段名与类型（无名时为位置参数）
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConstructorField<'a> {
-    pub name: Option<&'a str>,
-    pub ty: TypeRef,
-}
-
-/// 字符串插值的组成部分：字面量文本或内嵌表达式
-#[derive(Debug, Clone, PartialEq)]
-pub enum InterpolationPart<'a> {
-    Literal(&'a str),
-    Expression(ExprRef),
-}
-
-/// lambda 体：既可以是块表达式，也可以是普通表达式
-#[derive(Debug, Clone, PartialEq)]
-pub enum LambdaBody {
-    Block(ExprRef),
-    Expression(ExprRef),
-}
-
-/// match 表达式的一个分支：模式、可选守卫与分支体
-#[derive(Debug, Clone, PartialEq)]
-pub struct MatchArm {
-    pub pattern: PatternRef,
-    pub guard: Option<ExprRef>,
-    pub body: ExprRef,
-}
-
-/// select 表达式的一个分支：接收通道消息或超时
-#[derive(Debug, Clone, PartialEq)]
-pub enum SelectArm<'a> {
-    Receive {
-        channel_expr: ExprRef,
-        binding: Option<&'a str>,
-        body: ExprRef,
-    },
-    Timeout {
-        duration: ExprRef,
-        body: ExprRef,
-    },
-}
-
-/// import 语句中的单个导入项：名称与可选别名
-#[derive(Debug, Clone, PartialEq)]
-pub struct ImportItem<'a> {
-    pub name: &'a str,
-    pub alias: Option<&'a str>,
-}
-
-/// 构造器定义：名称、字段列表与可选返回类型
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConstructorDef<'a> {
-    pub name: &'a str,
-    pub fields: Vec<ConstructorField<'a>>,
-    pub return_type: Option<TypeRef>,
-}
-
-/// 方法声明：名称、类型参数、参数、返回类型、可选方法体、是否覆盖、委托信息
-#[derive(Debug, Clone, PartialEq)]
-pub struct MethodDecl<'a> {
-    pub name: &'a str,
-    pub type_params: Vec<TypeParam<'a>>,
-    pub params: Vec<Param<'a>>,
-    pub return_type: Option<TypeRef>,
-    pub body: Option<ExprRef>,
-    pub is_override: bool,
-    pub delegate: Option<DelegateInfo<'a>>,
-    pub visibility: Visibility,
-    pub is_async: bool,
-}
-
-/// 委托信息：将方法委托给某个 trait 的某个方法
-#[derive(Debug, Clone, PartialEq)]
-pub struct DelegateInfo<'a> {
-    pub trait_name: &'a str,
-    pub method_name: &'a str,
-}
-
-/// trait 中的关联类型声明
-#[derive(Debug, Clone, PartialEq)]
-pub struct AssociatedType<'a> {
-    pub name: &'a str,
-    pub kind: Option<Box<Kind>>,
-}
-
-// AST 节点定义：表达式、语句、声明、类型节点、模式、类型定义与模块
-
-
-// =========================================================================
-// 引用类型别名
+// A single flat registry with numeric precedences, driving a single Pratt parser.
+// Replaces 13 layers of parseXxx template functions (parseElvis/Or/And/BitOr/BitXor/BitAnd/Shift/
+// Equality/Comparison/Range/Addition/Multiplication).
 //
-// 子节点通过 AstArena 分配后以 NodeId(u32) 索引形式持有，零拷贝引用源码。
-// 别名保留以减少调用点改动（字段类型语义从引用变为索引）。
-// =========================================================================
-
-pub type ExprRef = ExprId;
-pub type StmtRef = StmtId;
-pub type TypeRef = TypeId;
-pub type PatternRef = PatternId;
-
-// =========================================================================
-// TypeNode — 类型语法节点
-// =========================================================================
-
-/// 类型语法节点：命名类型、泛型、可空、函数、记录、数组、kind 标注等
-#[derive(Debug, Clone, PartialEq)]
-pub enum TypeNode<'a> {
-    /// 命名类型，如 `i32`、`String`
-    Named { name: &'a str },
-    /// `Self` 类型
-    SelfType,
-    /// 泛型应用，如 `List<i32>`
-    Generic { name: &'a str, args: Vec<TypeRef> },
-    /// 可空类型 `T?`
-    Nullable { inner: TypeRef },
-    /// 借用引用 `&T`：指向已有对象的引用，共享读写，RC 管理
-    RefType { inner: TypeRef },
-    /// 裸指针 `*T`：绕过 RC，不安全，预留用于 FFI
-    RawPtr { inner: TypeRef },
-    /// 函数类型 `(P1, P2) -> R`
-    Function {
-        params: Vec<TypeRef>,
-        return_type: TypeRef,
-    },
-    /// 记录类型 `{ x: i32, y: i32 }`
-    Record { fields: Vec<RecordFieldType<'a>> },
-    /// 数组类型 `[T; N]`，size 为 None 时为切片
-    Array {
-        element_type: TypeRef,
-        size: Option<u64>,
-    },
-    /// kind 标注类型 `T :: *`
-    KindAnnotated { inner: TypeRef, kind: Box<Kind> },
-}
-
-// =========================================================================
-// Pattern — 模式匹配
-// =========================================================================
-
-/// 模式匹配中的模式：通配符、字面量、变量、构造器、记录、或模式、守卫模式
-#[derive(Debug, Clone, PartialEq)]
-pub enum Pattern<'a> {
-    /// 通配符 `_`
-    Wildcard,
-    /// 字面量模式
-    Literal(PatternLiteral<'a>),
-    /// 变量绑定模式 `x`
-    Variable { name: &'a str },
-    /// 构造器模式 `Some(x)`
-    Constructor {
-        name: &'a str,
-        patterns: Vec<PatternRef>,
-    },
-    /// 记录模式 `{ x, y: p }`
-    Record { fields: Vec<PatternRecordField<'a>> },
-    /// 或模式 `p1 | p2`
-    OrPattern {
-        left: PatternRef,
-        right: PatternRef,
-    },
-    /// 守卫模式 `p if cond`
-    Guard {
-        pattern: PatternRef,
-        condition: ExprRef,
-    },
-}
-
-// =========================================================================
-// Expr — 表达式节点
-// =========================================================================
-
-/// 表达式节点：涵盖字面量、标识符、各种运算、调用、控制流、模式匹配等全部表达式形式
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr<'a> {
-    /// 整数字面量，raw 保留源码文本，suffix 为可选类型后缀（如 `42i32`）
-    IntLit { raw: &'a str, suffix: Option<&'a str> },
-    /// 浮点字面量
-    FloatLit { raw: &'a str, suffix: Option<&'a str> },
-    /// 布尔字面量
-    BoolLit(bool),
-    /// 字符字面量（Unicode scalar value）
-    CharLit(u32),
-    /// 字符串字面量
-    StrLit(&'a str),
-    /// 字符串插值 `"foo ${expr} bar"`
-    StrInterp(Vec<InterpolationPart<'a>>),
-    /// `null` 字面量
-    NullLit,
-    /// `()` void 字面量
-    VoidLit,
-    /// 标识符引用
-    Ident(&'a str),
-    /// 赋值表达式 `target = value`
-    Assign { target: ExprRef, value: ExprRef },
-    /// 复合赋值 `target op= value`
-    CompoundAssign {
-        op: CompoundAssignOp,
-        target: ExprRef,
-        value: ExprRef,
-    },
-    /// 二元运算 `lhs op rhs`
-    Binary {
-        op: BinaryOp,
-        lhs: ExprRef,
-        rhs: ExprRef,
-    },
-    /// 一元运算 `op operand`
-    Unary { op: UnaryOp, operand: ExprRef },
-    /// 取引用 `&expr`
-    RefOf(ExprRef),
-    /// 解引用 `*expr`
-    Deref(ExprRef),
-    /// 函数调用 `callee(args)`，type_args 为显式泛型实参
-    Call {
-        callee: ExprRef,
-        args: Vec<ExprRef>,
-        type_args: Option<Vec<TypeRef>>,
-    },
-    /// 方法调用 `recv.method(args)`
-    MethodCall {
-        recv: ExprRef,
-        method: &'a str,
-        args: Vec<ExprRef>,
-        type_args: Option<Vec<TypeRef>>,
-    },
-    /// 字段访问 `recv.field`
-    FieldAccess { recv: ExprRef, field: &'a str },
-    /// 索引 `recv[index]`
-    Index { recv: ExprRef, index: ExprRef },
-    /// 切片 `recv[start..end]` 或 `recv[start..=end]`
-    Slice {
-        recv: ExprRef,
-        start: ExprRef,
-        end: ExprRef,
-        inclusive: bool,
-    },
-    /// 安全字段访问 `recv?.field`
-    SafeAccess { recv: ExprRef, field: &'a str },
-    /// 安全方法调用 `recv?.method(args)`
-    SafeMethodCall {
-        recv: ExprRef,
-        method: &'a str,
-        args: Vec<ExprRef>,
-        type_args: Option<Vec<TypeRef>>,
-    },
-    /// 错误传播 `expr!`
-    Propagate(ExprRef),
-    /// 非空断言 `expr!!`
-    NonNullAssert(ExprRef),
-    /// Elvis 运算 `lhs ?: rhs`
-    Elvis { lhs: ExprRef, rhs: ExprRef },
-    /// 数组字面量 `[a, b, c]` 或填充语法 `[value, ..count]`
-    ArrayLit {
-        elements: Vec<ExprRef>,
-        fill: Option<(ExprRef, ExprRef)>,
-    },
-    /// 记录字面量 `{ x: 1, y: 2 }`
-    RecordLit(Vec<RecordFieldExpr<'a>>),
-    /// 记录扩展 `{ base with x: 1 }`
-    RecordExtend {
-        base: ExprRef,
-        updates: Vec<RecordFieldExpr<'a>>,
-    },
-    /// lambda 表达式 `|params| body`
-    Lambda {
-        params: Vec<Param<'a>>,
-        body: LambdaBody,
-        is_async: bool,
-        return_type: Option<TypeRef>,
-    },
-    /// if 表达式 `if cond { then } else { else_ }`
-    If {
-        cond: ExprRef,
-        then_branch: ExprRef,
-        else_branch: Option<ExprRef>,
-    },
-    /// 块表达式 `{ stmts; trailing }`
-    Block {
-        stmts: Vec<StmtRef>,
-        trailing: Option<ExprRef>,
-    },
-    /// match 表达式 `match scrutinee { arms }`
-    Match {
-        scrutinee: ExprRef,
-        arms: Vec<MatchArm>,
-    },
-    /// 类型转换 `target(expr)`，safe=true 时为安全转换 `target(expr)?`
-    TypeCast {
-        target: TypeRef,
-        expr: ExprRef,
-        safe: bool,
-    },
-    /// 原子表达式 `atomic(expr)`
-    Atomic(ExprRef),
-    /// 惰性求值 `lazy(expr)`
-    Lazy(ExprRef),
-    /// select 表达式 `select { arms }`
-    Select(Vec<SelectArm<'a>>),
-    /// inline trait 值 `inline_trait { methods }`
-    InlineTrait(Vec<MethodDecl<'a>>),
-}
-
-impl<'a> Expr<'a> {
-    /// 判断是否为字面量表达式
-    pub fn is_literal(&self) -> bool {
-        matches!(
-            self,
-            Expr::IntLit { .. }
-                | Expr::FloatLit { .. }
-                | Expr::BoolLit(_)
-                | Expr::CharLit(_)
-                | Expr::StrLit(_)
-                | Expr::NullLit
-                | Expr::VoidLit
-        )
-    }
-
-    /// 判断是否为左值（可赋值目标）
-    pub fn is_lvalue(&self) -> bool {
-        matches!(
-            self,
-            Expr::Ident(_) | Expr::FieldAccess { .. } | Expr::Index { .. } | Expr::Deref(_)
-        )
-    }
-
-    /// 若为标识符表达式，返回其名称
-    pub fn as_ident(&self) -> Option<&'a str> {
-        match self {
-            Expr::Ident(name) => Some(*name),
-            _ => None,
-        }
-    }
-}
-
-// =========================================================================
-// Stmt — 语句节点
-// =========================================================================
-
-/// 语句节点：声明、赋值、控制流（return/throw/break/continue）、循环等
-#[derive(Debug, Clone, PartialEq)]
-pub enum Stmt<'a> {
-    /// 不可变绑定 `val name = value`
-    ValDecl {
-        name: &'a str,
-        type_annotation: Option<TypeRef>,
-        value: ExprRef,
-        visibility: Visibility,
-    },
-    /// 可变绑定 `var name = value`
-    VarDecl {
-        name: &'a str,
-        type_annotation: Option<TypeRef>,
-        value: ExprRef,
-        visibility: Visibility,
-    },
-    /// 赋值语句 `target = value`
-    Assignment {
-        target: ExprRef,
-        value: ExprRef,
-    },
-    /// 字段赋值 `object.field = value`
-    FieldAssignment {
-        object: ExprRef,
-        field: &'a str,
-        value: ExprRef,
-    },
-    /// 复合赋值 `target op= value`
-    CompoundAssignment {
-        target: ExprRef,
-        op: CompoundAssignOp,
-        value: ExprRef,
-    },
-    /// 纯表达式语句 `expr`
-    Expression { expr: ExprRef },
-    /// return 语句 `return value?`
-    Return { value: Option<ExprRef> },
-    /// defer 语句 `defer expr`
-    Defer { expr: ExprRef },
-    /// throw 语句 `throw expr`
-    Throw { expr: ExprRef },
-    /// break 语句
-    Break,
-    /// continue 语句
-    Continue,
-    /// for 循环 `for name in iterable { body }`
-    For {
-        name: &'a str,
-        iterable: ExprRef,
-        body: ExprRef,
-    },
-    /// while 循环 `while condition { body }`
-    While {
-        condition: ExprRef,
-        body: ExprRef,
-    },
-    /// loop 循环 `loop { body }`
-    Loop { body: ExprRef },
-    /// 局部声明（嵌套 fun/type/trait 等）
-    LocalDecl {
-        decl: Box<Decl<'a>>,
-    },
-}
-
-// =========================================================================
-// Attribute — 通用属性
-// =========================================================================
-
-/// 通用属性：@name 或 @name("arg1", "arg2") 或 @name "arg"
-#[derive(Debug, Clone, PartialEq)]
-pub struct Attribute<'a> {
-    pub name: &'a str,
-    pub args: Vec<&'a str>,
-}
-
-// =========================================================================
-// Decl — 顶层声明
-// =========================================================================
-
-/// 顶层声明：函数、类型、trait、import、pack、表达式声明
-#[derive(Debug, Clone, PartialEq)]
-pub enum Decl<'a> {
-    /// 函数声明 `fun name(params): ret { body }`
-    FunDecl {
-        visibility: Visibility,
-        name: &'a str,
-        type_params: Vec<TypeParam<'a>>,
-        params: Vec<Param<'a>>,
-        return_type: Option<TypeRef>,
-        bounds: Vec<TraitBound<'a>>,
-        body: ExprRef,
-        is_async: bool,
-        is_entry: bool,
-        attributes: Vec<Attribute<'a>>,
-        extern_c_body: Option<&'a str>,
-    },
-    /// 类型声明 `type name { ... }`
-    TypeDecl {
-        visibility: Visibility,
-        name: &'a str,
-        type_params: Vec<TypeParam<'a>>,
-        implemented_traits: Vec<TraitBound<'a>>,
-        type_constraints: Vec<TypeConstraint<'a>>,
-        def: TypeDef<'a>,
-        methods: Vec<MethodDecl<'a>>,
-    },
-    /// trait 声明 `trait name { ... }`
-    TraitDecl {
-        visibility: Visibility,
-        name: &'a str,
-        type_params: Vec<TypeParam<'a>>,
-        parents: Vec<TraitBound<'a>>,
-        associated_types: Vec<AssociatedType<'a>>,
-        methods: Vec<MethodDecl<'a>>,
-    },
-    /// import 声明 `import module_path { items }`
-    ImportDecl {
-        module_path: Vec<&'a str>,
-        items: Option<Vec<ImportItem<'a>>>,
-        visibility: Visibility,
-    },
-    /// pack 声明 `pack name`
-    PackDecl {
-        visibility: Visibility,
-        name: &'a str,
-    },
-    /// 顶层表达式声明
-    ExprDecl {
-        expr: ExprRef,
-        stmt: Option<StmtRef>,
-    },
-}
-
-// =========================================================================
-// TypeDef — 类型定义体
-// =========================================================================
-
-/// 类型定义体：代数数据类型、记录、别名、新类型、错误新类型
-#[derive(Debug, Clone, PartialEq)]
-pub enum TypeDef<'a> {
-    /// 代数数据类型 `adt { Constructor1 | Constructor2 }`
-    Adt { constructors: Vec<ConstructorDef<'a>> },
-    /// 记录类型 `record { field1: T1, field2: T2 }`
-    Record { fields: Vec<RecordFieldType<'a>> },
-    /// 类型别名 `alias = target`
-    Alias { target: TypeRef },
-    /// 新类型 `newtype name = inner`
-    Newtype { name: &'a str, inner: TypeRef },
-}
-
-// =========================================================================
-// Module — 模块
-// =========================================================================
-
-/// 模块：名称、源码路径与顶层声明列表
-#[derive(Debug, Clone, PartialEq)]
-pub struct Module<'a> {
-    pub name: &'a str,
-    pub source_path: Option<&'a str>,
-    pub arena: AstArena<'a>,
-    pub declarations: Vec<Spanned<Decl<'a>>>,
-}
-
-impl<'a> Module<'a> {
-    /// 按名称查找模块中的函数声明
-    pub fn find_function(&self, name: &str) -> Option<&Spanned<Decl<'a>>> {
-        self.declarations.iter().find(|d| match &d.node {
-            Decl::FunDecl { name: n, .. } => *n == name,
-            _ => false,
-        })
-    }
-}
-
-// =========================================================================
-// AstVisitor — AST 遍历 trait（hook 默认空，由 walk_* 驱动递归）
-// =========================================================================
-
-/// AST 遍历器 trait。`visit_*` 方法为 hook，默认空实现。
-/// 想要递归遍历的调用方使用对应的 `walk_*` 自由函数（接收 `&AstArena` 解引用节点）。
-/// 重写 `visit_*` 即可拦截该节点类型；自驱动 visitor（如 Printer）在 hook 内自行递归。
-///
-/// 非对象安全（泛型方法 `walk_*` 需要 `Sized`），仅静态分派，零虚函数开销。
-pub trait AstVisitor<'a>: Sized {
-    fn visit_module(&mut self, _module: &'a Module<'a>) {}
-    fn visit_decl(&mut self, _decl: &'a Spanned<Decl<'a>>) {}
-    fn visit_type_def(&mut self, _def: &'a TypeDef<'a>) {}
-    fn visit_stmt(&mut self, _stmt: StmtId) {}
-    fn visit_expr(&mut self, _expr: ExprId) {}
-    fn visit_type(&mut self, _ty: TypeId) {}
-    fn visit_pattern(&mut self, _pat: PatternId) {}
-    fn visit_kind(&mut self, _kind: &'a Kind) {}
-}
-
-// --- walk_* 自由函数：先调 hook 再递归子节点 ---
-
-pub fn walk_module<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, m: &'a Module<'a>) {
-    v.visit_module(m);
-    for decl in &m.declarations {
-        walk_decl(v, arena, decl);
-    }
-}
-
-pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl: &'a Spanned<Decl<'a>>) {
-    v.visit_decl(decl);
-    match &decl.node {
-        Decl::FunDecl {
-            type_params,
-            params,
-            return_type,
-            bounds,
-            body,
-            ..
-        } => {
-            for tp in type_params {
-                walk_type_param(v, arena, tp);
-            }
-            for p in params {
-                walk_param(v, arena, p);
-            }
-            if let Some(rt) = return_type {
-                walk_type(v, arena, *rt);
-            }
-            for b in bounds {
-                walk_trait_bound(v, arena, b);
-            }
-            walk_expr(v, arena, *body);
-        }
-        Decl::TypeDecl {
-            type_params,
-            implemented_traits,
-            type_constraints,
-            def,
-            methods,
-            ..
-        } => {
-            for tp in type_params {
-                walk_type_param(v, arena, tp);
-            }
-            for b in implemented_traits {
-                walk_trait_bound(v, arena, b);
-            }
-            for c in type_constraints {
-                walk_type_constraint(v, arena, c);
-            }
-            walk_type_def(v, arena, def);
-            for m in methods {
-                walk_method_decl(v, arena, m);
-            }
-        }
-        Decl::TraitDecl {
-            type_params,
-            parents,
-            associated_types,
-            methods,
-            ..
-        } => {
-            for tp in type_params {
-                walk_type_param(v, arena, tp);
-            }
-            for p in parents {
-                walk_trait_bound(v, arena, p);
-            }
-            for at in associated_types {
-                walk_associated_type(v, at);
-            }
-            for m in methods {
-                walk_method_decl(v, arena, m);
-            }
-        }
-        Decl::ImportDecl { .. } | Decl::PackDecl { .. } => {}
-        Decl::ExprDecl { expr, stmt } => {
-            walk_expr(v, arena, *expr);
-            if let Some(s) = stmt {
-                walk_stmt(v, arena, *s);
-            }
-        }
-    }
-}
-
-pub fn walk_type_def<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, def: &'a TypeDef<'a>) {
-    v.visit_type_def(def);
-    match def {
-        TypeDef::Adt { constructors } => {
-            for ctor in constructors {
-                walk_constructor_def(v, arena, ctor);
-            }
-        }
-        TypeDef::Record { fields } => {
-            for f in fields {
-                walk_record_field_type(v, arena, f);
-            }
-        }
-        TypeDef::Alias { target } => {
-            walk_type(v, arena, *target);
-        }
-        TypeDef::Newtype { inner, .. } => {
-            walk_type(v, arena, *inner);
-        }
-    }
-}
-
-pub fn walk_stmt<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: StmtId) {
-    v.visit_stmt(id);
-    let stmt = arena.stmt(id);
-    match &stmt.node {
-        Stmt::ValDecl {
-            type_annotation,
-            value,
-            ..
-        } => {
-            if let Some(ty) = type_annotation {
-                walk_type(v, arena, *ty);
-            }
-            walk_expr(v, arena, *value);
-        }
-        Stmt::VarDecl {
-            type_annotation,
-            value,
-            ..
-        } => {
-            if let Some(ty) = type_annotation {
-                walk_type(v, arena, *ty);
-            }
-            walk_expr(v, arena, *value);
-        }
-        Stmt::Assignment { target, value } => {
-            walk_expr(v, arena, *target);
-            walk_expr(v, arena, *value);
-        }
-        Stmt::FieldAssignment {
-            object, value, ..
-        } => {
-            walk_expr(v, arena, *object);
-            walk_expr(v, arena, *value);
-        }
-        Stmt::CompoundAssignment {
-            target, value, ..
-        } => {
-            walk_expr(v, arena, *target);
-            walk_expr(v, arena, *value);
-        }
-        Stmt::Expression { expr } => {
-            walk_expr(v, arena, *expr);
-        }
-        Stmt::Return { value } => {
-            if let Some(e) = value {
-                walk_expr(v, arena, *e);
-            }
-        }
-        Stmt::Defer { expr } => {
-            walk_expr(v, arena, *expr);
-        }
-        Stmt::Throw { expr } => {
-            walk_expr(v, arena, *expr);
-        }
-        Stmt::Break | Stmt::Continue => {}
-        Stmt::For {
-            iterable, body, ..
-        } => {
-            walk_expr(v, arena, *iterable);
-            walk_expr(v, arena, *body);
-        }
-        Stmt::While { condition, body } => {
-            walk_expr(v, arena, *condition);
-            walk_expr(v, arena, *body);
-        }
-        Stmt::Loop { body } => {
-            walk_expr(v, arena, *body);
-        }
-        Stmt::LocalDecl { decl } => match decl.as_ref() {
-            Decl::FunDecl { params, return_type, body, .. } => {
-                for p in params {
-                    walk_param(v, arena, p);
-                }
-                if let Some(rt) = return_type {
-                    walk_type(v, arena, *rt);
-                }
-                walk_expr(v, arena, *body);
-            }
-            Decl::TypeDecl { methods, .. } => {
-                for m in methods {
-                    walk_method_decl(v, arena, m);
-                }
-            }
-            Decl::TraitDecl { methods, .. } => {
-                for m in methods {
-                    walk_method_decl(v, arena, m);
-                }
-            }
-            _ => {}
-        },
-    }
-}
-
-pub fn walk_expr<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: ExprId) {
-    v.visit_expr(id);
-    let expr = arena.expr(id);
-    match &expr.node {
-        Expr::IntLit { .. }
-        | Expr::FloatLit { .. }
-        | Expr::BoolLit(_)
-        | Expr::CharLit(_)
-        | Expr::StrLit(_)
-        | Expr::NullLit
-        | Expr::VoidLit
-        | Expr::Ident(_) => {}
-        Expr::StrInterp(parts) => {
-            for part in parts {
-                walk_interpolation_part(v, arena, part);
-            }
-        }
-        Expr::Assign { target, value } => {
-            walk_expr(v, arena, *target);
-            walk_expr(v, arena, *value);
-        }
-        Expr::CompoundAssign { target, value, .. } => {
-            walk_expr(v, arena, *target);
-            walk_expr(v, arena, *value);
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            walk_expr(v, arena, *lhs);
-            walk_expr(v, arena, *rhs);
-        }
-        Expr::Unary { operand, .. } => {
-            walk_expr(v, arena, *operand);
-        }
-        Expr::RefOf(inner) | Expr::Deref(inner) | Expr::Propagate(inner)
-        | Expr::NonNullAssert(inner) | Expr::Atomic(inner) | Expr::Lazy(inner) => {
-            walk_expr(v, arena, *inner);
-        }
-        Expr::Call {
-            callee,
-            args,
-            type_args,
-        } => {
-            walk_expr(v, arena, *callee);
-            for a in args {
-                walk_expr(v, arena, *a);
-            }
-            if let Some(ta) = type_args {
-                for t in ta {
-                    walk_type(v, arena, *t);
-                }
-            }
-        }
-        Expr::MethodCall {
-            recv,
-            args,
-            type_args,
-            ..
-        } => {
-            walk_expr(v, arena, *recv);
-            for a in args {
-                walk_expr(v, arena, *a);
-            }
-            if let Some(ta) = type_args {
-                for t in ta {
-                    walk_type(v, arena, *t);
-                }
-            }
-        }
-        Expr::FieldAccess { recv, .. } | Expr::SafeAccess { recv, .. } => {
-            walk_expr(v, arena, *recv);
-        }
-        Expr::Index { recv, index } => {
-            walk_expr(v, arena, *recv);
-            walk_expr(v, arena, *index);
-        }
-        Expr::Slice {
-            recv, start, end, ..
-        } => {
-            walk_expr(v, arena, *recv);
-            walk_expr(v, arena, *start);
-            walk_expr(v, arena, *end);
-        }
-        Expr::SafeMethodCall {
-            recv,
-            args,
-            type_args,
-            ..
-        } => {
-            walk_expr(v, arena, *recv);
-            for a in args {
-                walk_expr(v, arena, *a);
-            }
-            if let Some(ta) = type_args {
-                for t in ta {
-                    walk_type(v, arena, *t);
-                }
-            }
-        }
-        Expr::Elvis { lhs, rhs } => {
-            walk_expr(v, arena, *lhs);
-            walk_expr(v, arena, *rhs);
-        }
-        Expr::ArrayLit { elements, fill } => {
-            for e in elements {
-                walk_expr(v, arena, *e);
-            }
-            if let Some((value, count)) = fill {
-                walk_expr(v, arena, *value);
-                walk_expr(v, arena, *count);
-            }
-        }
-        Expr::RecordLit(fields) => {
-            for f in fields {
-                walk_record_field_expr(v, arena, f);
-            }
-        }
-        Expr::RecordExtend { base, updates } => {
-            walk_expr(v, arena, *base);
-            for f in updates {
-                walk_record_field_expr(v, arena, f);
-            }
-        }
-        Expr::Lambda {
-            params,
-            body,
-            return_type,
-            ..
-        } => {
-            for p in params {
-                walk_param(v, arena, p);
-            }
-            walk_lambda_body(v, arena, body);
-            if let Some(rt) = return_type {
-                walk_type(v, arena, *rt);
-            }
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            walk_expr(v, arena, *cond);
-            walk_expr(v, arena, *then_branch);
-            if let Some(e) = else_branch {
-                walk_expr(v, arena, *e);
-            }
-        }
-        Expr::Block { stmts, trailing } => {
-            for s in stmts {
-                walk_stmt(v, arena, *s);
-            }
-            if let Some(e) = trailing {
-                walk_expr(v, arena, *e);
-            }
-        }
-        Expr::Match { scrutinee, arms } => {
-            walk_expr(v, arena, *scrutinee);
-            for arm in arms {
-                walk_match_arm(v, arena, arm);
-            }
-        }
-        Expr::TypeCast { target, expr, .. } => {
-            walk_type(v, arena, *target);
-            walk_expr(v, arena, *expr);
-        }
-        Expr::Select(arms) => {
-            for arm in arms {
-                walk_select_arm(v, arena, arm);
-            }
-        }
-        Expr::InlineTrait(methods) => {
-            for m in methods {
-                walk_method_decl(v, arena, m);
-            }
-        }
-    }
-}
-
-pub fn walk_type<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: TypeId) {
-    v.visit_type(id);
-    let ty = arena.ty(id);
-    match &ty.node {
-        TypeNode::Named { .. } | TypeNode::SelfType => {}
-        TypeNode::Generic { args, .. } => {
-            for a in args {
-                walk_type(v, arena, *a);
-            }
-        }
-        TypeNode::Nullable { inner }
-        | TypeNode::RefType { inner }
-        | TypeNode::RawPtr { inner } => {
-            walk_type(v, arena, *inner);
-        }
-        TypeNode::Function {
-            params,
-            return_type,
-        } => {
-            for p in params {
-                walk_type(v, arena, *p);
-            }
-            walk_type(v, arena, *return_type);
-        }
-        TypeNode::Record { fields } => {
-            for f in fields {
-                walk_record_field_type(v, arena, f);
-            }
-        }
-        TypeNode::Array { element_type, .. } => {
-            walk_type(v, arena, *element_type);
-        }
-        TypeNode::KindAnnotated { inner, kind } => {
-            walk_type(v, arena, *inner);
-            walk_kind(v, kind);
-        }
-    }
-}
-
-pub fn walk_pattern<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: PatternId) {
-    v.visit_pattern(id);
-    let pat = arena.pattern(id);
-    match &pat.node {
-        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Variable { .. } => {}
-        Pattern::Constructor { patterns, .. } => {
-            for p in patterns {
-                walk_pattern(v, arena, *p);
-            }
-        }
-        Pattern::Record { fields } => {
-            for f in fields {
-                walk_pattern(v, arena, f.pattern);
-            }
-        }
-        Pattern::OrPattern { left, right } => {
-            walk_pattern(v, arena, *left);
-            walk_pattern(v, arena, *right);
-        }
-        Pattern::Guard { pattern, condition } => {
-            walk_pattern(v, arena, *pattern);
-            walk_expr(v, arena, *condition);
-        }
-    }
-}
-
-pub fn walk_kind<'a, V: AstVisitor<'a>>(v: &mut V, kind: &'a Kind) {
-    v.visit_kind(kind);
-    match kind {
-        Kind::Star => {}
-        Kind::Arrow { param, result } => {
-            walk_kind(v, param);
-            walk_kind(v, result);
-        }
-    }
-}
-
-// --- 辅助 struct 的 walk 函数 ---
-
-fn walk_type_param<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, tp: &'a TypeParam<'a>) {
-    if let Some(k) = &tp.kind {
-        walk_kind(v, k);
-    }
-    for b in &tp.bounds {
-        walk_trait_bound(v, arena, b);
-    }
-}
-
-fn walk_trait_bound<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, b: &'a TraitBound<'a>) {
-    for t in &b.type_args {
-        walk_type(v, arena, *t);
-    }
-}
-
-fn walk_type_constraint<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, c: &'a TypeConstraint<'a>) {
-    walk_type(v, arena, c.concrete_type);
-}
-
-fn walk_param<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, p: &'a Param<'a>) {
-    if let Some(ty) = &p.type_annotation {
-        walk_type(v, arena, *ty);
-    }
-}
-
-fn walk_associated_type<'a, V: AstVisitor<'a>>(v: &mut V, at: &'a AssociatedType<'a>) {
-    if let Some(k) = &at.kind {
-        walk_kind(v, k);
-    }
-}
-
-fn walk_method_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, m: &'a MethodDecl<'a>) {
-    for tp in &m.type_params {
-        walk_type_param(v, arena, tp);
-    }
-    for p in &m.params {
-        walk_param(v, arena, p);
-    }
-    if let Some(rt) = &m.return_type {
-        walk_type(v, arena, *rt);
-    }
-    if let Some(body) = &m.body {
-        walk_expr(v, arena, *body);
-    }
-}
-
-fn walk_constructor_def<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, ctor: &'a ConstructorDef<'a>) {
-    for f in &ctor.fields {
-        walk_constructor_field(v, arena, f);
-    }
-    if let Some(rt) = &ctor.return_type {
-        walk_type(v, arena, *rt);
-    }
-}
-
-fn walk_constructor_field<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, f: &'a ConstructorField<'a>) {
-    walk_type(v, arena, f.ty);
-}
-
-fn walk_record_field_type<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, f: &'a RecordFieldType<'a>) {
-    walk_type(v, arena, f.ty);
-}
-
-fn walk_record_field_expr<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, f: &'a RecordFieldExpr<'a>) {
-    walk_expr(v, arena, f.value);
-}
-
-fn walk_interpolation_part<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, part: &'a InterpolationPart<'a>) {
-    if let InterpolationPart::Expression(e) = part {
-        walk_expr(v, arena, *e);
-    }
-}
-
-fn walk_lambda_body<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, body: &LambdaBody) {
-    match body {
-        LambdaBody::Block(e) | LambdaBody::Expression(e) => {
-            walk_expr(v, arena, *e);
-        }
-    }
-}
-
-fn walk_match_arm<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, arm: &MatchArm) {
-    walk_pattern(v, arena, arm.pattern);
-    if let Some(g) = &arm.guard {
-        walk_expr(v, arena, *g);
-    }
-    walk_expr(v, arena, arm.body);
-}
-
-fn walk_select_arm<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, arm: &'a SelectArm<'a>) {
-    match arm {
-        SelectArm::Receive {
-            channel_expr, body, ..
-        } => {
-            walk_expr(v, arena, *channel_expr);
-            walk_expr(v, arena, *body);
-        }
-        SelectArm::Timeout { duration, body } => {
-            walk_expr(v, arena, *duration);
-            walk_expr(v, arena, *body);
-        }
-    }
-}
-
-// BinaryOp 优先级表
-//
-// 单一扁平注册表 + 数值优先级，驱动单一 Pratt 解析器。
-// 替代 13 层 parseXxx 模板函数（parseElvis/Or/And/BitOr/BitXor/BitAnd/Shift/
-// Equality/Comparison/Range/Addition/Multiplication）。
-//
-// 新增二元运算符只需在 BINARY_OPS 追加一条，无需改解析器。
+// Adding a new binary operator only requires appending an entry to BINARY_OPS; the parser needs no changes.
 
 
-/// 单个运算符映射：token 类型 → BinaryOp + 优先级
+/// A single operator mapping: token kind -> BinaryOp + precedence
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpMapping {
     pub token: TokenKind,
     pub op: BinaryOp,
-    /// 数值越大越紧密
+    /// Higher value means tighter binding
     pub precedence: u8,
-    /// 仅 `*`（乘法 vs 解引用歧义）需跨行检查
+    /// Only `*` (multiplication vs deref ambiguity) requires cross-line checking
     pub check_multiline_deref: bool,
-    /// 右结合（如 `??` elvis 运算符）
+    /// Right-associative (e.g. the `??` elvis operator)
     pub right_assoc: bool,
 }
 
-// 优先级常量（从低到高）
+// Precedence constants (from low to high)
 pub const ELVIS_PREC: u8 = 1;
 pub const OR_PREC: u8 = 2;
 pub const AND_PREC: u8 = 3;
@@ -1404,14 +49,14 @@ pub const RANGE_PREC: u8 = 10;
 pub const ADDITION_PREC: u8 = 11;
 pub const MULTIPLICATION_PREC: u8 = 12;
 
-/// 最低优先级（Pratt 解析器入口）
+/// Lowest precedence (Pratt parser entry point)
 pub const MIN_PREC: u8 = ELVIS_PREC;
 
-/// 扁平二元运算符注册表（单一真相来源）
+/// Flat binary operator registry (single source of truth)
 ///
-/// 新增运算符只需在此追加一条。
+/// To add a new operator, simply append an entry here.
 pub const BINARY_OPS: &[OpMapping] = &[
-    // Elvis ?? (最低，右结合)
+    // Elvis ?? (lowest, right-associative)
     OpMapping {
         token: TokenKind::QuestionQuestion,
         op: BinaryOp::Elvis,
@@ -1419,7 +64,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: true,
     },
-    // 逻辑或 ||
+    // Logical or ||
     OpMapping {
         token: TokenKind::PipePipe,
         op: BinaryOp::Or,
@@ -1427,7 +72,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 逻辑与 &&
+    // Logical and &&
     OpMapping {
         token: TokenKind::AmpAmp,
         op: BinaryOp::And,
@@ -1435,7 +80,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 按位或 |
+    // Bitwise or |
     OpMapping {
         token: TokenKind::Pipe,
         op: BinaryOp::BitOr,
@@ -1443,7 +88,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 按位异或 ^
+    // Bitwise xor ^
     OpMapping {
         token: TokenKind::Caret,
         op: BinaryOp::BitXor,
@@ -1451,7 +96,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 按位与 &
+    // Bitwise and &
     OpMapping {
         token: TokenKind::Ampersand,
         op: BinaryOp::BitAnd,
@@ -1459,7 +104,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 移位 << >>
+    // Shift << >>
     OpMapping {
         token: TokenKind::LtLt,
         op: BinaryOp::Shl,
@@ -1474,7 +119,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 相等 == != === !==
+    // Equality == != === !==
     OpMapping {
         token: TokenKind::EqEq,
         op: BinaryOp::Eq,
@@ -1503,7 +148,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 比较 < > <= >=
+    // Comparison < > <= >=
     OpMapping {
         token: TokenKind::Lt,
         op: BinaryOp::Lt,
@@ -1532,7 +177,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 范围 .. ..=
+    // Range .. ..=
     OpMapping {
         token: TokenKind::DotDot,
         op: BinaryOp::Range,
@@ -1547,7 +192,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 加减 + ++ -
+    // Add/sub + ++ -
     OpMapping {
         token: TokenKind::Plus,
         op: BinaryOp::Add,
@@ -1569,7 +214,7 @@ pub const BINARY_OPS: &[OpMapping] = &[
         check_multiline_deref: false,
         right_assoc: false,
     },
-    // 乘除模 * / %（`*` 需跨行解引用检查）
+    // Mul/div/mod * / % (`*` requires cross-line deref checking)
     OpMapping {
         token: TokenKind::Star,
         op: BinaryOp::Mul,
@@ -1593,29 +238,30 @@ pub const BINARY_OPS: &[OpMapping] = &[
     },
 ];
 
-/// 按 token 类型查找二元运算符映射，未找到返回 None
+/// Look up a binary operator mapping by token kind; returns `None` if not found
 pub fn lookup_binary_op(tok: TokenKind) -> Option<&'static OpMapping> {
     BINARY_OPS.iter().find(|m| m.token == tok)
 }
 
-// 词法分析器（Lexer）
+// Lexer
 //
-// 将 Glue 源码字符串逐字符扫描为 Token 序列，支持关键字、标识符、
-// 整数（含二/八/十六进制）、浮点数、字符与字符串字面量（含插值），
-// 以及各类运算符与分隔符。Token 同时携带行列号信息以便错误定位。
+// Scans a Glue source string character-by-character into a Token sequence. Supports keywords,
+// identifiers, integers (binary/octal/hexadecimal), floating-point numbers, character and string
+// literals (with interpolation), and various operators and delimiters. Tokens carry line/column
+// information for error reporting.
 //
-// 语义对应 Zig 原版 `src/parse/lexer.zig`，但用 Rust 惯例重写。
-// 分号 `;` 被当作空白字符跳过；遇到词法错误时生成 `Err` token 并继续扫描，
-// 以便 parser 能收集更多错误。
+// Semantically corresponds to the Zig original `src/parse/lexer.zig`, but rewritten using Rust idioms.
+// Semicolons `;` are treated as whitespace and skipped; on lexical errors an `Err` token is emitted
+// and scanning continues, so that the parser can collect more errors.
 
 // =========================================================================
-// TokenKind：覆盖所有字面量、关键字、运算符与分隔符
+// TokenKind: covers all literals, keywords, operators, and delimiters
 // =========================================================================
 
-/// 词法单元类型：覆盖所有字面量、关键字、运算符与分隔符
+/// Lexical token kind: covers all literals, keywords, operators, and delimiters
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenKind {
-    // --- 字面量（7 种）---
+    // --- Literals (7) ---
     IntLiteral,
     FloatLiteral,
     CharLiteral,
@@ -1624,7 +270,7 @@ pub enum TokenKind {
     FalseLiteral,
     NullLiteral,
 
-    // --- 关键字（28 种）---
+    // --- Keywords (28) ---
     KwFun,
     KwType,
     KwTrait,
@@ -1654,10 +300,10 @@ pub enum TokenKind {
     KwLazy,
     KwDefer,
 
-    // 标识符
+    // Identifier
     Identifier,
 
-    // --- 运算符（42 种）---
+    // --- Operators (42) ---
     Plus,
     Minus,
     Star,
@@ -1701,7 +347,7 @@ pub enum TokenKind {
     EqGt,
     MinusGt,
 
-    // --- 分隔符（10 种）---
+    // --- Delimiters (10) ---
     LParen,
     RParen,
     LBracket,
@@ -1713,11 +359,11 @@ pub enum TokenKind {
     Dot,
     Pipe,
 
-    // --- 属性与原始块 ---
+    // --- Attributes and raw blocks ---
     At,        // @
-    RawBlock,  // #{ ... }# 原始块（lexeme 为内部内容，不含 #{ 和 }#）
+    RawBlock,  // #{ ... }# raw block (lexeme is the inner content, excluding #{ and }#)
 
-    // --- 特殊（2 种）---
+    // --- Special (2) ---
     Eof,
     Err,
 }
@@ -1726,7 +372,7 @@ pub enum TokenKind {
 // Token
 // =========================================================================
 
-/// 词法单元：类型、字面文本（零拷贝引用源码）、行列号
+/// Lexical token: kind, literal text (zero-copy reference into source), line, and column
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token<'a> {
     pub kind: TokenKind,
@@ -1739,7 +385,7 @@ pub struct Token<'a> {
 // LexerError
 // =========================================================================
 
-/// 词法分析可能产生的错误类型
+/// Error types that may occur during lexical analysis
 #[derive(Debug, Clone)]
 pub enum LexerError {
     UnterminatedString,
@@ -1754,16 +400,16 @@ pub enum LexerError {
 }
 
 // =========================================================================
-// TokenSink — Token 接收器 trait
+// TokenSink — Token receiver trait
 // =========================================================================
 
-/// Token 接收器 trait。Lexer 每生成一个 Token 调用 `emit_token`。
-/// 默认实现 `TokenCollector` 收集到 `Vec<Token>`。
+/// Token receiver trait. The Lexer calls `emit_token` for each Token it produces.
+/// The default implementation `TokenCollector` collects into a `Vec<Token>`.
 pub trait TokenSink<'a> {
     fn emit_token(&mut self, token: Token<'a>);
 }
 
-/// 默认接收器：收集到 Vec
+/// Default receiver: collects into a Vec
 pub struct TokenCollector<'a> {
     pub tokens: Vec<Token<'a>>,
 }
@@ -1773,7 +419,7 @@ impl<'a> TokenCollector<'a> {
         Self { tokens: Vec::new() }
     }
 
-    /// 消费 self 返回收集到的 Token 列表
+    /// Consumes self and returns the collected Token list
     pub fn into_tokens(self) -> Vec<Token<'a>> {
         self.tokens
     }
@@ -1795,7 +441,7 @@ impl<'a> TokenSink<'a> for TokenCollector<'a> {
 // Lexer
 // =========================================================================
 
-/// 词法分析器：持有源码、扫描位置与行列号
+/// Lexer: holds the source code, scan position, line, and column
 pub struct Lexer<'a> {
     source: &'a str,
     bytes: &'a [u8],
@@ -1805,7 +451,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    /// 创建词法分析器
+    /// Creates a lexer
     pub fn new(source: &'a str) -> Self {
         Self {
             source,
@@ -1816,10 +462,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 扫描整个源码并将 Token 流式发送到 sink，末尾追加 `Eof`。
+    /// Scans the entire source and streams Tokens to the sink, appending `Eof` at the end.
     ///
-    /// 遇到词法错误时生成 `Err` token 并继续扫描（不中断），
-    /// 以便 parser 能收集更多错误。
+    /// On lexical errors, emits an `Err` token and continues scanning (does not abort),
+    /// so that the parser can collect more errors.
     pub fn tokenize_into<S: TokenSink<'a>>(&mut self, sink: &mut S) {
         while self.pos < self.bytes.len() {
             let start = self.pos;
@@ -1829,7 +475,7 @@ impl<'a> Lexer<'a> {
                 Ok(Some(tok)) => sink.emit_token(tok),
                 Ok(None) => {}
                 Err(_) => {
-                    // 生成错误 Token，覆盖已消费的范围，继续扫描
+                    // Emit an error Token covering the consumed range, then continue scanning
                     sink.emit_token(Token {
                         kind: TokenKind::Err,
                         lexeme: &self.source[start..self.pos],
@@ -1847,21 +493,21 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    // --- 基础字符操作 ---
+    // --- Basic character operations ---
 
-    /// 查看当前位置字符（不前进）
+    /// Peek at the current character (does not advance)
     #[allow(dead_code)]
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
 
-    /// 查看下一位置字符（不前进）
+    /// Peek at the next character (does not advance)
     #[allow(dead_code)]
     fn peek_next(&self) -> Option<u8> {
         self.bytes.get(self.pos + 1).copied()
     }
 
-    /// 消费当前字符并前进，遇到换行时同步更新行列号
+    /// Consume the current character and advance; updates line/column on newline
     fn advance(&mut self) -> Option<u8> {
         let ch = *self.bytes.get(self.pos)?;
         self.pos += 1;
@@ -1874,7 +520,7 @@ impl<'a> Lexer<'a> {
         Some(ch)
     }
 
-    /// 当当前字符等于预期时消费并前进，返回是否匹配
+    /// Consume and advance if the current character equals the expected one; returns whether it matched
     fn match_char(&mut self, expected: u8) -> bool {
         if self.pos >= self.bytes.len() {
             return false;
@@ -1892,7 +538,7 @@ impl<'a> Lexer<'a> {
         true
     }
 
-    /// 根据起止位置与行列号构造 Token（lexeme 零拷贝引用源码）
+    /// Build a Token from start/end positions and line/column (lexeme is a zero-copy reference into source)
     fn make_token(&self, kind: TokenKind, start: usize, start_line: u32, start_col: u32) -> Token<'a> {
         Token {
             kind,
@@ -1902,10 +548,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // --- 单个词法单元扫描 ---
+    // --- Single-token scanning ---
 
-    /// 扫描单个词法单元：根据首字符分派到对应处理分支。
-    /// 返回 `Ok(None)` 表示空白/注释/分号（不产生 Token）。
+    /// Scan a single token: dispatch to the matching branch based on the first character.
+    /// Returns `Ok(None)` for whitespace/comments/semicolons (no Token produced).
     fn scan_token(&mut self) -> Result<Option<Token<'a>>, LexerError> {
         let start = self.pos;
         let start_line = self.line;
@@ -1915,7 +561,7 @@ impl<'a> Lexer<'a> {
             None => return Ok(None),
         };
         match ch {
-            // 空白字符直接跳过
+            // Whitespace is skipped directly
             b' ' | b'\t' | b'\r' | b'\n' => Ok(None),
             b'/' => {
                 if self.match_char(b'/') {
@@ -1937,7 +583,7 @@ impl<'a> Lexer<'a> {
             b'{' => Ok(Some(self.make_token(TokenKind::LBrace, start, start_line, start_col))),
             b'}' => Ok(Some(self.make_token(TokenKind::RBrace, start, start_line, start_col))),
             b',' => Ok(Some(self.make_token(TokenKind::Comma, start, start_line, start_col))),
-            // 分号被当作空白字符跳过
+            // Semicolons are treated as whitespace and skipped
             b';' => Ok(None),
             b':' => Ok(Some(self.make_token(TokenKind::Colon, start, start_line, start_col))),
             b'%' => {
@@ -2043,7 +689,7 @@ impl<'a> Lexer<'a> {
                         Ok(Some(self.make_token(TokenKind::DotDot, start, start_line, start_col)))
                     }
                 } else {
-                    // 单独点号后跟数字时，按 .浮点数 处理（如 .5）
+                    // A lone dot followed by a digit is treated as a .float (e.g. .5)
                     if self.pos < self.bytes.len() && is_digit(self.bytes[self.pos]) {
                         self.scan_dot_float(start, start_line, start_col)
                     } else {
@@ -2089,14 +735,14 @@ impl<'a> Lexer<'a> {
             b'"' => self.scan_string(start, start_line, start_col),
             b'0'..=b'9' => self.scan_number(start, start_line, start_col),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.scan_identifier(start, start_line, start_col),
-            // 未知字符：生成错误 Token（不中断扫描）
+            // Unknown character: emit an error Token (does not abort scanning)
             _ => Ok(Some(self.make_token(TokenKind::Err, start, start_line, start_col))),
         }
     }
 
-    // --- 注释 ---
+    // --- Comments ---
 
-    /// 跳过行注释（// 到行尾，不消费换行符）
+    /// Skip a line comment (// to end of line, does not consume the newline)
     fn skip_line_comment(&mut self) {
         while self.pos < self.bytes.len() {
             if self.bytes[self.pos] == b'\n' {
@@ -2107,7 +753,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 跳过块注释（/* */，支持嵌套）
+    /// Skip a block comment (/* */, supports nesting)
     fn skip_block_comment(&mut self) -> Result<(), LexerError> {
         let mut depth: u32 = 1;
         while self.pos < self.bytes.len() && depth > 0 {
@@ -2135,9 +781,9 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    // --- 数字 ---
+    // --- Numbers ---
 
-    /// 扫描数字字面量，自动识别二/八/十六进制前缀、小数点、指数与类型后缀
+    /// Scan a numeric literal, auto-detecting binary/octal/hexadecimal prefixes, decimal points, exponents, and type suffixes
     fn scan_number(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         if self.bytes[start] == b'0' && self.pos < self.bytes.len() {
             let prefix = self.bytes[self.pos];
@@ -2161,7 +807,7 @@ impl<'a> Lexer<'a> {
         }
         self.skip_underscore_digits(false);
         let mut is_float = false;
-        // 小数部分
+        // Fractional part
         if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.'
             && self.pos + 1 < self.bytes.len() && is_digit(self.bytes[self.pos + 1])
         {
@@ -2174,7 +820,7 @@ impl<'a> Lexer<'a> {
             }
             self.skip_underscore_digits(false);
         }
-        // 指数部分
+        // Exponent part
         if self.pos < self.bytes.len() && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E') {
             is_float = true;
             self.pos += 1;
@@ -2192,27 +838,18 @@ impl<'a> Lexer<'a> {
                 return Err(LexerError::InvalidNumber);
             }
         }
-        // 类型后缀（如 i32、f64），非法后缀则回退
+        // Type suffix (e.g. i32, f64): consume all identifier characters; validity is checked by Sema
         if self.pos < self.bytes.len() && is_identifier_start(self.bytes[self.pos]) {
-            let suffix_start = self.pos;
             while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
                 self.pos += 1;
                 self.column += 1;
-            }
-            let suffix = &self.source[suffix_start..self.pos];
-            if is_float_suffix(suffix) {
-                is_float = true;
-            } else if !is_int_suffix(suffix) {
-                let backtrack = self.pos - suffix_start;
-                self.pos = suffix_start;
-                self.column = self.column.saturating_sub(backtrack as u32);
             }
         }
         let kind = if is_float { TokenKind::FloatLiteral } else { TokenKind::IntLiteral };
         Ok(Some(self.make_token(kind, start, start_line, start_col)))
     }
 
-    /// 跳过数字中的下划线分隔符（如 1_000），`hex` 控制是否按十六进制判断
+    /// Skip underscore separators within digits (e.g. 1_000); `hex` controls whether to treat digits as hexadecimal
     fn skip_underscore_digits(&mut self, hex: bool) {
         while self.pos < self.bytes.len() {
             if self.bytes[self.pos] == b'_' && self.pos + 1 < self.bytes.len() {
@@ -2241,7 +878,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 扫描以点号开头的浮点数（如 .5）
+    /// Scan a float literal that starts with a dot (e.g. .5)
     fn scan_dot_float(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         while self.pos < self.bytes.len() && is_digit(self.bytes[self.pos]) {
             self.pos += 1;
@@ -2264,24 +901,17 @@ impl<'a> Lexer<'a> {
                 return Err(LexerError::InvalidNumber);
             }
         }
-        // .浮点数 仅允许浮点类型后缀，非法后缀则回退
+        // Type suffix: consume all identifier characters; validity is checked by Sema
         if self.pos < self.bytes.len() && is_identifier_start(self.bytes[self.pos]) {
-            let suffix_start = self.pos;
             while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
                 self.pos += 1;
                 self.column += 1;
-            }
-            let suffix = &self.source[suffix_start..self.pos];
-            if !is_float_suffix(suffix) {
-                let backtrack = self.pos - suffix_start;
-                self.pos = suffix_start;
-                self.column = self.column.saturating_sub(backtrack as u32);
             }
         }
         Ok(Some(self.make_token(TokenKind::FloatLiteral, start, start_line, start_col)))
     }
 
-    /// 扫描十六进制数字字面量（0x 前缀），支持十六进制小数与 p 指数
+    /// Scan a hexadecimal numeric literal (0x prefix), supporting hexadecimal fractions and p exponents
     fn scan_hex_number(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         let mut has_digits = false;
         while self.pos < self.bytes.len() && is_hex_digit(self.bytes[self.pos]) {
@@ -2326,25 +956,18 @@ impl<'a> Lexer<'a> {
         if !has_digits {
             return Err(LexerError::InvalidHexDigit);
         }
-        // 类型后缀，非法则回退
+        // Type suffix: consume all identifier characters; validity is checked by Sema
         if self.pos < self.bytes.len() && is_identifier_start(self.bytes[self.pos]) {
-            let suffix_start = self.pos;
             while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
                 self.pos += 1;
                 self.column += 1;
-            }
-            let suffix = &self.source[suffix_start..self.pos];
-            if !is_int_suffix(suffix) && !is_float_suffix(suffix) {
-                let backtrack = self.pos - suffix_start;
-                self.pos = suffix_start;
-                self.column = self.column.saturating_sub(backtrack as u32);
             }
         }
         let kind = if is_float { TokenKind::FloatLiteral } else { TokenKind::IntLiteral };
         Ok(Some(self.make_token(kind, start, start_line, start_col)))
     }
 
-    /// 扫描八进制数字字面量（0o 前缀）
+    /// Scan an octal numeric literal (0o prefix)
     fn scan_octal_number(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         let mut has_digits = false;
         while self.pos < self.bytes.len() && is_octal_digit(self.bytes[self.pos]) {
@@ -2373,24 +996,17 @@ impl<'a> Lexer<'a> {
         if !has_digits {
             return Err(LexerError::InvalidOctalDigit);
         }
-        // 仅允许整数类型后缀，非法则回退
+        // Type suffix: consume all identifier characters; validity is checked by Sema
         if self.pos < self.bytes.len() && is_identifier_start(self.bytes[self.pos]) {
-            let suffix_start = self.pos;
             while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
                 self.pos += 1;
                 self.column += 1;
-            }
-            let suffix = &self.source[suffix_start..self.pos];
-            if !is_int_suffix(suffix) {
-                let backtrack = self.pos - suffix_start;
-                self.pos = suffix_start;
-                self.column = self.column.saturating_sub(backtrack as u32);
             }
         }
         Ok(Some(self.make_token(TokenKind::IntLiteral, start, start_line, start_col)))
     }
 
-    /// 扫描二进制数字字面量（0b 前缀）
+    /// Scan a binary numeric literal (0b prefix)
     fn scan_binary_number(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         let mut has_digits = false;
         while self.pos < self.bytes.len() && is_binary_digit(self.bytes[self.pos]) {
@@ -2420,24 +1036,17 @@ impl<'a> Lexer<'a> {
             return Err(LexerError::InvalidBinaryDigit);
         }
         if self.pos < self.bytes.len() && is_identifier_start(self.bytes[self.pos]) {
-            let suffix_start = self.pos;
             while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
                 self.pos += 1;
                 self.column += 1;
-            }
-            let suffix = &self.source[suffix_start..self.pos];
-            if !is_int_suffix(suffix) {
-                let backtrack = self.pos - suffix_start;
-                self.pos = suffix_start;
-                self.column = self.column.saturating_sub(backtrack as u32);
             }
         }
         Ok(Some(self.make_token(TokenKind::IntLiteral, start, start_line, start_col)))
     }
 
-    // --- 字符 ---
+    // --- Characters ---
 
-    /// 扫描字符字面量（'x'），支持转义与 Unicode 转义 \u{...}
+    /// Scan a character literal ('x'), supporting escapes and Unicode escapes \u{...}
     fn scan_char(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         if self.pos >= self.bytes.len() {
             return Err(LexerError::UnterminatedChar);
@@ -2482,7 +1091,23 @@ impl<'a> Lexer<'a> {
                 }
             }
         } else {
-            self.pos += 1;
+            // Non-ASCII character: a multi-byte UTF-8 sequence, advance by character boundary
+            // Avoid advancing by single byte which would leave pos mid-character and cause a slice panic
+            let ch_start = self.pos;
+            let first = self.bytes[self.pos];
+            let utf8_len = if first < 0x80 {
+                1
+            } else if first < 0xC0 {
+                1 // Invalid UTF-8 leading byte; advance by 1 byte for fault tolerance
+            } else if first < 0xE0 {
+                2
+            } else if first < 0xF0 {
+                3
+            } else {
+                4
+            };
+            let end = std::cmp::min(ch_start + utf8_len, self.bytes.len());
+            self.pos = end;
             self.column += 1;
         }
         if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'\'' {
@@ -2493,12 +1118,12 @@ impl<'a> Lexer<'a> {
         Ok(Some(self.make_token(TokenKind::CharLiteral, start, start_line, start_col)))
     }
 
-    // --- 字符串 ---
+    // --- Strings ---
 
-    /// 扫描字符串字面量，支持转义、`{{` `}}` 字面花括号与 `{表达式}` 插值。
+    /// Scan a string literal, supporting escapes, `{{`/`}}` literal braces, and `{expression}` interpolation.
     ///
-    /// 整个字符串字面量（含插值部分）被作为单个 `StringLiteral` Token，
-    /// lexeme 包含原始文本。字符串中不允许裸换行。
+    /// The entire string literal (including interpolation parts) is emitted as a single `StringLiteral` Token;
+    /// the lexeme contains the raw text. Bare newlines are not allowed inside strings.
     fn scan_string(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         while self.pos < self.bytes.len() {
             let ch = self.bytes[self.pos];
@@ -2524,7 +1149,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
             } else if ch == b'{' {
-                // {{ 表示字面 {，否则进入插值表达式扫描
+                // {{ denotes a literal {; otherwise enter interpolation expression scanning
                 if self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == b'{' {
                     self.pos += 2;
                     self.column += 2;
@@ -2547,7 +1172,7 @@ impl<'a> Lexer<'a> {
                         } else if inner == b'}' {
                             brace_depth -= 1;
                         } else if inner == b'"' {
-                            // 插值表达式中嵌套的字符串字面量
+                            // Nested string literal inside an interpolation expression
                             self.pos += 1;
                             self.column += 1;
                             while self.pos < self.bytes.len() && self.bytes[self.pos] != b'"' {
@@ -2584,7 +1209,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
             } else if ch == b'}' {
-                // }} 表示字面 }
+                // }} denotes a literal }
                 if self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == b'}' {
                     self.pos += 2;
                     self.column += 2;
@@ -2602,7 +1227,7 @@ impl<'a> Lexer<'a> {
         Err(LexerError::UnterminatedString)
     }
 
-    /// 扫描原始块 #{ ... }#：逐字符扫描直到匹配 }#，lexeme 为内部内容（不含 #{ 和 }#）。
+    /// Scan a raw block #{ ... }#: scan character-by-character until a matching }# is found; the lexeme is the inner content (excluding #{ and }#).
     fn scan_raw_block(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         let content_start = self.pos;
         while self.pos < self.bytes.len() {
@@ -2611,8 +1236,8 @@ impl<'a> Lexer<'a> {
                 let content = &self.source[content_start..self.pos];
                 self.pos += 2;
                 self.column += 2;
-                // 生成一个 Token，lexeme 为内部内容
-                // 注意：make_token 用 start..self.pos 会包含 #{ 和 }#，我们需要手动构造
+                // Emit a single Token whose lexeme is the inner content
+                // Note: make_token uses start..self.pos which would include #{ and }#, so we construct it manually
                 let _ = start;
                 return Ok(Some(Token {
                     kind: TokenKind::RawBlock,
@@ -2633,9 +1258,9 @@ impl<'a> Lexer<'a> {
         Err(LexerError::UnterminatedString)
     }
 
-    // --- 标识符 ---
+    // --- Identifiers ---
 
-    /// 扫描标识符或关键字，通过关键字表判定最终 Token 类型
+    /// Scan an identifier or keyword; the keyword table determines the final Token kind
     fn scan_identifier(&mut self, start: usize, start_line: u32, start_col: u32) -> Result<Option<Token<'a>>, LexerError> {
         while self.pos < self.bytes.len() && is_identifier_continue(self.bytes[self.pos]) {
             self.pos += 1;
@@ -2648,40 +1273,40 @@ impl<'a> Lexer<'a> {
 }
 
 // =========================================================================
-// 辅助函数
+// Helper functions
 // =========================================================================
 
-/// 判断是否为十进制数字
+/// Whether the character is a decimal digit
 fn is_digit(ch: u8) -> bool {
     ch.is_ascii_digit()
 }
 
-/// 判断是否为十六进制数字
+/// Whether the character is a hexadecimal digit
 fn is_hex_digit(ch: u8) -> bool {
     ch.is_ascii_hexdigit()
 }
 
-/// 判断是否为八进制数字
+/// Whether the character is an octal digit
 fn is_octal_digit(ch: u8) -> bool {
     (b'0'..=b'7').contains(&ch)
 }
 
-/// 判断是否为二进制数字
+/// Whether the character is a binary digit
 fn is_binary_digit(ch: u8) -> bool {
     ch == b'0' || ch == b'1'
 }
 
-/// 判断字符是否可作为标识符首字符（仅 ASCII）
+/// Whether the character may start an identifier (ASCII only)
 fn is_identifier_start(ch: u8) -> bool {
     ch.is_ascii_alphabetic() || ch == b'_'
 }
 
-/// 判断字符是否可作为标识符后续字符（仅 ASCII）
+/// Whether the character may continue an identifier (ASCII only)
 fn is_identifier_continue(ch: u8) -> bool {
     is_identifier_start(ch) || is_digit(ch)
 }
 
-/// 查询文本是否为关键字，否则返回 `Identifier`
+/// Look up whether the text is a keyword; otherwise returns `Identifier`
 fn keyword_type(text: &str) -> TokenKind {
     match text {
         "fun" => TokenKind::KwFun,
@@ -2719,30 +1344,17 @@ fn keyword_type(text: &str) -> TokenKind {
     }
 }
 
-/// 判断后缀是否为合法整数类型后缀
-fn is_int_suffix(suffix: &str) -> bool {
-    matches!(
-        suffix,
-        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128" | "isize" | "usize"
-    )
-}
 
-/// 判断后缀是否为合法浮点类型后缀
-fn is_float_suffix(suffix: &str) -> bool {
-    matches!(suffix, "f16" | "f32" | "f64" | "f128")
-}
-
-
-// 递归下降语法分析器
+// Recursive-descent parser
 //
-// 将 Token 序列解析为 AST。核心特性：
-// - 递归下降 + Pratt 优先级爬升（由 binary_op_table 驱动）
-// - 虚拟 Token 拆分（`>>` → 两个 `>`，`>=` → `>` + `=`，`>>=` → `>` + `>=`）
-// - 负数字面量折叠（`-42` → IntLit，非 Unary）
-// - lambda 两种语法（`fun(params) body` 与 `(params) => expr`）
-// - record literal vs record extend vs grouping 三路回溯
-// - 字符串插值（复用 Parser 状态解析子表达式）
-// - 错误恢复（synchronize 跳到声明边界）
+// Parses a Token sequence into an AST. Core features:
+// - Recursive descent + Pratt precedence climbing (driven by binary_op_table)
+// - Virtual token splitting (`>>` -> two `>`, `>=` -> `>` + `=`, `>>=` -> `>` + `>=`)
+// - Negative literal folding (`-42` -> IntLit, not Unary)
+// - Two lambda syntaxes (`fun(params) body` and `(params) => expr`)
+// - Three-way backtracking: record literal vs record extend vs grouping
+// - String interpolation (reuses Parser state to parse sub-expressions)
+// - Error recovery (synchronize skips to a declaration boundary)
 
 
 use bumpalo::Bump;
@@ -2751,7 +1363,7 @@ use bumpalo::Bump;
 // ParseError
 // =========================================================================
 
-/// 语法错误：携带源码位置与消息
+/// Syntax error: carries source location and message
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub line: u32,
@@ -2762,23 +1374,23 @@ pub struct ParseError {
 pub type ParseResult<T> = Result<T, ParseError>;
 
 // =========================================================================
-// ParseErrorHandler — 解析错误处理器 trait
+// ParseErrorHandler — parse error handler trait
 // =========================================================================
 
-/// 解析错误处理器 trait。Parser 在遇到错误时调用 hook，
-/// 默认实现 `ErrorCollector` 收集到 `Vec<ParseError>`。
+/// Parse error handler trait. The Parser calls the hook on errors;
+/// the default implementation `ErrorCollector` collects into a `Vec<ParseError>`.
 pub trait ParseErrorHandler {
-    /// 记录一条语法错误，返回 ParseError 供传播
+    /// Record a syntax error; returns a ParseError for propagation
     fn on_error(&mut self, line: u32, column: u32, message: &str) -> ParseError;
-    /// 错误恢复通知：Parser 在 `synchronize` 完成后调用
+    /// Error recovery notification: called by the Parser after `synchronize` completes
     fn on_recover(&mut self) {}
-    /// 返回已收集的错误列表
+    /// Returns the collected error list
     fn errors(&self) -> &[ParseError];
-    /// 截断错误列表到指定长度（用于推测解析回退）
+    /// Truncate the error list to the given length (used for speculative parse backtracking)
     fn truncate_errors(&mut self, len: usize);
 }
 
-/// 默认错误处理器：收集错误到 Vec，恢复时跳过到声明边界。
+/// Default error handler: collects errors into a Vec; on recovery, skips to a declaration boundary.
 pub struct ErrorCollector {
     pub errors: Vec<ParseError>,
 }
@@ -2819,28 +1431,30 @@ impl ParseErrorHandler for ErrorCollector {
 // Parser
 // =========================================================================
 
-/// 递归下降语法分析器
+/// Recursive-descent parser
 pub struct Parser<'a, H: ParseErrorHandler> {
     tokens: &'a [Token<'a>],
     current: usize,
-    /// bumpalo arena：仅用于分配动态构建的字符串（负数字面量、反转义、int_to_key）
-    /// 与插值子表达式的 token 数组。AST 节点本身存储在 `ast` 中。
+    /// bumpalo arena: used only for allocating dynamically built strings (negative literals,
+    /// unescaped text, int_to_key) and the token array for interpolation sub-expressions.
+    /// AST nodes themselves are stored in `ast`.
     arena: &'a Bump,
-    /// AST 节点统一存储（替代节点级 bumpalo 分配）
+    /// Unified AST node storage (replaces per-node bumpalo allocation)
     ast: AstArena<'a>,
     handler: H,
-    /// 虚拟 Token 拆分：`>=` 拆为 `>` + `=`，消费 `>` 后设置 pending_eq
+    /// Virtual token splitting: `>=` split into `>` + `=`; after consuming `>`, set pending_eq
     pending_eq: bool,
-    /// 虚拟 Token 拆分：`>>` 拆为 `>` + `>`，消费内层 `>` 后设置 pending_gt
+    /// Virtual token splitting: `>>` split into `>` + `>`; after consuming the inner `>`, set pending_gt
     pending_gt: bool,
-    /// 虚拟 Token 拆分：`>>=` 拆为 `>` + `>=`，消费内层 `>` 后设置 pending_gt_eq
+    /// Virtual token splitting: `>>=` split into `>` + `>=`; after consuming the inner `>`, set pending_gt_eq
     pending_gt_eq: bool,
 }
 
-// --- 解析辅助宏 ---
+// --- Parse helper macro ---
 
-/// 生成逗号分隔列表解析方法：先解析一项，随后循环消费逗号直至遇到终止符。
-/// `check($tk)` 以给定 TokenKind 为终止符；`check_close_angle` 以闭合尖括号为终止符。
+/// Generates a comma-separated list parsing method: parse one item, then repeatedly consume commas
+/// until a terminator is encountered.
+/// `check($tk)` uses the given TokenKind as terminator; `check_close_angle` uses a closing angle bracket.
 macro_rules! impl_parse_comma_list {
     ($method:ident, $item:ty, $parse_fn:ident, check($tk:expr)) => {
         fn $method(&mut self, items: &mut Vec<$item>) -> ParseResult<()> {
@@ -2869,7 +1483,7 @@ macro_rules! impl_parse_comma_list {
 }
 
 impl<'a, H: ParseErrorHandler> Parser<'a, H> {
-    /// 创建语法分析器，需显式传入错误处理器
+    /// Creates a parser; an error handler must be passed explicitly
     pub fn new(tokens: &'a [Token<'a>], arena: &'a Bump, handler: H) -> Self {
         Self {
             tokens,
@@ -2883,16 +1497,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
     }
 
-    /// 返回收集到的错误列表
+    /// Returns the collected error list
     pub fn errors(&self) -> &[ParseError] {
         self.handler.errors()
     }
 
     // =====================================================================
-    // Token 导航
+    // Token navigation
     // =====================================================================
 
-    /// 查看当前 Token（处理虚拟 Token 注入）
+    /// Peek at the current Token (handles virtual token injection)
     fn peek(&self) -> Token<'a> {
         if self.pending_eq {
             let base = self.base_token();
@@ -2912,7 +1526,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.tokens[self.current]
     }
 
-    /// 获取用于虚拟 Token 位置计算的基准 Token
+    /// Returns the base Token used for virtual token position computation
     fn base_token(&self) -> Token<'a> {
         if self.current > 0 {
             self.tokens[self.current - 1]
@@ -2921,18 +1535,18 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
     }
 
-    /// 返回上一个已消费的 Token
+    /// Returns the most recently consumed Token
     fn previous(&self) -> Token<'a> {
         debug_assert!(self.current > 0);
         self.tokens[self.current - 1]
     }
 
-    /// 是否到达 Token 序列末尾
+    /// Whether the end of the Token sequence has been reached
     fn is_at_end(&self) -> bool {
         self.peek().kind == TokenKind::Eof
     }
 
-    /// 消费当前 Token 并前进（处理虚拟 Token 消费）
+    /// Consume the current Token and advance (handles virtual token consumption)
     fn advance(&mut self) -> Token<'a> {
         if self.pending_eq {
             self.pending_eq = false;
@@ -2955,7 +1569,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.tokens[self.current - 1]
     }
 
-    /// 当前 Token 是否为指定类型
+    /// Whether the current Token is of the given kind
     fn check(&self, kind: TokenKind) -> bool {
         if self.is_at_end() {
             return false;
@@ -2963,7 +1577,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.peek().kind == kind
     }
 
-    /// 当当前 Token 匹配时消费并返回 true
+    /// Consume and return true if the current Token matches
     fn match_token(&mut self, kind: TokenKind) -> bool {
         if self.check(kind) {
             self.advance();
@@ -2972,7 +1586,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         false
     }
 
-    /// 期望消费指定类型 Token，不匹配时记录错误并返回 Err
+    /// Expect and consume a Token of the given kind; on mismatch, records an error and returns Err
     fn expect(&mut self, kind: TokenKind, message: &str) -> ParseResult<Token<'a>> {
         if self.check(kind) {
             return Ok(self.advance());
@@ -2981,12 +1595,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Err(self.report_error_at(tok.line, tok.column, message))
     }
 
-    /// 当前 Token 是否为指定名称的标识符
+    /// Whether the current Token is an identifier with the given name
     fn check_identifier(&self, name: &str) -> bool {
         self.peek().kind == TokenKind::Identifier && self.peek().lexeme == name
     }
 
-    /// 检测当前位置是否为闭合泛型参数列表的 `>`（含虚拟拆分形态）
+    /// Detect whether the current position is a `>` closing a generic parameter list (including virtual-split forms)
     fn check_close_angle(&self) -> bool {
         if self.pending_gt || self.pending_gt_eq {
             return true;
@@ -3000,7 +1614,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         )
     }
 
-    /// 期望消费关闭泛型参数的 `>`，支持虚拟拆分 `>=` / `>>` / `>>=`
+    /// Expect and consume the `>` that closes a generic parameter list, supporting virtual splits `>=` / `>>` / `>>=`
     fn expect_close_angle(&mut self, message: &str) -> ParseResult<()> {
         if self.check(TokenKind::Gt) {
             self.advance();
@@ -3036,31 +1650,31 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 错误处理
+    // Error handling
     // =====================================================================
 
-    /// 在指定位置记录一条语法错误，返回 ParseError 供传播
+    /// Record a syntax error at the given location; returns a ParseError for propagation
     fn report_error_at(&mut self, line: u32, column: u32, message: &str) -> ParseError {
         self.handler.on_error(line, column, message)
     }
 
-    /// 在当前 Token 处记录一条语法错误
+    /// Record a syntax error at the current Token
     fn report_error(&mut self, message: &str) -> ParseResult<()> {
         let tok = self.peek();
         Err(self.report_error_at(tok.line, tok.column, message))
     }
 
-    /// 条件语句禁止使用括号
+    /// Reject parenthesized conditions in conditional statements
     fn reject_paren_condition(&mut self, kw_name: &str) -> ParseResult<()> {
         if self.check(TokenKind::LParen) {
-            let msg = format!("{} 条件不允许使用括号", kw_name);
+            let msg = format!("parentheses are not allowed around the {} condition", kw_name);
             self.report_error(&msg)?;
             unreachable!()
         }
         Ok(())
     }
 
-    /// 错误恢复：跳过 Token 直到遇到声明起始或右大括号
+    /// Error recovery: skip Tokens until a declaration start or a closing brace is encountered
     fn synchronize(&mut self) {
         while !self.is_at_end() {
             match self.peek().kind {
@@ -3085,7 +1699,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // AST 节点分配
+    // AST node allocation
     // =====================================================================
 
     fn alloc_expr(&mut self, span: Span, expr: Expr<'a>) -> ExprRef {
@@ -3109,10 +1723,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 模块解析
+    // Module parsing
     // =====================================================================
 
-    /// 解析整个模块
+    /// Parse an entire module
     pub fn parse_module(&mut self, module_name: &'a str) -> ParseResult<Module<'a>> {
         let mut declarations = Vec::new();
         while !self.is_at_end() {
@@ -3191,7 +1805,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析 0..N 个属性前缀：@name 或 @name("arg") 或 @name "arg"
+    /// Parse 0..N attribute prefixes: @name or @name("arg") or @name "arg"
     fn parse_attributes(&mut self) -> Vec<Attribute<'a>> {
         let mut attrs = Vec::new();
         while self.check(TokenKind::At) {
@@ -3206,7 +1820,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 while !self.check(TokenKind::RParen) && !self.is_at_end() {
                     if self.check(TokenKind::StringLiteral) {
                         let lex = self.advance().lexeme;
-                        // 去掉首尾引号
+                        // Strip the surrounding quotes
                         if lex.len() >= 2 {
                             args.push(&lex[1..lex.len() - 1]);
                         } else {
@@ -3235,12 +1849,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         attrs
     }
 
-    /// 尝试解析顶层声明（容错版本，失败返回 None）
+    /// Attempt to parse a top-level declaration (fault-tolerant; returns None on failure)
     fn try_parse_decl(&mut self) -> Option<Spanned<Decl<'a>>> {
         let saved = self.current;
         let attributes = self.parse_attributes();
         if !attributes.is_empty() && !self.check(TokenKind::KwPub) && !self.check(TokenKind::KwAsync) && !self.check(TokenKind::KwFun) {
-            // 属性后必须跟 pub/async/fun
+            // Attributes must be followed by pub/async/fun
             self.current = saved;
             return None;
         }
@@ -3293,11 +1907,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             }
             return None;
         }
-        // 回退 pub
+        // Backtrack pub
         if visibility == Visibility::Public {
             self.current = saved;
         }
-        // 顶层语句
+        // Top-level statement
         if matches!(
             self.peek().kind,
             TokenKind::KwVal
@@ -3325,10 +1939,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 声明解析
+    // Declaration parsing
     // =====================================================================
 
-    /// 解析函数声明：fun name<TParams>(params): ReturnType with bounds { body }
+    /// Parse a function declaration: `fun name<TParams>(params): ReturnType with bounds { body }`
     fn parse_fun_decl(&mut self, visibility: Visibility, is_async: bool, attributes: Vec<Attribute<'a>>) -> ParseResult<Spanned<Decl<'a>>> {
         let fun_tok = self.advance(); // 'fun'
         let name_tok = self.expect(TokenKind::Identifier, "expected function name")?;
@@ -3349,21 +1963,21 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             return Err(self.report_error_at(
                 name_tok.line,
                 name_tok.column,
-                "函数声明必须显式标注返回类型（无返回值请使用 ': void'）",
+                "function declaration must explicitly annotate the return type (use ': void' for no return value)",
             ));
         };
         let mut bounds = Vec::new();
         if self.match_token(TokenKind::KwWith) {
             self.parse_trait_bound_list(&mut bounds)?;
         }
-        // @extern("C") 函数：body 为 #{ }# 原始块，而非 Glue 表达式
+        // @extern("C") function: body is a #{ }# raw block rather than a Glue expression
         let extern_c_body = if self.check(TokenKind::RawBlock) {
             let tok = self.advance();
             Some(tok.lexeme)
         } else {
             None
         };
-        // extern_c_body 存在时用占位表达式作为 body（Sema 会跳过检查）
+        // When extern_c_body is present, use a placeholder expression as the body (Sema skips checking)
         let body = if extern_c_body.is_some() {
             self.alloc_expr(token_span(&fun_tok), Expr::VoidLit)
         } else {
@@ -3387,7 +2001,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// 解析类型声明：type Name<TParams> : traits = def with constraints { methods }
+    /// Parse a type declaration: `type Name<TParams> : traits = def with constraints { methods }`
     fn parse_type_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let type_tok = self.advance(); // 'type'
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
@@ -3432,7 +2046,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// 解析类型定义体
+    /// Parse a type definition body
     fn parse_type_def(&mut self) -> ParseResult<TypeDef<'a>> {
         if self.match_token(TokenKind::Pipe) {
             return self.parse_adt_body();
@@ -3454,7 +2068,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     if self.check(TokenKind::Identifier) {
                         self.advance();
                         if self.check(TokenKind::Colon) {
-                            // name: Type → 记录式参数
+                            // name: Type -> record-style parameter
                             self.current = saved2;
                             let mut _params = Vec::new();
                             self.parse_param_list(&mut _params)?;
@@ -3490,7 +2104,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(TypeDef::Alias { target })
     }
 
-    /// 尝试解析单构造器 ADT
+    /// Attempt to parse a single-constructor ADT
     fn try_parse_single_ctor_adt(&mut self) -> Option<TypeDef<'a>> {
         let name_tok = self.advance();
         if !self.check(TokenKind::LParen) {
@@ -3507,7 +2121,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 }],
             });
         }
-        // 命名字段
+        // Named fields
         if self.check(TokenKind::Identifier)
             && self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1].kind == TokenKind::Colon
@@ -3527,7 +2141,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 }],
             });
         }
-        // 位置字段
+        // Positional fields
         let first_type = match self.parse_type() {
             Ok(t) => t,
             Err(_) => return None,
@@ -3567,7 +2181,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 尝试解析记录类型定义
+    /// Attempt to parse a record type definition
     fn try_parse_record_type_def(&mut self) -> Option<TypeDef<'a>> {
         self.advance(); // '('
         if self.peek().kind == TokenKind::Identifier {
@@ -3599,7 +2213,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         None
     }
 
-    /// 解析 ADT 构造器列表
+    /// Parse an ADT constructor list
     fn parse_adt_body(&mut self) -> ParseResult<TypeDef<'a>> {
         let mut constructors = vec![self.parse_constructor_def()?];
         while self.match_token(TokenKind::Pipe) {
@@ -3608,7 +2222,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(TypeDef::Adt { constructors })
     }
 
-    /// 解析单个构造器定义
+    /// Parse a single constructor definition
     fn parse_constructor_def(&mut self) -> ParseResult<ConstructorDef<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected constructor name")?;
         let mut fields = Vec::new();
@@ -3630,10 +2244,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    // 解析构造器字段列表
+    // Parse a constructor field list
     impl_parse_comma_list!(parse_constructor_field_list, ConstructorField<'a>, parse_constructor_field, check(TokenKind::RParen));
 
-    /// 解析单个构造器字段
+    /// Parse a single constructor field
     fn parse_constructor_field(&mut self) -> ParseResult<ConstructorField<'a>> {
         if self.peek().kind == TokenKind::Identifier {
             let saved = self.current;
@@ -3651,7 +2265,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(ConstructorField { name: None, ty })
     }
 
-    /// 解析 trait 声明
+    /// Parse a trait declaration
     fn parse_trait_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let trait_tok = self.advance(); // 'trait'
         let name_tok = self.expect(TokenKind::Identifier, "expected trait name")?;
@@ -3691,7 +2305,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// 解析关联类型声明
+    /// Parse an associated type declaration
     fn parse_associated_type(&mut self) -> ParseResult<AssociatedType<'a>> {
         let _type_tok = self.advance(); // 'type'
         let name_tok = self.expect(TokenKind::Identifier, "expected associated type name")?;
@@ -3706,7 +2320,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析方法声明
+    /// Parse a method declaration
     fn parse_method_decl(&mut self) -> ParseResult<MethodDecl<'a>> {
         let mut visibility = Visibility::Private;
         if self.match_token(TokenKind::KwPub) {
@@ -3731,7 +2345,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             Some(self.parse_type()?)
         } else {
             self.report_error(
-                "方法声明必须显式标注返回类型（无返回值请使用 ': void'）",
+                "method declaration must explicitly annotate the return type (use ': void' for no return value)",
             )?;
             unreachable!()
         };
@@ -3764,7 +2378,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析 import 声明
+    /// Parse an import declaration
     fn parse_use_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let use_tok = self.advance(); // 'import'
         let first = self.expect(TokenKind::Identifier, "expected module name")?;
@@ -3811,7 +2425,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// 解析单个导入项
+    /// Parse a single import item
     fn parse_import_item(&mut self) -> ParseResult<ImportItem<'a>> {
         let name = self.expect(TokenKind::Identifier, "expected import item name")?;
         let alias = if self.match_token(TokenKind::KwAs) {
@@ -3826,7 +2440,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析 pack 声明
+    /// Parse a pack declaration
     fn parse_pack_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let pack_tok = self.advance(); // 'pack'
         let name_tok = self.expect(TokenKind::Identifier, "expected pack name")?;
@@ -3840,7 +2454,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 类型参数、Kind、参数、约束
+    // Type parameters, kinds, parameters, constraints
     // =====================================================================
 
     impl_parse_comma_list!(parse_type_param_list, TypeParam<'a>, parse_type_param, check_close_angle);
@@ -3999,10 +2613,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     impl_parse_comma_list!(parse_type_arg_list, TypeRef, parse_type, check_close_angle);
 
     // =====================================================================
-    // 类型解析
+    // Type parsing
     // =====================================================================
 
-    /// 类型解析入口：处理前缀 &T / *T
+    /// Type parsing entry point: handles prefix &T / *T
     fn parse_type(&mut self) -> ParseResult<TypeRef> {
         if self.match_token(TokenKind::Ampersand) {
             let span = token_span(&self.previous());
@@ -4023,7 +2637,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.parse_function_type()
     }
 
-    /// 解析函数类型：(P1, P2) -> R 或 A -> C
+    /// Parse a function type: `(P1, P2) -> R` or `A -> C`
     fn parse_function_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) && self.paren_group_followed_by_arrow() {
             let span = token_span(&self.peek());
@@ -4065,7 +2679,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(left)
     }
 
-    /// 向前探测：圆括号组之后是否紧跟箭头
+    /// Lookahead: whether a parenthesized group is immediately followed by an arrow
     fn paren_group_followed_by_arrow(&self) -> bool {
         let mut i = self.current;
         if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
@@ -4090,7 +2704,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         false
     }
 
-    /// 解析可空类型：T?（链式）
+    /// Parse a nullable type: `T?` (chained)
     fn parse_nullable_type(&mut self) -> ParseResult<TypeRef> {
         let mut ty = self.parse_primary_type()?;
         while self.match_token(TokenKind::Question) {
@@ -4100,7 +2714,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(ty)
     }
 
-    /// 解析基本类型：命名/泛型，后缀数组 [N]
+    /// Parse a primary type: named/generic, with suffix array `[N]`
     fn parse_primary_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) {
             return self.parse_record_type();
@@ -4126,7 +2740,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         } else {
             self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
         };
-        // 后缀数组类型 T[N]
+        // Suffix array type T[N]
         while self.match_token(TokenKind::LBracket) {
             let mut size: Option<u64> = None;
             if !self.check(TokenKind::RBracket) {
@@ -4144,7 +2758,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(ty)
     }
 
-    /// 解析记录类型：(field: Type, ...)
+    /// Parse a record type: `(field: Type, ...)`
     fn parse_record_type(&mut self) -> ParseResult<TypeRef> {
         let lparen = self.advance(); // '('
         let span = token_span(&lparen);
@@ -4178,22 +2792,22 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 表达式解析
+    // Expression parsing
     // =====================================================================
 
-    /// 表达式解析入口
+    /// Expression parsing entry point
     pub fn parse_expr(&mut self) -> ParseResult<ExprRef> {
         self.parse_binary(MIN_PREC)
     }
 
-    /// 单一 Pratt 解析器
+    /// Single Pratt parser
     fn parse_binary(&mut self, min_prec: u8) -> ParseResult<ExprRef> {
         let mut left = self.parse_unary()?;
         while let Some(mapping) = lookup_binary_op(self.peek().kind) {
             if mapping.precedence < min_prec {
                 break;
             }
-            // `*` 跨行时视为解引用
+            // `*` across lines is treated as dereference
             if mapping.check_multiline_deref && self.current > 0 {
                 let prev_tok = self.tokens[self.current - 1];
                 if self.peek().line != prev_tok.line {
@@ -4219,7 +2833,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(left)
     }
 
-    /// 解析一元运算
+    /// Parse a unary operation
     fn parse_unary(&mut self) -> ParseResult<ExprRef> {
         if self.match_token(TokenKind::Bang) {
             let op_tok = self.previous();
@@ -4255,7 +2869,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.match_token(TokenKind::Minus) {
             let op_tok = self.previous();
-            // 负号紧跟数字字面量时直接合并
+            // When a minus sign is immediately followed by a numeric literal, fold them directly
             if self.check(TokenKind::IntLiteral) {
                 let lit_tok = self.advance();
                 return self.parse_negative_int_literal(lit_tok);
@@ -4273,26 +2887,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.parse_postfix()
     }
 
-    /// 解析后缀运算
+    /// Parse a postfix operation
     fn parse_postfix(&mut self) -> ParseResult<ExprRef> {
         let mut expr = self.parse_primary()?;
         loop {
             if self.match_token(TokenKind::Question) {
                 let op_tok = self.previous();
-                // type_cast 后紧跟 ? → 安全转换：重新分配一个 safe=true 的 TypeCast 节点
-                if let Expr::TypeCast { target, expr: inner, safe: false } = &self.ast.expr(expr).node {
-                    let target = *target;
-                    let inner = *inner;
-                    expr = self.alloc_expr(
-                        token_span(&op_tok),
-                        Expr::TypeCast {
-                            target,
-                            expr: inner,
-                            safe: true,
-                        },
-                    );
-                    continue;
-                }
                 expr = self.alloc_expr(token_span(&op_tok), Expr::Propagate(expr));
             } else if self.match_token(TokenKind::Bang) {
                 let op_tok = self.previous();
@@ -4332,7 +2932,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     });
                 }
             } else if self.check(TokenKind::LParen) {
-                // 函数调用 f(args)
+                // Function call f(args)
                 if matches!(self.ast.expr(expr).node, Expr::Call { .. }) {
                     self.report_error(
                         "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
@@ -4347,7 +2947,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     type_args,
                 });
             } else if self.check(TokenKind::Lt) && self.is_turbofish_call() {
-                // turbofish 调用 f<T>(args)
+                // turbofish call f<T>(args)
                 self.advance(); // '<'
                 let mut type_args = Vec::new();
                 self.parse_type_arg_list(&mut type_args)?;
@@ -4377,7 +2977,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     type_args: Some(type_args),
                 });
             } else if self.match_token(TokenKind::LBracket) {
-                // 索引或切片
+                // Index or slice
                 let bracket_tok = self.previous();
                 let start = self.parse_binary(ADDITION_PREC)?;
                 if self.match_token(TokenKind::DotDotEq) || self.match_token(TokenKind::DotDot) {
@@ -4404,16 +3004,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(expr)
     }
 
-    /// 解析调用参数（已在 `(` 处）
+    /// Parse call arguments (already at `(`)
     fn parse_call_args(&mut self) -> ParseResult<(Vec<ExprRef>, Option<Vec<TypeRef>>)> {
-        // 可选 turbofish <T> 在 ( 之前
+        // Optional turbofish <T> before (
         let type_args = if self.match_token(TokenKind::Lt) {
             let mut ta = Vec::new();
             self.parse_type_arg_list(&mut ta)?;
             if self.match_token(TokenKind::Gt) {
                 Some(ta)
             } else {
-                // 回退
+                // Backtrack
                 self.current -= ta.len() + 1;
                 None
             }
@@ -4435,7 +3035,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok((args, type_args))
     }
 
-    /// 探测 `f<T>(args)` 形式的 turbofish 调用
+    /// Detect a turbofish call of the form `f<T>(args)`
     fn is_turbofish_call(&self) -> bool {
         if !self.check(TokenKind::Lt) {
             return false;
@@ -4463,7 +3063,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         false
     }
 
-    /// 解析基本表达式
+    /// Parse a primary expression
     fn parse_primary(&mut self) -> ParseResult<ExprRef> {
         if self.match_token(TokenKind::IntLiteral) {
             let tok = self.previous();
@@ -4493,14 +3093,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let tok = self.previous();
             return Ok(self.alloc_expr(token_span(&tok), Expr::NullLit));
         }
-        // fun(params) body → lambda
+        // fun(params) body -> lambda
         if self.check(TokenKind::KwFun)
             && self.tokens.len() > self.current + 1
             && self.tokens[self.current + 1].kind == TokenKind::LParen
         {
             return self.parse_lambda_fun(false);
         }
-        // async fun(params) body → async lambda
+        // async fun(params) body -> async lambda
         if self.check(TokenKind::KwAsync)
             && self.tokens.len() > self.current + 1
             && self.tokens[self.current + 1].kind == TokenKind::KwFun
@@ -4542,7 +3142,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         if self.match_token(TokenKind::LParen) {
             return self.parse_paren_or_record_or_lambda();
         }
-        // `type` 关键字在表达式位置且后跟 `(` → 作为标识符
+        // `type` keyword in expression position followed by `(` -> treated as an identifier
         if self.check(TokenKind::KwType)
             && self.tokens.len() > self.current + 1
             && self.tokens[self.current + 1].kind == TokenKind::LParen
@@ -4554,17 +3154,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.peek().kind,
             TokenKind::Identifier | TokenKind::KwVal | TokenKind::KwVar | TokenKind::KwChannel
         ) {
-            // void 在表达式位置表示单元值
+            // void in expression position denotes the unit value
             if self.check(TokenKind::Identifier) && self.peek().lexeme == "void" {
                 let tok = self.advance();
                 return Ok(self.alloc_expr(token_span(&tok), Expr::VoidLit));
-            }
-            // 内建类型名后跟 `(` → 类型转换
-            if is_builtin_type(self.peek().lexeme)
-                && self.tokens.len() > self.current + 1
-                && self.tokens[self.current + 1].kind == TokenKind::LParen
-            {
-                return self.parse_type_cast();
             }
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident(tok.lexeme)));
@@ -4574,10 +3167,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 字面量解析
+    // Literal parsing
     // =====================================================================
 
-    /// 解析整数字面量，分离数字部分与类型后缀
+    /// Parse an integer literal, separating the numeric part from the type suffix
     fn parse_int_literal(&mut self, tok: Token<'a>) -> ExprRef {
         let raw = tok.lexeme;
         let mut i: usize = 0;
@@ -4605,7 +3198,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析负整数字面量，将负号合并进 raw
+    /// Parse a negative integer literal, folding the minus sign into raw
     fn parse_negative_int_literal(&mut self, lit_tok: Token<'a>) -> ParseResult<ExprRef> {
         let raw = lit_tok.lexeme;
         let mut i: usize = 0;
@@ -4627,7 +3220,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             }
         }
         let suffix = if i < raw.len() { Some(&raw[i..]) } else { None };
-        // 在 arena 中分配 "-" + raw[..i]
+        // Allocate "-" + raw[..i] in the arena
         let mut s = bumpalo::collections::String::new_in(self.arena);
         s.push('-');
         s.push_str(&raw[..i]);
@@ -4638,16 +3231,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析浮点字面量，分离数字部分与类型后缀
+    /// Parse a float literal, separating the numeric part from the type suffix
     fn parse_float_literal(&mut self, tok: Token<'a>) -> ExprRef {
         let raw = tok.lexeme;
         let bytes = raw.as_bytes();
         let mut i = raw.len();
-        // 从末尾扫描数字
+        // Scan digits from the end
         while i > 0 && bytes[i - 1].is_ascii_digit() {
             i -= 1;
         }
-        // 从末尾扫描字母（后缀）
+        // Scan letters (suffix) from the end
         while i > 0 && bytes[i - 1].is_ascii_alphabetic() {
             i -= 1;
         }
@@ -4662,7 +3255,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析负浮点字面量
+    /// Parse a negative float literal
     fn parse_negative_float_literal(&mut self, lit_tok: Token<'a>) -> ParseResult<ExprRef> {
         let raw = lit_tok.lexeme;
         let bytes = raw.as_bytes();
@@ -4688,7 +3281,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析字符串字面量（含插值处理）
+    /// Parse a string literal (including interpolation handling)
     fn parse_string_literal(&mut self, tok: Token<'a>) -> ParseResult<ExprRef> {
         let raw = tok.lexeme;
         if !contains_interpolation(raw) {
@@ -4743,7 +3336,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(self.alloc_expr(token_span(&tok), Expr::StrInterp(parts)))
     }
 
-    /// 对插值表达式文本进行词法+语法分析
+    /// Lexically and syntactically parse an interpolation expression text
     fn parse_interpolation_expr(&mut self, text: &'a str) -> ParseResult<ExprRef> {
         let mut lexer = Lexer::new(text);
         let mut sink = TokenCollector::new();
@@ -4765,7 +3358,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.pending_gt_eq = false;
 
         let result = self.parse_expr();
-        // 恢复状态
+        // Restore state
         self.tokens = saved_tokens;
         self.current = saved_current;
         self.pending_eq = saved_pending_eq;
@@ -4777,9 +3370,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         result
     }
 
-    /// 反转义字符串
+    /// Unescape a string
     fn unescape_string(&self, text: &'a str) -> &'a str {
-        // 快路径：无转义则零拷贝返回
+        // Fast path: return zero-copy if no escapes
         let bytes = text.as_bytes();
         let mut i = 0;
         while i < text.len() {
@@ -4797,7 +3390,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         if i >= text.len() {
             return text;
         }
-        // 慢路径
+        // Slow path
         let mut result = bumpalo::collections::String::new_in(self.arena);
         let mut j = 0;
         while j < text.len() {
@@ -4851,10 +3444,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 特殊表达式
+    // Special expressions
     // =====================================================================
 
-    /// 解析 fun 关键字开头的 lambda：fun(params) body
+    /// Parse a lambda starting with the fun keyword: `fun(params) body`
     fn parse_lambda_fun(&mut self, is_async: bool) -> ParseResult<ExprRef> {
         let fun_tok = self.advance(); // 'fun'
         let span = token_span(&fun_tok);
@@ -4873,7 +3466,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 尝试解析 lambda：(params) => expr（失败时回退）
+    /// Attempt to parse a lambda: `(params) => expr` (backtracks on failure)
     fn try_parse_lambda(&mut self, saved: usize, span: Span) -> Option<ExprRef> {
         let saved_error_count = self.handler.errors().len();
         let mut params = Vec::new();
@@ -4927,7 +3520,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// 解析圆括号表达式：单元值、lambda、记录字面量、记录扩展或分组
+    /// Parse a parenthesized expression: unit value, lambda, record literal, record extend, or grouping
     fn parse_paren_or_record_or_lambda(&mut self) -> ParseResult<ExprRef> {
         let lparen_tok = self.previous();
         let span = token_span(&lparen_tok);
@@ -4939,7 +3532,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             return Ok(lambda);
         }
         self.current = saved;
-        // 记录扩展：(...base, field: value)
+        // Record extend: (...base, field: value)
         if self.peek().kind == TokenKind::Ellipsis {
             self.advance();
             let base_expr = self.parse_expr()?;
@@ -4962,7 +3555,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 updates,
             }));
         }
-        // 记录字面量：(field: value, ...)
+        // Record literal: (field: value, ...)
         if self.peek().kind == TokenKind::Identifier {
             let name_tok = self.advance();
             if self.check(TokenKind::Colon) {
@@ -5012,10 +3605,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             }
             self.current = saved;
         }
-        // 普通分组表达式
+        // Plain grouping expression
         let first_expr = self.parse_expr()?;
         if self.match_token(TokenKind::Comma) {
-            // 匿名元组不被允许
+            // Anonymous tuples are not allowed
             self.report_error_at(
                 lparen_tok.line,
                 lparen_tok.column,
@@ -5027,28 +3620,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(first_expr)
     }
 
-    /// 解析类型转换：BuiltinType(expr)
-    fn parse_type_cast(&mut self) -> ParseResult<ExprRef> {
-        let name_tok = self.advance();
-        let span = token_span(&name_tok);
-        let target = self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme });
-        let _ = self.expect(TokenKind::LParen, "expected '('");
-        let expr = self.parse_expr()?;
-        let _ = self.expect(TokenKind::RParen, "expected ')'");
-        Ok(self.alloc_expr(span, Expr::TypeCast {
-            target,
-            expr,
-            safe: false,
-        }))
-    }
-
-    /// 解析 cast builder：cast(expr).to(T) / cast(expr).try_to(T)
+    /// Parse a cast builder: `cast(expr).to(T)` / `cast(expr).try_to(T)`
     ///
-    /// 废除特殊语法：降级为普通函数调用
-    ///   cast(x).to(T)      → __cast_to<T>(x)
-    ///   cast(x).try_to(T)  → __cast_try_to<T>(x)
+    /// The special syntax is desugared into a plain function call:
+    ///   cast(x).to(T)      -> __cast_to<T>(x)
+    ///   cast(x).try_to(T)  -> __cast_try_to<T>(x)
     ///
-    /// sema 推断源类型 S 后解析为 __cast_S_to_T(x) 函数调用。
+    /// After sema infers the source type S, this resolves to a __cast_S_to_T(x) function call.
     fn parse_cast_builder(&mut self) -> ParseResult<ExprRef> {
         let cast_tok = self.previous();
         let span = token_span(&cast_tok);
@@ -5075,15 +3653,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             unreachable!()
         }
         let type_tok = self.advance();
-        if !is_builtin_type(type_tok.lexeme) {
-            self.report_error(
-                "cast target must be a builtin type (i8/i16/.../isize/usize/.../bool/char/str)",
-            )?;
-            unreachable!()
-        }
         let target = self.alloc_type(token_span(&type_tok), TypeNode::Named { name: type_tok.lexeme });
         let _ = self.expect(TokenKind::RParen, "expected ')' after cast target type");
-        // 降级为普通 Call: __cast_to<T>(x) / __cast_try_to<T>(x)
+        // Desugar into a plain Call: __cast_to<T>(x) / __cast_try_to<T>(x)
         let callee = self.alloc_expr(span, Expr::Ident(callee_name));
         Ok(self.alloc_expr(span, Expr::Call {
             callee,
@@ -5092,7 +3664,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析 if 表达式
+    /// Parse an if expression
     fn parse_if_expr(&mut self) -> ParseResult<ExprRef> {
         let if_tok = self.previous();
         let span = token_span(&if_tok);
@@ -5111,7 +3683,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析 match 表达式
+    /// Parse a match expression
     fn parse_match_expr(&mut self) -> ParseResult<ExprRef> {
         let match_tok = self.previous();
         let span = token_span(&match_tok);
@@ -5139,7 +3711,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(self.alloc_expr(span, Expr::Match { scrutinee, arms }))
     }
 
-    /// 解析 match 分支
+    /// Parse a match arm
     fn parse_match_arm(&mut self) -> ParseResult<MatchArm> {
         let pattern = self.parse_pattern()?;
         let guard = if self.match_token(TokenKind::KwIf) {
@@ -5149,7 +3721,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             None
         };
         let _ = self.expect(TokenKind::EqGt, "expected '=>'");
-        // 控制流语句作为分支体时包装为块表达式
+        // Wrap control-flow statements as block expressions when used as an arm body
         let body = if matches!(
             self.peek().kind,
             TokenKind::KwThrow | TokenKind::KwReturn | TokenKind::KwBreak | TokenKind::KwContinue
@@ -5238,14 +3810,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(self.alloc_expr(span, Expr::InlineTrait(methods)))
     }
 
-    /// 解析数组字面量
+    /// Parse an array literal
     fn parse_array_literal(&mut self) -> ParseResult<ExprRef> {
         let bracket_tok = self.previous();
         let span = token_span(&bracket_tok);
         let mut elements = Vec::new();
         if !self.check(TokenKind::RBracket) {
             elements.push(self.parse_expr()?);
-            // 数组填充语法 [value, ..count]
+            // Array fill syntax [value, ..count]
             if self.match_token(TokenKind::Comma) {
                 if self.match_token(TokenKind::DotDot) {
                     let count = self.parse_expr()?;
@@ -5256,7 +3828,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         fill: Some((value, count)),
                     }));
                 }
-                // 普通多元素
+                // Regular multi-element
                 if !self.check(TokenKind::RBracket) {
                     elements.push(self.parse_expr()?);
                     while self.match_token(TokenKind::Comma) {
@@ -5275,7 +3847,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析块表达式
+    /// Parse a block expression
     fn parse_block_expr(&mut self) -> ParseResult<ExprRef> {
         let brace_tok = self.advance(); // '{'
         let span = token_span(&brace_tok);
@@ -5307,7 +3879,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 语句解析
+    // Statement parsing
     // =====================================================================
 
     fn is_stmt_start(&self) -> bool {
@@ -5329,7 +3901,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         )
     }
 
-    /// 语句解析入口
+    /// Statement parsing entry point
     fn parse_stmt(&mut self) -> ParseResult<StmtRef> {
         if self.match_token(TokenKind::KwVal) {
             return self.parse_val_decl();
@@ -5377,9 +3949,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.parse_expr_or_assignment_stmt()
     }
 
-    /// 解析 fun 语句
-    /// 命名 fun → LocalDecl(Decl::FunDecl)（统一嵌套声明入口）
-    /// 匿名 fun(params) body → Expression(Lambda)
+    /// Parse a fun statement
+    /// Named fun -> LocalDecl(Decl::FunDecl) (unified nested declaration entry point)
+    /// Anonymous fun(params) body -> Expression(Lambda)
     fn parse_fun_stmt(&mut self) -> ParseResult<StmtRef> {
         let fun_tok = self.previous();
         let span = token_span(&fun_tok);
@@ -5421,7 +3993,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             };
             return Ok(self.alloc_stmt(span, Stmt::LocalDecl { decl: Box::new(decl) }));
         }
-        // 匿名 lambda
+        // Anonymous lambda
         let mut params = Vec::new();
         let _ = self.expect(TokenKind::LParen, "expected '('");
         if !self.check(TokenKind::RParen) {
@@ -5543,7 +4115,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         if self.match_token(TokenKind::Eq) {
             let eq_tok = self.previous();
             let value = self.parse_expr()?;
-            // 先从 arena 复制出节点信息，避免与 alloc_stmt 的 &mut self 借用冲突
+            // Copy node info out of the arena first to avoid borrow conflict with alloc_stmt's &mut self
             let expr_span = self.ast.expr(expr).span;
             let (is_ident, field_info): (bool, Option<(ExprRef, &'a str)>) =
                 match &self.ast.expr(expr).node {
@@ -5600,7 +4172,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     // =====================================================================
-    // 模式解析
+    // Pattern parsing
     // =====================================================================
 
     fn parse_pattern(&mut self) -> ParseResult<PatternRef> {
@@ -5679,7 +4251,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         unreachable!()
     }
 
-    /// 解析构造器模式
+    /// Parse a constructor pattern
     fn parse_constructor_pattern(&mut self, name_tok: Token<'a>) -> ParseResult<PatternRef> {
         self.advance(); // '('
         let mut patterns = Vec::new();
@@ -5699,7 +4271,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }))
     }
 
-    /// 解析记录模式
+    /// Parse a record pattern
     fn parse_record_pattern(&mut self) -> ParseResult<PatternRef> {
         let lparen = self.previous();
         let span = token_span(&lparen);
@@ -5709,7 +4281,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 let saved = self.current;
                 let name_tok = self.advance();
                 if self.check(TokenKind::Colon) {
-                    // 命名字段模式
+                    // Named-field pattern
                     self.advance();
                     let pattern = self.parse_pattern()?;
                     fields.push(PatternRecordField {
@@ -5733,7 +4305,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 }
                 self.current = saved;
             }
-            // 位置模式
+            // Positional pattern
             let first = self.parse_pattern()?;
             fields.push(PatternRecordField {
                 name: int_to_key(self.arena, 0),
@@ -5758,19 +4330,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 }
 
 // =========================================================================
-// 辅助函数
+// Helper functions
 // =========================================================================
 
 fn token_span(tok: &Token<'_>) -> Span {
     Span::new(tok.line, tok.column)
-}
-
-fn is_builtin_type(name: &str) -> bool {
-    matches!(
-        name,
-        "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128" | "isize"
-            | "usize" | "f16" | "f32" | "f64" | "f128" | "bool" | "char" | "str"
-    )
 }
 
 fn parse_char_value(lexeme: &str) -> u32 {
@@ -5796,7 +4360,9 @@ fn parse_char_value(lexeme: &str) -> u32 {
             _ => bytes[1] as u32,
         };
     }
-    bytes[0] as u32
+    // Non-ASCII character: decode the full UTF-8 sequence to a Unicode code point
+    // bytes[0] as u32 would only take the first byte (incorrect for multi-byte characters)
+    content.chars().next().map(|c| c as u32).unwrap_or(0)
 }
 
 fn contains_interpolation(raw: &str) -> bool {
@@ -5837,1633 +4403,4 @@ fn int_to_key(arena: &Bump, idx: usize) -> &str {
 
 fn parse_u64(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
-}
-
-// AST 打印器
-//
-// 将 AST 序列化为规范的 S-表达式文本，用于：
-// - 调试：可视化解析结果
-// - 验证：与 Zig 原版 ast_printer 输出做 diff，确保语义一致
-//
-// 格式约定：
-// - 每个节点一行，`(node_type field1 field2 ...)`
-// - 嵌套节点缩进 2 空格
-// - 字符串字面量用双引号包裹，内部转义 `"` `\` `\n`
-// - 空列表输出 `()`，可选值缺失输出 `(none)`
-// - 标识符/名称裸输出（不加引号），与字符串字面量区分
-
-
-/// AST 打印器：累积输出文本与缩进层级
-pub struct Printer<'a> {
-    buf: String,
-    indent: usize,
-    arena: &'a AstArena<'a>,
-}
-
-// --- 打印辅助宏 ---
-
-/// 为运算符类型生成 `(op <name>)` 打印方法
-macro_rules! impl_print_op {
-    ($method:ident, $op:ty, $conv:ident) => {
-        fn $method(&mut self, op: $op) {
-            self.write_line(&format!("(op {})", $conv(op)));
-        }
-    };
-}
-
-/// 生成带标签的列表打印方法：空列表输出 `(label ())`，否则逐项打印。
-/// 列表元素为 NodeId（Copy），逐项解引用后调用对应 visit_*。
-macro_rules! impl_print_list {
-    ($method:ident, $item:ty, $print_fn:ident) => {
-        fn $method(&mut self, label: &str, items: &[$item]) {
-            if items.is_empty() {
-                self.write_line(&format!("({} ())", label));
-                return;
-            }
-            self.write_line(&format!("({}", label));
-            self.indent();
-            for e in items {
-                self.$print_fn(*e);
-            }
-            self.dedent();
-            self.write_line(")");
-        }
-    };
-}
-
-impl<'a> Printer<'a> {
-    /// 创建打印器，需传入模块的 AST arena 用于解引用节点
-    pub fn new(arena: &'a AstArena<'a>) -> Self {
-        Self {
-            buf: String::new(),
-            indent: 0,
-            arena,
-        }
-    }
-
-    /// 将 `&ExprId` 解引用并访问
-    fn ve(&mut self, id: &ExprId) {
-        self.visit_expr(*id);
-    }
-    /// 将 `&TypeId` 解引用并访问
-    fn vt(&mut self, id: &TypeId) {
-        self.visit_type(*id);
-    }
-    /// 将 `&StmtId` 解引用并访问
-    fn vs(&mut self, id: &StmtId) {
-        self.visit_stmt(*id);
-    }
-    /// 将 `&PatternId` 解引用并访问
-    fn vp(&mut self, id: &PatternId) {
-        self.visit_pattern(*id);
-    }
-
-    /// 将模块打印为规范文本
-    pub fn print_module(&mut self, module: &'a Module<'a>) -> &str {
-        self.write_line(&format!("(module \"{}\"", escape_str(module.name)));
-        self.indent();
-        if let Some(path) = module.source_path {
-            self.write_line(&format!("(source_path \"{}\")", escape_str(path)));
-        }
-        for decl in &module.declarations {
-            self.visit_decl(decl);
-        }
-        self.dedent();
-        self.write_line(")");
-        &self.buf
-    }
-
-    // --- 缩进辅助 ---
-
-    fn indent(&mut self) {
-        self.indent += 1;
-    }
-
-    fn dedent(&mut self) {
-        if self.indent > 0 {
-            self.indent -= 1;
-        }
-    }
-
-    fn write_line(&mut self, text: &str) {
-        for _ in 0..self.indent {
-            self.buf.push_str("  ");
-        }
-        self.buf.push_str(text);
-        self.buf.push('\n');
-    }
-}
-
-impl<'a> AstVisitor<'a> for Printer<'a> {
-    // --- 声明 ---
-
-    fn visit_decl(&mut self, decl: &'a Spanned<Decl<'a>>) {
-        match &decl.node {
-            Decl::FunDecl {
-                visibility,
-                name,
-                type_params,
-                params,
-                return_type,
-                bounds,
-                body,
-                is_async,
-                is_entry,
-                attributes,
-                extern_c_body,
-            } => {
-                self.write_line(&format!("(fun_decl \"{}\"", name));
-                self.indent();
-                for attr in attributes {
-                    if attr.args.is_empty() {
-                        self.write_line(&format!("(attribute \"{}\")", attr.name));
-                    } else {
-                        let args_str = attr.args.iter().map(|a| format!("\"{}\"", a)).collect::<Vec<_>>().join(" ");
-                        self.write_line(&format!("(attribute \"{}\" (args {}))", attr.name, args_str));
-                    }
-                }
-                self.print_visibility(*visibility);
-                self.print_type_params(type_params);
-                self.print_params(params);
-                self.print_return_type(return_type);
-                self.print_bounds(bounds);
-                self.write_line(&format!("(is_async {})(is_entry {})", is_async, is_entry));
-                self.write_line("(body");
-                self.indent();
-                self.ve(body);
-                self.dedent();
-                self.write_line(")");
-                if let Some(c_body) = extern_c_body {
-                    self.write_line("(extern_c_body");
-                    self.indent();
-                    self.write_line(&format!("\"{}\"", c_body.escape_default()));
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Decl::TypeDecl {
-                visibility,
-                name,
-                type_params,
-                implemented_traits,
-                type_constraints,
-                def,
-                methods,
-            } => {
-                self.write_line(&format!("(type_decl \"{}\"", name));
-                self.indent();
-                self.print_visibility(*visibility);
-                self.print_type_params(type_params);
-                self.print_bounds(implemented_traits);
-                self.print_type_constraints(type_constraints);
-                self.visit_type_def(def);
-                self.print_methods(methods);
-                self.dedent();
-                self.write_line(")");
-            }
-            Decl::TraitDecl {
-                visibility,
-                name,
-                type_params,
-                parents,
-                associated_types,
-                methods,
-            } => {
-                self.write_line(&format!("(trait_decl \"{}\"", name));
-                self.indent();
-                self.print_visibility(*visibility);
-                self.print_type_params(type_params);
-                self.print_bounds(parents);
-                self.print_associated_types(associated_types);
-                self.print_methods(methods);
-                self.dedent();
-                self.write_line(")");
-            }
-            Decl::ImportDecl {
-                module_path,
-                items,
-                visibility,
-            } => {
-                let path_str = module_path.join(".");
-                self.write_line(&format!("(import_decl \"{}\"", path_str));
-                self.indent();
-                self.print_visibility(*visibility);
-                match items {
-                    Some(item_list) => {
-                        self.write_line("(items");
-                        self.indent();
-                        for item in item_list {
-                            match item.alias {
-                                Some(alias) => {
-                                    self.write_line(&format!(
-                                        "(item \"{}\" (alias \"{}\"))",
-                                        item.name, alias
-                                    ));
-                                }
-                                None => {
-                                    self.write_line(&format!("(item \"{}\")", item.name));
-                                }
-                            }
-                        }
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(items (none))"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Decl::PackDecl { visibility, name } => {
-                self.write_line(&format!("(pack_decl \"{}\"", name));
-                self.indent();
-                self.print_visibility(*visibility);
-                self.dedent();
-                self.write_line(")");
-            }
-            Decl::ExprDecl { expr, stmt } => {
-                self.write_line("(expr_decl");
-                self.indent();
-                self.ve(expr);
-                if let Some(s) = stmt {
-                    self.write_line("(stmt");
-                    self.indent();
-                    self.vs(s);
-                    self.dedent();
-                    self.write_line(")");
-                } else {
-                    self.write_line("(stmt (none))");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-
-    // --- 类型定义 ---
-
-    fn visit_type_def(&mut self, def: &'a TypeDef<'a>) {
-        match def {
-            TypeDef::Adt { constructors } => {
-                self.write_line("(adt");
-                self.indent();
-                for ctor in constructors {
-                    self.write_line(&format!("(constructor \"{}\"", ctor.name));
-                    self.indent();
-                    if ctor.fields.is_empty() {
-                        self.write_line("(fields ())");
-                    } else {
-                        self.write_line("(fields");
-                        self.indent();
-                        for field in &ctor.fields {
-                            match field.name {
-                                Some(fname) => {
-                                    self.write_line(&format!("(field \"{}\"", fname));
-                                    self.indent();
-                                    self.vt(&field.ty);
-                                    self.dedent();
-                                    self.write_line(")");
-                                }
-                                None => {
-                                    self.write_line("(positional_field");
-                                    self.indent();
-                                    self.vt(&field.ty);
-                                    self.dedent();
-                                    self.write_line(")");
-                                }
-                            }
-                        }
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    if let Some(rt) = &ctor.return_type {
-                        self.write_line("(return_type");
-                        self.indent();
-                        self.vt(rt);
-                        self.dedent();
-                        self.write_line(")");
-                    } else {
-                        self.write_line("(return_type (none))");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeDef::Record { fields } => {
-                self.write_line("(record");
-                self.indent();
-                if fields.is_empty() {
-                    self.write_line("(fields ())");
-                } else {
-                    self.write_line("(fields");
-                    self.indent();
-                    for field in fields {
-                        self.write_line(&format!("(field \"{}\"", field.name));
-                        self.indent();
-                        self.vt(&field.ty);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeDef::Alias { target } => {
-                self.write_line("(alias");
-                self.indent();
-                self.vt(target);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeDef::Newtype { name, inner } => {
-                self.write_line(&format!("(newtype \"{}\"", name));
-                self.indent();
-                self.vt(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-    // --- 类型节点 ---
-
-    fn visit_type(&mut self, ty: TypeId) {
-        match &self.arena.ty(ty).node {
-            TypeNode::Named { name } => {
-                self.write_line(&format!("(type_named \"{}\")", name));
-            }
-            TypeNode::SelfType => {
-                self.write_line("(type_self)");
-            }
-            TypeNode::Generic { name, args } => {
-                self.write_line(&format!("(type_generic \"{}\"", name));
-                self.indent();
-                self.print_type_list("type_args", args);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::Nullable { inner } => {
-                self.write_line("(type_nullable");
-                self.indent();
-                self.vt(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::RefType { inner } => {
-                self.write_line("(type_ref");
-                self.indent();
-                self.vt(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::RawPtr { inner } => {
-                self.write_line("(type_raw_ptr");
-                self.indent();
-                self.vt(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::Function {
-                params,
-                return_type,
-            } => {
-                self.write_line("(type_function");
-                self.indent();
-                self.print_type_list("params", params);
-                self.write_line("(return_type");
-                self.indent();
-                self.vt(return_type);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::Record { fields } => {
-                self.write_line("(type_record");
-                self.indent();
-                if fields.is_empty() {
-                    self.write_line("(fields ())");
-                } else {
-                    self.write_line("(fields");
-                    self.indent();
-                    for field in fields {
-                        self.write_line(&format!("(field \"{}\"", field.name));
-                        self.indent();
-                        self.vt(&field.ty);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::Array {
-                element_type,
-                size,
-            } => {
-                self.write_line("(type_array");
-                self.indent();
-                self.write_line("(element_type");
-                self.indent();
-                self.vt(element_type);
-                self.dedent();
-                self.write_line(")");
-                match size {
-                    Some(n) => self.write_line(&format!("(size {})", n)),
-                    None => self.write_line("(size (none))"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            TypeNode::KindAnnotated { inner, kind } => {
-                self.write_line("(type_kind_annotated");
-                self.indent();
-                self.vt(inner);
-                self.write_line("(kind");
-                self.indent();
-                self.visit_kind(kind);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-
-    fn visit_kind(&mut self, kind: &'a Kind) {
-        match kind {
-            Kind::Star => self.write_line("(kind_star)"),
-            Kind::Arrow { param, result } => {
-                self.write_line("(kind_arrow");
-                self.indent();
-                self.write_line("(param");
-                self.indent();
-                self.visit_kind(param);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(result");
-                self.indent();
-                self.visit_kind(result);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-
-    // --- 表达式 ---
-
-    fn visit_expr(&mut self, expr: ExprId) {
-        match &self.arena.expr(expr).node {
-            Expr::IntLit { raw, suffix } => match suffix {
-                Some(s) => self.write_line(&format!("(int_lit \"{}\" (suffix \"{}\"))", raw, s)),
-                None => self.write_line(&format!("(int_lit \"{}\" (suffix (none)))", raw)),
-            },
-            Expr::FloatLit { raw, suffix } => match suffix {
-                Some(s) => self.write_line(&format!("(float_lit \"{}\" (suffix \"{}\"))", raw, s)),
-                None => self.write_line(&format!("(float_lit \"{}\" (suffix (none)))", raw)),
-            },
-            Expr::BoolLit(b) => self.write_line(&format!("(bool_lit {})", b)),
-            Expr::CharLit(c) => self.write_line(&format!("(char_lit {})", c)),
-            Expr::StrLit(s) => {
-                self.write_line(&format!("(str_lit \"{}\")", escape_str(s)));
-            }
-            Expr::StrInterp(parts) => {
-                self.write_line("(str_interp");
-                self.indent();
-                for part in parts {
-                    match part {
-                        InterpolationPart::Literal(text) => {
-                            self.write_line(&format!("(literal \"{}\")", escape_str(text)));
-                        }
-                        InterpolationPart::Expression(e) => {
-                            self.write_line("(expression");
-                            self.indent();
-                            self.ve(e);
-                            self.dedent();
-                            self.write_line(")");
-                        }
-                    }
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::NullLit => self.write_line("(null_lit)"),
-            Expr::VoidLit => self.write_line("(void_lit)"),
-            Expr::Ident(name) => self.write_line(&format!("(ident \"{}\")", name)),
-            Expr::Assign { target, value } => {
-                self.write_line("(assign");
-                self.indent();
-                self.write_line("(target");
-                self.indent();
-                self.ve(target);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::CompoundAssign { op, target, value } => {
-                self.write_line("(compound_assign");
-                self.indent();
-                self.print_compound_assign_op(*op);
-                self.write_line("(target");
-                self.indent();
-                self.ve(target);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Binary { op, lhs, rhs } => {
-                self.write_line("(binary");
-                self.indent();
-                self.print_binary_op(*op);
-                self.write_line("(lhs");
-                self.indent();
-                self.ve(lhs);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(rhs");
-                self.indent();
-                self.ve(rhs);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Unary { op, operand } => {
-                self.write_line("(unary");
-                self.indent();
-                self.print_unary_op(*op);
-                self.write_line("(operand");
-                self.indent();
-                self.ve(operand);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::RefOf(inner) => {
-                self.write_line("(ref_of");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Deref(inner) => {
-                self.write_line("(deref");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Call {
-                callee,
-                args,
-                type_args,
-            } => {
-                self.write_line("(call");
-                self.indent();
-                self.write_line("(callee");
-                self.indent();
-                self.ve(callee);
-                self.dedent();
-                self.write_line(")");
-                self.print_type_args_option(type_args);
-                self.print_expr_list("args", args);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::MethodCall {
-                recv,
-                method,
-                args,
-                type_args,
-            } => {
-                self.write_line(&format!("(method_call \"{}\"", method));
-                self.indent();
-                self.write_line("(recv");
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-                self.print_type_args_option(type_args);
-                self.print_expr_list("args", args);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::FieldAccess { recv, field } => {
-                self.write_line(&format!("(field_access \"{}\"", field));
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Index { recv, index } => {
-                self.write_line("(index");
-                self.indent();
-                self.write_line("(recv");
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(index");
-                self.indent();
-                self.ve(index);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Slice {
-                recv,
-                start,
-                end,
-                inclusive,
-            } => {
-                self.write_line(&format!("(slice (inclusive {})", inclusive));
-                self.indent();
-                self.write_line("(recv");
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(start");
-                self.indent();
-                self.ve(start);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(end");
-                self.indent();
-                self.ve(end);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::SafeAccess { recv, field } => {
-                self.write_line(&format!("(safe_access \"{}\"", field));
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::SafeMethodCall {
-                recv,
-                method,
-                args,
-                type_args,
-            } => {
-                self.write_line(&format!("(safe_method_call \"{}\"", method));
-                self.indent();
-                self.write_line("(recv");
-                self.indent();
-                self.ve(recv);
-                self.dedent();
-                self.write_line(")");
-                self.print_type_args_option(type_args);
-                self.print_expr_list("args", args);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Propagate(inner) => {
-                self.write_line("(propagate");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::NonNullAssert(inner) => {
-                self.write_line("(non_null_assert");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Elvis { lhs, rhs } => {
-                self.write_line("(elvis");
-                self.indent();
-                self.write_line("(lhs");
-                self.indent();
-                self.ve(lhs);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(rhs");
-                self.indent();
-                self.ve(rhs);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::ArrayLit { elements, fill } => {
-                self.write_line("(array_lit");
-                self.indent();
-                self.print_expr_list("elements", elements);
-                match fill {
-                    Some((value, count)) => {
-                        self.write_line("(fill");
-                        self.indent();
-                        self.write_line("(value");
-                        self.indent();
-                        self.ve(value);
-                        self.dedent();
-                        self.write_line(")");
-                        self.write_line("(count");
-                        self.indent();
-                        self.ve(count);
-                        self.dedent();
-                        self.write_line(")");
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(fill (none))"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::RecordLit(fields) => {
-                self.write_line("(record_lit");
-                self.indent();
-                if fields.is_empty() {
-                    self.write_line("(fields ())");
-                } else {
-                    self.write_line("(fields");
-                    self.indent();
-                    for f in fields {
-                        self.write_line(&format!("(field \"{}\"", f.name));
-                        self.indent();
-                        self.ve(&f.value);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::RecordExtend { base, updates } => {
-                self.write_line("(record_extend");
-                self.indent();
-                self.write_line("(base");
-                self.indent();
-                self.ve(base);
-                self.dedent();
-                self.write_line(")");
-                if updates.is_empty() {
-                    self.write_line("(updates ())");
-                } else {
-                    self.write_line("(updates");
-                    self.indent();
-                    for f in updates {
-                        self.write_line(&format!("(field \"{}\"", f.name));
-                        self.indent();
-                        self.ve(&f.value);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Lambda {
-                params,
-                body,
-                is_async,
-                return_type,
-            } => {
-                self.write_line(&format!("(lambda (is_async {})", is_async));
-                self.indent();
-                self.print_params(params);
-                self.print_return_type(return_type);
-                match body {
-                    LambdaBody::Block(b) => {
-                        self.write_line("(body_block");
-                        self.indent();
-                        self.ve(b);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    LambdaBody::Expression(b) => {
-                        self.write_line("(body_expr");
-                        self.indent();
-                        self.ve(b);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.write_line("(if");
-                self.indent();
-                self.write_line("(cond");
-                self.indent();
-                self.ve(cond);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(then");
-                self.indent();
-                self.ve(then_branch);
-                self.dedent();
-                self.write_line(")");
-                match else_branch {
-                    Some(e) => {
-                        self.write_line("(else");
-                        self.indent();
-                        self.ve(e);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(else (none))"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Block { stmts, trailing } => {
-                self.write_line("(block");
-                self.indent();
-                if stmts.is_empty() {
-                    self.write_line("(stmts ())");
-                } else {
-                    self.write_line("(stmts");
-                    self.indent();
-                    for s in stmts {
-                        self.vs(s);
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                match trailing {
-                    Some(e) => {
-                        self.write_line("(trailing");
-                        self.indent();
-                        self.ve(e);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(trailing (none))"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Match { scrutinee, arms } => {
-                self.write_line("(match");
-                self.indent();
-                self.write_line("(scrutinee");
-                self.indent();
-                self.ve(scrutinee);
-                self.dedent();
-                self.write_line(")");
-                if arms.is_empty() {
-                    self.write_line("(arms ())");
-                } else {
-                    self.write_line("(arms");
-                    self.indent();
-                    for arm in arms {
-                        self.write_line("(arm");
-                        self.indent();
-                        self.write_line("(pattern");
-                        self.indent();
-                        self.vp(&arm.pattern);
-                        self.dedent();
-                        self.write_line(")");
-                        match &arm.guard {
-                            Some(g) => {
-                                self.write_line("(guard");
-                                self.indent();
-                                self.ve(g);
-                                self.dedent();
-                                self.write_line(")");
-                            }
-                            None => self.write_line("(guard (none))"),
-                        }
-                        self.write_line("(body");
-                        self.indent();
-                        self.ve(&arm.body);
-                        self.dedent();
-                        self.write_line(")");
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::TypeCast { target, expr, safe } => {
-                self.write_line(&format!("(type_cast (safe {})", safe));
-                self.indent();
-                self.write_line("(target");
-                self.indent();
-                self.vt(target);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(expr");
-                self.indent();
-                self.ve(expr);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Atomic(inner) => {
-                self.write_line("(atomic");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Lazy(inner) => {
-                self.write_line("(lazy");
-                self.indent();
-                self.ve(inner);
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::Select(arms) => {
-                self.write_line("(select");
-                self.indent();
-                if arms.is_empty() {
-                    self.write_line("(arms ())");
-                } else {
-                    self.write_line("(arms");
-                    self.indent();
-                    for arm in arms {
-                        match arm {
-                            SelectArm::Receive {
-                                channel_expr,
-                                binding,
-                                body,
-                            } => {
-                                self.write_line("(receive");
-                                self.indent();
-                                self.write_line("(channel");
-                                self.indent();
-                                self.ve(channel_expr);
-                                self.dedent();
-                                self.write_line(")");
-                                match binding {
-                                    Some(name) => {
-                                        self.write_line(&format!("(binding \"{}\")", name));
-                                    }
-                                    None => self.write_line("(binding (none))"),
-                                }
-                                self.write_line("(body");
-                                self.indent();
-                                self.ve(body);
-                                self.dedent();
-                                self.write_line(")");
-                                self.dedent();
-                                self.write_line(")");
-                            }
-                            SelectArm::Timeout { duration, body } => {
-                                self.write_line("(timeout");
-                                self.indent();
-                                self.write_line("(duration");
-                                self.indent();
-                                self.ve(duration);
-                                self.dedent();
-                                self.write_line(")");
-                                self.write_line("(body");
-                                self.indent();
-                                self.ve(body);
-                                self.dedent();
-                                self.write_line(")");
-                                self.dedent();
-                                self.write_line(")");
-                            }
-                        }
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Expr::InlineTrait(methods) => {
-                self.write_line("(inline_trait");
-                self.indent();
-                self.print_methods(methods);
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-
-    // --- 语句 ---
-
-    fn visit_stmt(&mut self, stmt: StmtId) {
-        match &self.arena.stmt(stmt).node {
-            Stmt::ValDecl {
-                name,
-                type_annotation,
-                value,
-                visibility,
-            } => {
-                self.write_line(&format!("(val_decl \"{}\"", name));
-                self.indent();
-                self.print_visibility(*visibility);
-                match type_annotation {
-                    Some(ty) => {
-                        self.write_line("(type");
-                        self.indent();
-                        self.vt(ty);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(type (none))"),
-                }
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::VarDecl {
-                name,
-                type_annotation,
-                value,
-                visibility,
-            } => {
-                self.write_line(&format!("(var_decl \"{}\"", name));
-                self.indent();
-                self.print_visibility(*visibility);
-                match type_annotation {
-                    Some(ty) => {
-                        self.write_line("(type");
-                        self.indent();
-                        self.vt(ty);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    None => self.write_line("(type (none))"),
-                }
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Assignment { target, value } => {
-                self.write_line("(assignment");
-                self.indent();
-                self.write_line("(target");
-                self.indent();
-                self.ve(target);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::FieldAssignment {
-                object,
-                field,
-                value,
-            } => {
-                self.write_line(&format!("(field_assignment \"{}\"", field));
-                self.indent();
-                self.write_line("(object");
-                self.indent();
-                self.ve(object);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::CompoundAssignment { target, op, value } => {
-                self.write_line("(compound_assignment");
-                self.indent();
-                self.print_compound_assign_op(*op);
-                self.write_line("(target");
-                self.indent();
-                self.ve(target);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(value");
-                self.indent();
-                self.ve(value);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Expression { expr } => {
-                self.write_line("(expression_stmt");
-                self.indent();
-                self.ve(expr);
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Return { value } => match value {
-                Some(e) => {
-                    self.write_line("(return");
-                    self.indent();
-                    self.ve(e);
-                    self.dedent();
-                    self.write_line(")");
-                }
-                None => self.write_line("(return (none))"),
-            },
-            Stmt::Defer { expr } => {
-                self.write_line("(defer");
-                self.indent();
-                self.ve(expr);
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Throw { expr } => {
-                self.write_line("(throw");
-                self.indent();
-                self.ve(expr);
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Break => self.write_line("(break)"),
-            Stmt::Continue => self.write_line("(continue)"),
-            Stmt::For {
-                name,
-                iterable,
-                body,
-            } => {
-                self.write_line(&format!("(for \"{}\"", name));
-                self.indent();
-                self.write_line("(iterable");
-                self.indent();
-                self.ve(iterable);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(body");
-                self.indent();
-                self.ve(body);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::While { condition, body } => {
-                self.write_line("(while");
-                self.indent();
-                self.write_line("(cond");
-                self.indent();
-                self.ve(condition);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(body");
-                self.indent();
-                self.ve(body);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::Loop { body } => {
-                self.write_line("(loop");
-                self.indent();
-                self.write_line("(body");
-                self.indent();
-                self.ve(body);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Stmt::LocalDecl { decl } => {
-                self.write_line("(local-decl");
-                self.indent();
-                match decl.as_ref() {
-                    Decl::FunDecl { name, body, .. } => {
-                        self.write_line(&format!("(fun {})", name));
-                        self.ve(body);
-                    }
-                    Decl::TypeDecl { name, .. } => {
-                        self.write_line(&format!("(type {})", name));
-                    }
-                    Decl::TraitDecl { name, .. } => {
-                        self.write_line(&format!("(trait {})", name));
-                    }
-                    _ => self.write_line("(unknown)"),
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-
-    // --- 模式 ---
-
-    fn visit_pattern(&mut self, pat: PatternId) {
-        match &self.arena.pattern(pat).node {
-            Pattern::Wildcard => self.write_line("(wildcard)"),
-            Pattern::Literal(lit) => {
-                self.write_line("(pattern_literal");
-                self.indent();
-                self.print_pattern_literal(lit);
-                self.dedent();
-                self.write_line(")");
-            }
-            Pattern::Variable { name } => {
-                self.write_line(&format!("(pattern_var \"{}\")", name));
-            }
-            Pattern::Constructor { name, patterns } => {
-                self.write_line(&format!("(pattern_constructor \"{}\"", name));
-                self.indent();
-                if patterns.is_empty() {
-                    self.write_line("(patterns ())");
-                } else {
-                    self.write_line("(patterns");
-                    self.indent();
-                    for p in patterns {
-                        self.vp(p);
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Pattern::Record { fields } => {
-                self.write_line("(pattern_record");
-                self.indent();
-                if fields.is_empty() {
-                    self.write_line("(fields ())");
-                } else {
-                    self.write_line("(fields");
-                    self.indent();
-                    for f in fields {
-                        self.write_line(&format!("(field \"{}\"", f.name));
-                        self.indent();
-                        self.vp(&f.pattern);
-                        self.dedent();
-                        self.write_line(")");
-                    }
-                    self.dedent();
-                    self.write_line(")");
-                }
-                self.dedent();
-                self.write_line(")");
-            }
-            Pattern::OrPattern { left, right } => {
-                self.write_line("(or_pattern");
-                self.indent();
-                self.write_line("(left");
-                self.indent();
-                self.vp(left);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(right");
-                self.indent();
-                self.vp(right);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-            Pattern::Guard { pattern, condition } => {
-                self.write_line("(guard_pattern");
-                self.indent();
-                self.write_line("(pattern");
-                self.indent();
-                self.vp(pattern);
-                self.dedent();
-                self.write_line(")");
-                self.write_line("(condition");
-                self.indent();
-                self.ve(condition);
-                self.dedent();
-                self.write_line(")");
-                self.dedent();
-                self.write_line(")");
-            }
-        }
-    }
-}
-impl<'a> Printer<'a> {
-    // --- 方法 ---
-
-    fn print_methods(&mut self, methods: &'a [MethodDecl<'a>]) {
-        if methods.is_empty() {
-            self.write_line("(methods ())");
-            return;
-        }
-        self.write_line("(methods");
-        self.indent();
-        for m in methods {
-            self.print_method(m);
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_method(&mut self, m: &'a MethodDecl<'a>) {
-        self.write_line(&format!("(method \"{}\"", m.name));
-        self.indent();
-        self.print_visibility(m.visibility);
-        self.write_line(&format!("(is_async {})(is_override {})", m.is_async, m.is_override));
-        self.print_type_params(&m.type_params);
-        self.print_params(&m.params);
-        self.print_return_type(&m.return_type);
-        if let Some(delegate) = &m.delegate {
-            self.write_line(&format!(
-                "(delegate (trait \"{}\") (method \"{}\"))",
-                delegate.trait_name, delegate.method_name
-            ));
-        } else {
-            self.write_line("(delegate (none))");
-        }
-        if let Some(body) = &m.body {
-            self.write_line("(body");
-            self.indent();
-            self.ve(body);
-            self.dedent();
-            self.write_line(")");
-        } else {
-            self.write_line("(body (none))");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_associated_types(&mut self, assoc: &'a [AssociatedType<'a>]) {
-        if assoc.is_empty() {
-            self.write_line("(associated_types ())");
-            return;
-        }
-        self.write_line("(associated_types");
-        self.indent();
-        for at in assoc {
-            self.write_line(&format!("(associated_type \"{}\"", at.name));
-            self.indent();
-            match &at.kind {
-                Some(k) => {
-                    self.write_line("(kind");
-                    self.indent();
-                    self.visit_kind(k);
-                    self.dedent();
-                    self.write_line(")");
-                }
-                None => self.write_line("(kind (none))"),
-            }
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_type_constraints(&mut self, constraints: &[TypeConstraint<'_>]) {
-        if constraints.is_empty() {
-            self.write_line("(type_constraints ())");
-            return;
-        }
-        self.write_line("(type_constraints");
-        self.indent();
-        for c in constraints {
-            self.write_line(&format!("(constraint \"{}\"", c.type_param));
-            self.indent();
-            self.vt(&c.concrete_type);
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    // --- 可见性/参数/约束 ---
-
-    fn print_visibility(&mut self, vis: Visibility) {
-        match vis {
-            Visibility::Private => self.write_line("(visibility private)"),
-            Visibility::Public => self.write_line("(visibility public)"),
-        }
-    }
-
-    fn print_type_params(&mut self, params: &'a [TypeParam<'a>]) {
-        if params.is_empty() {
-            self.write_line("(type_params ())");
-            return;
-        }
-        self.write_line("(type_params");
-        self.indent();
-        for tp in params {
-            self.write_line(&format!("(type_param \"{}\"", tp.name));
-            self.indent();
-            match &tp.kind {
-                Some(k) => {
-                    self.write_line("(kind");
-                    self.indent();
-                    self.visit_kind(k);
-                    self.dedent();
-                    self.write_line(")");
-                }
-                None => self.write_line("(kind (none))"),
-            }
-            self.print_bounds(&tp.bounds);
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_params(&mut self, params: &[Param<'_>]) {
-        if params.is_empty() {
-            self.write_line("(params ())");
-            return;
-        }
-        self.write_line("(params");
-        self.indent();
-        for p in params {
-            self.write_line(&format!("(param \"{}\"", p.name));
-            self.indent();
-            match &p.type_annotation {
-                Some(ty) => {
-                    self.write_line("(type");
-                    self.indent();
-                    self.vt(ty);
-                    self.dedent();
-                    self.write_line(")");
-                }
-                None => self.write_line("(type (none))"),
-            }
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_bounds(&mut self, bounds: &[TraitBound<'_>]) {
-        if bounds.is_empty() {
-            self.write_line("(bounds ())");
-            return;
-        }
-        self.write_line("(bounds");
-        self.indent();
-        for b in bounds {
-            self.write_line(&format!("(trait_bound \"{}\"", b.trait_name));
-            self.indent();
-            self.print_type_list("type_args", &b.type_args);
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_return_type(&mut self, rt: &Option<TypeRef>) {
-        match rt {
-            Some(ty) => {
-                self.write_line("(return_type");
-                self.indent();
-                self.vt(ty);
-                self.dedent();
-                self.write_line(")");
-            }
-            None => self.write_line("(return_type (none))"),
-        }
-    }
-    fn print_pattern_literal(&mut self, lit: &PatternLiteral<'_>) {
-        match lit {
-            PatternLiteral::Int(s) => self.write_line(&format!("(int \"{}\")", s)),
-            PatternLiteral::Float(s) => self.write_line(&format!("(float \"{}\")", s)),
-            PatternLiteral::Bool(b) => self.write_line(&format!("(bool {})", b)),
-            PatternLiteral::Char(c) => self.write_line(&format!("(char {})", c)),
-            PatternLiteral::String(s) => {
-                self.write_line(&format!("(string \"{}\")", escape_str(s)));
-            }
-            PatternLiteral::Null => self.write_line("(null)"),
-        }
-    }
-
-    // --- 运算符打印 ---
-
-    impl_print_op!(print_binary_op, BinaryOp, binary_op_str);
-    impl_print_op!(print_unary_op, UnaryOp, unary_op_str);
-    impl_print_op!(print_compound_assign_op, CompoundAssignOp, compound_assign_op_str);
-
-    // --- 列表/可选辅助 ---
-
-    impl_print_list!(print_expr_list, ExprRef, visit_expr);
-    impl_print_list!(print_type_list, TypeRef, visit_type);
-
-    fn print_type_args_option(&mut self, type_args: &Option<Vec<TypeRef>>) {
-        match type_args {
-            Some(args) if !args.is_empty() => self.print_type_list("type_args", args),
-            _ => self.write_line("(type_args ())"),
-        }
-    }
-}
-
-// --- 运算符字符串映射 ---
-
-fn binary_op_str(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "add",
-        BinaryOp::Sub => "sub",
-        BinaryOp::Mul => "mul",
-        BinaryOp::Div => "div",
-        BinaryOp::Mod => "mod",
-        BinaryOp::Eq => "eq",
-        BinaryOp::NotEq => "neq",
-        BinaryOp::RefEq => "ref_eq",
-        BinaryOp::RefNeq => "ref_neq",
-        BinaryOp::Lt => "lt",
-        BinaryOp::Gt => "gt",
-        BinaryOp::LtEq => "lt_eq",
-        BinaryOp::GtEq => "gt_eq",
-        BinaryOp::And => "and",
-        BinaryOp::Or => "or",
-        BinaryOp::BitAnd => "bit_and",
-        BinaryOp::BitOr => "bit_or",
-        BinaryOp::BitXor => "bit_xor",
-        BinaryOp::Shl => "shl",
-        BinaryOp::Shr => "shr",
-        BinaryOp::ConcatList => "concat_list",
-        BinaryOp::Range => "range",
-        BinaryOp::RangeInclusive => "range_inclusive",
-        BinaryOp::Elvis => "elvis",
-    }
-}
-
-fn unary_op_str(op: UnaryOp) -> &'static str {
-    match op {
-        UnaryOp::Not => "not",
-        UnaryOp::Neg => "neg",
-        UnaryOp::BitNot => "bit_not",
-    }
-}
-
-fn compound_assign_op_str(op: CompoundAssignOp) -> &'static str {
-    match op {
-        CompoundAssignOp::AddAssign => "add_assign",
-        CompoundAssignOp::SubAssign => "sub_assign",
-        CompoundAssignOp::MulAssign => "mul_assign",
-        CompoundAssignOp::DivAssign => "div_assign",
-        CompoundAssignOp::ModAssign => "mod_assign",
-        CompoundAssignOp::BitAndAssign => "bit_and_assign",
-        CompoundAssignOp::BitOrAssign => "bit_or_assign",
-        CompoundAssignOp::BitXorAssign => "bit_xor_assign",
-        CompoundAssignOp::ShlAssign => "shl_assign",
-        CompoundAssignOp::ShrAssign => "shr_assign",
-    }
-}
-
-/// 转义字符串中的特殊字符，用于打印带引号的字面量
-fn escape_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{{{:x}}}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }

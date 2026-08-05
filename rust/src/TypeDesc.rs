@@ -17,9 +17,42 @@
 //! - 21：void
 //! - 22+：用户类型（经 `TypeDescriptorPool::register` 分配）
 
-use crate::Sema::FIRST_DYNAMIC_TYPE_ID;
 use crate::Value::{Char, F128, F16, ValueArena, ValueHandle, ValueTag};
 use rustc_hash::FxHashMap;
+
+// =========================================================================
+// type_id 编号约定常量（权威源，被 Sema/Ir/Analyzer 共享）
+// =========================================================================
+
+/// 内置标量类型 ID 范围：1..=21（共 21 种）。
+/// type_id 0 保留给 "unknown"；22+ 为用户/动态类型（type_def_index 偏移）。
+pub const FIRST_DYNAMIC_TYPE_ID: u16 = 22;
+pub const MAX_BUILTIN_TYPE_ID: u16 = 21;
+
+/// str/null/void 的 type_id（与 lookup_by_type_id 静态表一致）。
+pub const STR_TYPE_ID: u16 = 19;
+pub const NULL_TYPE_ID: u16 = 20;
+pub const VOID_TYPE_ID: u16 = 21;
+
+/// 整数类型 type_id 范围：1..=12（与 IntKind 变体顺序一致）。
+pub const FIRST_INT_TYPE_ID: u16 = 1;
+pub const LAST_INT_TYPE_ID: u16 = 12;
+/// 浮点类型 type_id 范围：13..=16（与 FloatKind 变体顺序一致）。
+pub const FIRST_FLOAT_TYPE_ID: u16 = 13;
+pub const LAST_FLOAT_TYPE_ID: u16 = 16;
+
+/// 将 type_def_index 转为动态 type_id。
+#[inline]
+pub const fn dynamic_type_id(type_def_index: u16) -> u16 {
+    FIRST_DYNAMIC_TYPE_ID + type_def_index
+}
+
+/// 将动态 type_id 还原为 type_def_index。
+/// 仅对 type_id >= FIRST_DYNAMIC_TYPE_ID 有效。
+#[inline]
+pub const fn type_def_index_of(type_id: u16) -> u16 {
+    type_id - FIRST_DYNAMIC_TYPE_ID
+}
 
 // =========================================================================
 // IntKind / FloatKind 枚举
@@ -106,22 +139,22 @@ impl TypeDescriptor {
         self.size as usize
     }
 
-    /// 是否为 null 类型（type_id == 20）。
+    /// 是否为 null 类型。
     #[inline]
     pub fn is_null_type(&self) -> bool {
-        self.type_id == 20
+        self.type_id == NULL_TYPE_ID
     }
 
-    /// 是否为 void 类型（type_id == 21）。
+    /// 是否为 void 类型。
     #[inline]
     pub fn is_void_type(&self) -> bool {
-        self.type_id == 21
+        self.type_id == VOID_TYPE_ID
     }
 
-    /// 是否为引用类型：str(19) 或用户类型(>=22)；nullable 类型不算引用。
+    /// 是否为引用类型：str 或用户类型(>=FIRST_DYNAMIC_TYPE_ID)；nullable 类型不算引用。
     #[inline]
     pub fn is_ref(&self) -> bool {
-        !self.is_nullable() && (self.type_id == 19 || self.type_id >= 22)
+        !self.is_nullable() && (self.type_id == STR_TYPE_ID || self.type_id >= FIRST_DYNAMIC_TYPE_ID)
     }
 
     /// 是否为 nullable 类型（type_name 以 "nullable" 开头）。
@@ -130,16 +163,16 @@ impl TypeDescriptor {
         self.type_name.starts_with("nullable")
     }
 
-    /// 是否为整数类型（type_id 1..=12）。
+    /// 是否为整数类型。
     #[inline]
     pub fn is_int(&self) -> bool {
-        matches!(self.type_id, 1..=12)
+        matches!(self.type_id, FIRST_INT_TYPE_ID..=LAST_INT_TYPE_ID)
     }
 
-    /// 是否为浮点类型（type_id 13..=16）。
+    /// 是否为浮点类型。
     #[inline]
     pub fn is_float(&self) -> bool {
-        matches!(self.type_id, 13..=16)
+        matches!(self.type_id, FIRST_FLOAT_TYPE_ID..=LAST_FLOAT_TYPE_ID)
     }
 
     /// 转换为 `IntKind`，非整数类型返回 `None`。
@@ -1007,19 +1040,19 @@ pub static BOOL_DESC: TypeDescriptor = TypeDescriptor {
 pub static STR_DESC: TypeDescriptor = TypeDescriptor {
     size: 8,
     ops: &HeapRefOps,
-    type_id: 19,
+    type_id: STR_TYPE_ID,
     type_name: "str",
 };
 pub static NULL_DESC: TypeDescriptor = TypeDescriptor {
     size: 0,
     ops: &NullOps,
-    type_id: 20,
+    type_id: NULL_TYPE_ID,
     type_name: "null",
 };
 pub static VOID_DESC: TypeDescriptor = TypeDescriptor {
     size: 0,
     ops: &VoidOps,
-    type_id: 21,
+    type_id: VOID_TYPE_ID,
     type_name: "void",
 };
 
@@ -1125,13 +1158,13 @@ impl TypeDescriptorPool {
         type_id
     }
 
-    /// 按 `type_id` 查找描述符；1..=21 委托给静态表，22+ 查询动态池。
+    /// 按 `type_id` 查找描述符；1..=MAX_BUILTIN_TYPE_ID 委托给静态表，FIRST_DYNAMIC_TYPE_ID+ 查询动态池。
     #[inline]
     pub fn get(&self, type_id: u16) -> Option<&'static TypeDescriptor> {
-        if type_id <= 21 {
+        if type_id <= MAX_BUILTIN_TYPE_ID {
             return lookup_by_type_id(type_id);
         }
-        let idx = (type_id - 22) as usize;
+        let idx = type_def_index_of(type_id) as usize;
         self.descriptors.get(idx).copied()
     }
 

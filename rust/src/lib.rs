@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 
-#[path = "Ast.rs"]
-pub mod Ast;
+pub mod ast;
 
 #[path = "Value.rs"]
 pub mod Value;
@@ -9,8 +8,7 @@ pub mod Value;
 #[path = "TypeDesc.rs"]
 pub mod TypeDesc;
 
-#[path = "Sema.rs"]
-pub mod Sema;
+pub mod sema;
 
 #[path = "Reflect.rs"]
 pub mod Reflect;
@@ -29,9 +27,6 @@ pub mod Ir;
 
 #[path = "Engine.rs"]
 pub mod Engine;
-
-#[path = "Analyzer.rs"]
-pub mod Analyzer;
 
 #[path = "Optimizer.rs"]
 pub mod Optimizer;

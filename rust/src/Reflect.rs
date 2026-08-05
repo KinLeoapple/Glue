@@ -188,31 +188,24 @@ pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out
     write_str_out(&name, out_data, out_len);
 }
 
-/// 返回值的字节大小（标量按 tag，堆对象按 ref_kind 估算）
+/// 返回值的字节大小（标量委托 `ValueTag::byte_width`，堆对象按 ref_kind 估算）
 #[no_mangle]
 pub extern "C" fn __reflect_size(handle: u32) -> u8 {
     let h = ValueHandle::from_raw(handle);
     let tag = h.tag();
-    match tag {
-        ValueTag::Null | ValueTag::Void => 0,
-        ValueTag::Bool => 1,
-        ValueTag::Char => 4,
-        ValueTag::I8 | ValueTag::U8 => 1,
-        ValueTag::I16 | ValueTag::U16 | ValueTag::F16 => 2,
-        ValueTag::I32 | ValueTag::U32 | ValueTag::F32 => 4,
-        ValueTag::I64 | ValueTag::U64 | ValueTag::F64 | ValueTag::Isize | ValueTag::Usize => 8,
-        ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
-        ValueTag::Ref => {
-            if let Some(obj) = ValueArena::get_global_obj(h) {
-                match obj.ref_kind() {
-                    RefKind::Str => 16,
-                    RefKind::Array => 16,
-                    RefKind::Record | RefKind::Adt | RefKind::Newtype => 0,
-                    _ => 0,
-                }
-            } else { 0 }
-        }
+    if tag != ValueTag::Ref {
+        // 标量/Null/Void 统一委托 byte_width（与 Value.rs 单点同步）
+        return tag.byte_width() as u8;
     }
+    // 堆对象：str/array 估算为 16（data+len），其余无固定尺寸
+    if let Some(obj) = ValueArena::get_global_obj(h) {
+        match obj.ref_kind() {
+            RefKind::Str => 16,
+            RefKind::Array => 16,
+            RefKind::Record | RefKind::Adt | RefKind::Newtype => 0,
+            _ => 0,
+        }
+    } else { 0 }
 }
 
 /// 返回字段数（Record/Adt/Newtype/Array 的字段/元素数）
@@ -354,8 +347,12 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
                     ValueTag::Bool => s.push_str(if h == ValueHandle::TRUE { "true" } else { "false" }),
                     ValueTag::Char => {
                         let c = a.get_char(h);
-                        if c <= 0x7F { s.push(c as u8 as char); }
-                        else { s.push_str(&format!("U+{:04X}", c)); }
+                        // 码点 → Unicode 标量值 → 字符（覆盖所有合法码点，包括非 ASCII）
+                        if let Some(ch) = char::from_u32(c) {
+                            s.push(ch);
+                        } else {
+                            s.push_str(&format!("U+{:04X}", c));
+                        }
                     }
                     ValueTag::I8 => s.push_str(&a.get_i8(h).to_string()),
                     ValueTag::I16 => s.push_str(&a.get_i16(h).to_string()),
@@ -406,8 +403,8 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     ScalarTag::Bool => (if sv.bool_val { "true" } else { "false" }).to_string(),
                     ScalarTag::Char => {
                         let c = sv.char_val;
-                        if c <= 0x7F { (c as u8 as char).to_string() }
-                        else { format!("U+{:04X}", c) }
+                        // 码点 → Unicode 标量值 → 字符（覆盖所有合法码点，包括非 ASCII）
+                        char::from_u32(c).map(|ch| ch.to_string()).unwrap_or_else(|| format!("U+{:04X}", c))
                     }
                     ScalarTag::I8 => sv.i8_val.to_string(),
                     ScalarTag::I16 => sv.i16_val.to_string(),

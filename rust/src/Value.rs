@@ -1101,6 +1101,39 @@ impl ScalarTag {
             ScalarTag::F128 => "f128",
         }
     }
+
+    /// 全部 18 种标量标签（与 `type_name` 单点同步）。
+    pub fn all() -> &'static [ScalarTag] {
+        &[
+            ScalarTag::Bool, ScalarTag::Char,
+            ScalarTag::I8, ScalarTag::I16, ScalarTag::I32, ScalarTag::I64, ScalarTag::I128,
+            ScalarTag::U8, ScalarTag::U16, ScalarTag::U32, ScalarTag::U64, ScalarTag::U128,
+            ScalarTag::Isize, ScalarTag::Usize,
+            ScalarTag::F16, ScalarTag::F32, ScalarTag::F64, ScalarTag::F128,
+        ]
+    }
+
+    /// 类型名 → ScalarTag（反向查找，与 `type_name` 单点同步）。
+    pub fn from_name(name: &str) -> Option<ScalarTag> {
+        for tag in Self::all() {
+            if tag.type_name() == name {
+                return Some(*tag);
+            }
+        }
+        None
+    }
+
+    /// 字节宽度（与 ValueTag::byte_width 单点同步）。
+    #[inline]
+    pub fn byte_width(self) -> u8 {
+        match self {
+            ScalarTag::Bool | ScalarTag::I8 | ScalarTag::U8 => 1,
+            ScalarTag::I16 | ScalarTag::U16 | ScalarTag::F16 => 2,
+            ScalarTag::Char | ScalarTag::I32 | ScalarTag::U32 | ScalarTag::F32 => 4,
+            ScalarTag::I64 | ScalarTag::U64 | ScalarTag::Isize | ScalarTag::Usize | ScalarTag::F64 => 8,
+            ScalarTag::I128 | ScalarTag::U128 | ScalarTag::F128 => 16,
+        }
+    }
 }
 
 // ---- ScalarValue — 标量值 union（16 字节）----
@@ -2049,6 +2082,24 @@ pub struct ChannelValue {
     closed: Mutex<bool>,
 }
 
+/// channel send 失败原因（运行时条件，非程序员错误）。
+#[derive(Debug, Clone, Copy)]
+pub enum ChannelSendError {
+    /// channel 已关闭
+    Closed,
+    /// 有界 channel 已满
+    Full { capacity: usize },
+}
+
+impl ChannelSendError {
+    pub fn message(&self) -> &'static str {
+        match self {
+            ChannelSendError::Closed => "send on closed channel",
+            ChannelSendError::Full { .. } => "channel full",
+        }
+    }
+}
+
 impl ChannelValue {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -2062,17 +2113,18 @@ impl ChannelValue {
     pub fn id(&self) -> u64 {
         self.id
     }
-    /// 非阻塞发送：push 到 buffer，满则 panic（设计决策：send 非阻塞，满为程序员错误）
-    pub fn send(&self, val: Value) {
+    /// 非阻塞发送：push 到 buffer。满或已关闭时返回 Err（运行时条件，非程序员错误）。
+    pub fn send(&self, val: Value) -> Result<(), ChannelSendError> {
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         // [V-5] 持 buffer 锁期间检查 closed，与 close（同样持 buffer 锁）互斥，消除 TOCTOU
         if *self.closed.lock().unwrap_or_else(|e| e.into_inner()) {
-            panic!("send on closed channel");
+            return Err(ChannelSendError::Closed);
         }
         if self.capacity > 0 && buf.len() >= self.capacity {
-            panic!("channel full (capacity={})", self.capacity);
+            return Err(ChannelSendError::Full { capacity: self.capacity });
         }
         buf.push_back(val);
+        Ok(())
     }
     /// 接收：pop 从 buffer 前端，无数据返回 None（await 路径在 resolve_and_check_await 处理挂起）
     pub fn recv(&self) -> Option<Value> {
@@ -3884,7 +3936,7 @@ fn simd_soa_deep_clone(soa: &ScalarSoA) -> Vec<Value> {
     }
 }
 
-fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
+pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
     match (a, b) {
         (HeapObj::Str(x), HeapObj::Str(y)) => x.equals(y),
         (HeapObj::Array(x), HeapObj::Array(y)) => {
@@ -3901,13 +3953,13 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             x.elements
                 .iter()
                 .zip(&y.elements)
-                .all(|(p, q)| value_equals(p, q))
+                .all(|(p, q)| value_equals_with_arena(p, q, arena))
         }
         (HeapObj::Record(x), HeapObj::Record(y)) => {
             x.type_name == y.type_name
                 && x.field_names == y.field_names
                 && x.fields.len() == y.fields.len()
-                && x.fields.iter().zip(&y.fields).all(|(p, q)| value_equals(p, q))
+                && x.fields.iter().zip(&y.fields).all(|(p, q)| value_equals_with_arena(p, q, arena))
         }
         (HeapObj::Adt(x), HeapObj::Adt(y)) => {
             x.type_name == y.type_name
@@ -3917,7 +3969,7 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                     .fields
                     .iter()
                     .zip(&y.fields)
-                    .all(|(xf, yf)| value_equals(&xf.value, &yf.value))
+                    .all(|(xf, yf)| value_equals_with_arena(&xf.value, &yf.value, arena))
         }
         (HeapObj::Newtype(x), HeapObj::Newtype(y)) => {
             x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
@@ -3925,7 +3977,7 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
             let xb = x.inner.lock().clone();
             let yb = y.inner.lock().clone();
-            value_equals(&xb, &yb)
+            value_equals_with_arena(&xb, &yb, arena)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
             x.start == y.start && x.end == y.end && x.inclusive == y.inclusive
@@ -3936,7 +3988,7 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                 && x.is_error_subtype == y.is_error_subtype
         }
         (HeapObj::ThrowVal(x), HeapObj::ThrowVal(y)) => match (&x.payload, &y.payload) {
-            (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => value_equals(a, b),
+            (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => value_equals_with_arena(a, b, arena),
             (ThrowPayload::Err(a), ThrowPayload::Err(b)) => Arc::ptr_eq(a, b),
             _ => false,
         },
@@ -3948,7 +4000,7 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                     .upvalues
                     .iter()
                     .zip(&y.upvalues)
-                    .all(|(p, q)| value_equals(p, q))
+                    .all(|(p, q)| value_equals_with_arena(p, q, arena))
         }
         (HeapObj::Builtin(x), HeapObj::Builtin(y)) => {
             (x.fn_ptr as usize) == (y.fn_ptr as usize) && x.name == y.name
@@ -3959,7 +4011,12 @@ fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
 
 /// Value 语义相等（用于 HeapObj 字段比较）。
 /// 标量按 tag + bit 比较；Ref 走 heap_equals 递归；Null/Void 按判别。
-fn value_equals(a: &Value, b: &Value) -> bool {
+pub fn value_equals(a: &Value, b: &Value) -> bool {
+    value_equals_with_arena(a, b, &ValueArena::default())
+}
+
+/// Value 语义相等（带 ValueArena，用于 ValueHandle 比较）。
+pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
         (Value::Scalar(av, at), Value::Scalar(bv, bt)) => {
@@ -3990,7 +4047,7 @@ fn value_equals(a: &Value, b: &Value) -> bool {
                 ScalarTag::F128 => (unsafe { av.f128_val } == unsafe { bv.f128_val }),
             }
         }
-        (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), &ValueArena::default()),
+        (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),
         _ => false,
     }
 }
@@ -5339,8 +5396,8 @@ fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => a.checked_div(b).unwrap_or_else(T::zero),
-        BinOp::Mod => a.checked_rem(b).unwrap_or_else(T::zero),
+        BinOp::Div => a.checked_div(b).expect("division by zero"),
+        BinOp::Mod => a.checked_rem(b).expect("division by zero"),
         BinOp::Band => a.bit_and(b),
         BinOp::Bor => a.bit_or(b),
         BinOp::Bxor => a.bit_xor(b),
@@ -5620,9 +5677,9 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // 整数除零返回 0（与泛型 checked_div 语义一致）
-        BinOp::Div => a.checked_div(b).unwrap_or(0),
-        BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+        // 整数除零直接 panic（不回退）
+        BinOp::Div => a / b,
+        BinOp::Mod => a % b,
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
@@ -5696,8 +5753,8 @@ fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => a.checked_div(b).unwrap_or(0),
-        BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+        BinOp::Div => a / b,
+        BinOp::Mod => a % b,
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
@@ -5866,8 +5923,8 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a.checked_div(b).unwrap_or(0),
-                BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+                BinOp::Div => a / b,
+                BinOp::Mod => a % b,
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
@@ -5941,8 +5998,8 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a.checked_div(b).unwrap_or(0),
-                BinOp::Mod => a.checked_rem(b).unwrap_or(0),
+                BinOp::Div => a / b,
+                BinOp::Mod => a % b,
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
@@ -6293,8 +6350,8 @@ macro_rules! impl_arith_int {
             #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
             #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
             #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
-            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { a.checked_div(b).unwrap_or(0) }
-            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { a.checked_rem(b).unwrap_or(0) }
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { a / b }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { a % b }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }

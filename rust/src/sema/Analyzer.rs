@@ -4,11 +4,12 @@
 //! 三层多 pass 管线，rayon 并行。类型驱动副作用判定。
 //! 详见 docs/superpowers/specs/2026-08-03-analyzer-design.md
 
-use crate::Ast::{
+use crate::ast::Ast::{
     AstArena, Decl, Expr, ExprId, InterpolationPart, LambdaBody, Module, Pattern, PatternId,
     SelectArm, Stmt, StmtId, Visibility,
 };
-use crate::Sema::{dynamic_type_id, module_expr_key, ConstVal, SemaResult};
+use crate::sema::Sema::{module_expr_key, ConstVal, SemaResult};
+use crate::TypeDesc::dynamic_type_id;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 // =========================================================================
@@ -468,11 +469,6 @@ pub fn classify_side_effect(
             acc
         }
 
-        // ── 类型转换：操作数纯则纯 ──
-        Expr::TypeCast { expr, .. } => classify_side_effect(
-            *expr, arena, module_name, sema, purity, escape, func_name_to_id,
-        ),
-
         // ── Elvis：两侧均纯才纯 ──
         Expr::Elvis { lhs, rhs } => {
             let l = classify_side_effect(*lhs, arena, module_name, sema, purity, escape, func_name_to_id);
@@ -676,9 +672,6 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
                 collect_def_use_expr(arm.body, arena, func, graph);
             }
         }
-        Expr::TypeCast { expr, .. } => {
-            collect_def_use_expr(*expr, arena, func, graph);
-        }
         Expr::StrInterp(parts) => {
             for p in parts {
                 if let InterpolationPart::Expression(e) = p {
@@ -860,7 +853,7 @@ fn mark_entry_reason(
     is_entry: bool,
     visibility: Visibility,
     has_extern_c: bool,
-    attributes: &[crate::Ast::Attribute],
+    attributes: &[crate::ast::Ast::Attribute],
     name: &str,
     sema: &SemaResult,
 ) {
@@ -1019,9 +1012,6 @@ fn collect_call_edges(
                 collect_call_edges(arm.body, arena, caller, caller_name, module_name, sema, cg);
             }
         }
-        Expr::TypeCast { expr, .. } => {
-            collect_call_edges(*expr, arena, caller, caller_name, module_name, sema, cg);
-        }
         Expr::StrInterp(parts) => {
             for p in parts {
                 if let InterpolationPart::Expression(e) = p {
@@ -1046,8 +1036,8 @@ fn collect_call_edges(
         Expr::Lambda { body, .. } => {
             // 递归进入 lambda body：嵌套 lambda 中的调用归并到外层 caller
             let inner = match body {
-                crate::Ast::LambdaBody::Block(e) => *e,
-                crate::Ast::LambdaBody::Expression(e) => *e,
+                crate::ast::Ast::LambdaBody::Block(e) => *e,
+                crate::ast::Ast::LambdaBody::Expression(e) => *e,
             };
             collect_call_edges(inner, arena, caller, caller_name, module_name, sema, cg);
         }
@@ -1110,7 +1100,7 @@ fn collect_call_edges_stmt(
         }
         Stmt::LocalDecl { decl } => {
             // 递归进入嵌套函数 body：嵌套函数中的调用归并到外层 caller
-            if let crate::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
+            if let crate::ast::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
                 collect_call_edges(*body, arena, caller, caller_name, module_name, sema, cg);
             }
         }
@@ -1326,7 +1316,6 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &Sema
                         a.guard.map_or(false, |g| check(g, arena, self_name, sema)) || check(a.body, arena, self_name, sema)
                     })
             }
-            Expr::TypeCast { expr, .. } => check(*expr, arena, self_name, sema),
             Expr::StrInterp(parts) => parts.iter().any(|p| {
                 if let InterpolationPart::Expression(e) = p {
                     check(*e, arena, self_name, sema)
@@ -1517,7 +1506,6 @@ fn walk_children_expr<F: FnMut(ExprId)>(expr_id: ExprId, arena: &AstArena, mut f
                 f(arm.body);
             }
         }
-        Expr::TypeCast { expr, .. } => f(*expr),
         Expr::StrInterp(parts) => {
             for p in parts {
                 if let InterpolationPart::Expression(e) = p { f(*e); }
@@ -2424,6 +2412,12 @@ pub fn inline_pass(
             if has_nested_function(*body, arena) {
                 continue;
             }
+            // 包含 ? 传播运算符（Expr::Propagate）的函数不内联：
+            // compute_propagate 通过 ControlSignal::Return 实现提前返回，
+            // 该信号是函数级作用域，内联后会错误地终止调用方函数
+            if has_propagate(*body, arena) {
+                continue;
+            }
             let size = count_expr_nodes(*body, arena);
             if size <= INLINE_SIZE_THRESHOLD {
                 report.candidates.push((func, size));
@@ -2466,7 +2460,7 @@ fn has_nested_function(expr_id: ExprId, arena: &AstArena) -> bool {
 fn has_nested_function_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     let stmt = &arena.stmt(stmt_id).node;
     if let Stmt::LocalDecl { decl } = stmt {
-        if matches!(decl.as_ref(), crate::Ast::Decl::FunDecl { .. }) {
+        if matches!(decl.as_ref(), crate::ast::Ast::Decl::FunDecl { .. }) {
             return true;
         }
     }
@@ -2474,6 +2468,39 @@ fn has_nested_function_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     walk_children_stmt(stmt_id, arena, |e| {
         if !found {
             found = has_nested_function(e, arena);
+        }
+    });
+    found
+}
+
+/// 检测表达式中是否包含 `?` 传播运算符（Expr::Propagate）。
+/// 包含 ? 的函数不应内联：compute_propagate 通过 ControlSignal::Return 实现提前返回，
+/// 该信号是函数级作用域，内联后会错误地终止调用方函数。
+fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
+    if matches!(arena.expr(expr_id).node, Expr::Propagate(_)) {
+        return true;
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = has_propagate(c, arena);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = has_propagate_stmt(s, arena);
+            }
+        });
+    }
+    found
+}
+
+fn has_propagate_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
+    let mut found = false;
+    walk_children_stmt(stmt_id, arena, |e| {
+        if !found {
+            found = has_propagate(e, arena);
         }
     });
     found
@@ -2572,7 +2599,7 @@ fn analyze_match_stmt(stmt_id: StmtId, arena: &AstArena, module_name: &str, sema
 fn analyze_single_match(
     match_expr: ExprId,
     scrutinee: ExprId,
-    arms: &[crate::Ast::MatchArm],
+    arms: &[crate::ast::Ast::MatchArm],
     arena: &AstArena,
     module_name: &str,
     sema: &SemaResult,
@@ -2599,7 +2626,7 @@ fn analyze_single_match(
     let Some(&type_idx) = sema.type_def_index.get(type_name) else { return };
     let type_def = &sema.type_defs[type_idx as usize];
     // 仅 ADT 类型有多个构造器需要检查完备性
-    if type_def.kind != crate::Sema::TypeDefKind::Adt {
+    if type_def.kind != crate::sema::Sema::TypeDefKind::Adt {
         return;
     }
     let all_ctors: Vec<&str> = type_def.constructors.iter().map(|c| c.name.as_ref()).collect();

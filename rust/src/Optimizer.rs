@@ -5,7 +5,7 @@
 //! 节点变换采用"标记 + 重定向 + 晚期压缩重建"策略，Engine 侧零改动。
 //! 详见 docs/superpowers/plans/2026-08-04-ir-optimizer.md
 
-use crate::Ir::{ConstValue, ComputeFnId, DataFlowGraph, Node, NodeId, NodeKind};
+use crate::Ir::{CF_NOOP, ConstValue, ComputeFnId, DataFlowGraph, Node, NodeId, NodeKind};
 use pastey::paste;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -415,7 +415,7 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
                 kind: NodeKind::Const,
                 input_count: 0,
                 inputs_offset: new_offset,
-                compute_fn: ComputeFnId(0),
+                compute_fn: CF_NOOP,
             };
             graph.const_values[idx] = Some(cv);
         }
@@ -436,10 +436,12 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
 // Pass: CSE — 公共子表达式消除
 // =========================================================================
 
-/// CSE pass：纯节点 (compute_fn, resolved_inputs) 相同 → 合并。
+/// CSE pass：纯节点 (compute_fn, resolved_inputs, metadata_hash) 相同 → 合并。
 /// 首个出现者保留，后续 redirect 到首个。
+/// 元数据哈希确保 pattern_field_indices/pattern_ctor_names/field_access_infos 等
+/// per-node 元数据不同的节点不会被错误合并。
 pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &FxHashSet<ComputeFnId>) {
-    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>), NodeId> = FxHashMap::default();
+    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64), NodeId> = FxHashMap::default();
     let wb_targets = collect_writeback_targets(graph);
 
     for (idx, node) in graph.nodes.iter().enumerate() {
@@ -456,7 +458,8 @@ pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
 
         let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
         let resolved: Vec<NodeId> = inputs.iter().map(|&i| ctx.resolve(i)).collect();
-        let key = (node.compute_fn, resolved);
+        let meta_hash = graph.cse_metadata_hash(idx);
+        let key = (node.compute_fn, resolved, meta_hash);
         if let Some(&existing) = seen.get(&key) {
             ctx.redirect.insert(id, existing);
         } else {
@@ -473,7 +476,7 @@ pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
 /// noop_compute_real(0) 是纯透传。
 fn passthrough_set() -> FxHashSet<ComputeFnId> {
     let mut s = FxHashSet::default();
-    s.insert(ComputeFnId(0)); // noop_compute_real
+    s.insert(CF_NOOP); // noop_compute_real
     s
 }
 

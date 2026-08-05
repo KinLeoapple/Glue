@@ -21,10 +21,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 
-use crate::Ast::{
-    Decl, ErrorCollector, ImportItem, Lexer, Module, ParseError, Parser, Token, TokenCollector,
-    Visibility,
-};
+use crate::ast::Ast::{Decl, ImportItem, Module, Visibility};
+use crate::ast::Parser::{ErrorCollector, Lexer, ParseError, Parser, Token, TokenCollector};
 
 // ─── 标准库源码嵌入 ──────────────────────────────────────────────────
 // 使用 include_str! 在编译期将 .glue 源文件嵌入二进制，供 ModuleLoader parse。
