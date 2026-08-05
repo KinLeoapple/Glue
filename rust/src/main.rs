@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand};
 use glue::ast::Ast::{Module, Printer};
 use glue::ast::Parser::{ErrorCollector, Lexer, Parser as GlueParser, Token, TokenCollector};
 use glue::Engine::EngineRef;
-use glue::sema::Analyzer;
-use glue::Ir::IrBuilder;
+use glue::pass::Analyzer;
+use glue::ir::Builder::IrBuilder;
 use glue::ModuleLoader::ModuleLoader;
 use glue::sema::Sema::{populate_module, SemaResult, TypeArena};
 use glue::sema::Inference::InferContext;
@@ -650,7 +650,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
 
     // IR 后优化：ConstFold/CSE/CopyProp/DCE 固定点迭代
     if std::env::var("GLUE_NO_OPT").is_err() {
-        glue::Optimizer::optimize(&mut graph);
+        glue::pass::Optimizer::optimize(&mut graph);
     }
 
     if debug {

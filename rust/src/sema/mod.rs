@@ -1,14 +1,14 @@
-//! sema — 语义分析模块
+//! sema — Semantic analysis modules.
 //!
-//! 汇总 Sema 管线的 5 个子模块：
-//! - `Sema`：类型系统核心数据结构（ConcreteType / TypeArena / SemaResult）
-//! - `Relations`：类型关系判定（等价 / 子类型 / 数值提升）
-//! - `Inference`：类型推断与约束求解
-//! - `Monomorph`：单态化实例收集
-//! - `Analyzer`：Sema 后静态分析（死代码 / 记忆化策略）
+//! Aggregates the Sema pipeline submodules:
+//! - `Sema`: Core type system data structures (ConcreteType / TypeArena / SemaResult).
+//! - `Relations`: Type relation checks (equality / subtype / numeric promotion).
+//! - `Inference`: Type inference and constraint solving.
+//! - `Monomorph`: Monomorphization instance collection.
+//!
+//! Note: `Analyzer` (Sema-post static analysis) now lives in `crate::pass`.
 
 pub mod Sema;
 pub mod Relations;
 pub mod Inference;
 pub mod Monomorph;
-pub mod Analyzer;

@@ -5,7 +5,7 @@
 //! 节点变换采用"标记 + 重定向 + 晚期压缩重建"策略，Engine 侧零改动。
 //! 详见 docs/superpowers/plans/2026-08-04-ir-optimizer.md
 
-use crate::Ir::{CF_NOOP, ConstValue, ComputeFnId, DataFlowGraph, Node, NodeId, NodeKind};
+use crate::ir::Ir::{CF_NOOP, ConstValue, ComputeFnId, DataFlowGraph, Node, NodeId, NodeKind};
 use pastey::paste;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -602,7 +602,7 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
 /// 顺序：ConstFold → CSE → CopyProp → DCE
 /// 循环直到一轮无变换，最后应用晚期重建。
 pub fn optimize(graph: &mut DataFlowGraph) {
-    let pure_set = crate::Ir::pure_compute_fn_set();
+    let pure_set = crate::ir::Ir::pure_compute_fn_set();
     let no_fold = std::env::var("GLUE_NO_FOLD").is_ok();
     let no_cse = std::env::var("GLUE_NO_CSE").is_ok();
     let no_copy = std::env::var("GLUE_NO_COPY").is_ok();

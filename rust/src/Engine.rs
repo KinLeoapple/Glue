@@ -11,7 +11,7 @@
 //! - sync/async 统一：子图有无挂起点
 //! - 帧级回收 + 槽级 RC
 
-use crate::Ir::*;
+use crate::ir::Ir::*;
 use crate::Value::{Value, ValueArena};
 use std::cell::{RefCell, RefMut};
 use std::ops::DerefMut;
@@ -1416,7 +1416,7 @@ pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: 类型构造（从输入收集字段值，根据 kind 构造 Record/Adt/Newtype HeapObj）
 pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Ir::{RecordLitKind, RecordLitInfo};
+    use crate::ir::Ir::{RecordLitKind, RecordLitInfo};
     use crate::Value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
     read_node_inputs!(frame, node, graph, n, inputs);
     let fields: Vec<Value> = inputs
@@ -2269,7 +2269,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_await 无法访问 Engine 运行时，只设置 pending_await，
 /// 核心循环消费后解析事件源 → 检查就绪 → 就绪则注入值继续 → 未就绪则挂起。
 pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Ir::PendingAwait;
+    use crate::ir::Ir::PendingAwait;
 
     read_node_inputs!(frame, node, graph, n, inputs);
     // inputs[0] = 事件对象节点（AsyncHandle/Channel/Timer）
@@ -2288,8 +2288,8 @@ pub fn compute_await(frame: &mut Frame, node: NodeId) -> Value {
                     .find(|d| d.node == es)
                     .map(|d| d.kind)
             })
-            .unwrap_or(crate::Ir::EventSourceKind::AsyncJoin),
-        None => crate::Ir::EventSourceKind::AsyncJoin,
+            .unwrap_or(crate::ir::Ir::EventSourceKind::AsyncJoin),
+        None => crate::ir::Ir::EventSourceKind::AsyncJoin,
     };
 
     frame.pending = Some(Pending::Await(PendingAwait {
@@ -2339,7 +2339,7 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
     };
     match ch.send(val) {
         Ok(()) => {
-            let ch_id = crate::Ir::ChannelId(ch.id());
+            let ch_id = crate::ir::Ir::ChannelId(ch.id());
             frame.pending = Some(Pending::ChannelNotify(ch_id));
             Value::VOID
         }
@@ -2364,7 +2364,7 @@ pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
 /// 与 compute_call_launch 相同参数收集逻辑，但 is_async=true。
 /// 核心循环检测 is_async=true 后：启动子帧 + call 节点写 AsyncHandle + 通知下游 + 不挂起。
 pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::Ir::PendingCall;
+    use crate::ir::Ir::PendingCall;
 
     let graph = frame.graph.clone();
     let target_sg = graph.call_targets[node.0 as usize]
@@ -2595,7 +2595,7 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 /// defer body 是独立子图，创建新帧并通过 run_frame_sync 同步执行。
 fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
     let sg_id = frame.subgraph_id;
-    let defer_entries: Vec<crate::Ir::DeferEntry> =
+    let defer_entries: Vec<crate::ir::Ir::DeferEntry> =
         graph.subgraphs[sg_id.0 as usize].defer_table.clone();
     for entry in defer_entries.iter().rev() {
         let (dn_start, dn_end) = graph.subgraphs[entry.body_subgraph.0 as usize].node_range;
@@ -2620,7 +2620,7 @@ fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
 /// 不支持：async/await、channel/timer 事件、select、循环体复用。
 /// 适用于 thunk 子图（纯计算 + 同步函数调用）。
 fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
-    use crate::Ir::{ControlSignal, LoopKind, NodeKind, PendingCall, SignalKind, SubGraphId};
+    use crate::ir::Ir::{ControlSignal, LoopKind, NodeKind, PendingCall, SignalKind, SubGraphId};
 
     let mut iter_guard: u64 = 0;
     loop {
@@ -2982,7 +2982,7 @@ pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let handle_val = frame.get_value_by_global(inputs[0]);
     // async handle 是 i32 标量，值即 async_id
-    let async_id = crate::Ir::AsyncHandleId(handle_val.as_i32() as u32);
+    let async_id = crate::ir::Ir::AsyncHandleId(handle_val.as_i32() as u32);
     frame.pending = Some(Pending::Cancel(async_id));
     Value::VOID
 }
@@ -3124,26 +3124,26 @@ struct TimerEntry {
 }
 impl TimerRuntime {
     pub fn new() -> Self { Self { timers: Vec::new() } }
-    pub fn start(&mut self, duration: std::time::Duration) -> crate::Ir::TimerId {
-        let id = crate::Ir::TimerId(self.timers.len() as u32);
+    pub fn start(&mut self, duration: std::time::Duration) -> crate::ir::Ir::TimerId {
+        let id = crate::ir::Ir::TimerId(self.timers.len() as u32);
         self.timers.push(TimerEntry {
             deadline: std::time::Instant::now() + duration,
             fired: false,
         });
         id
     }
-    pub fn check_and_fire(&mut self) -> Vec<crate::Ir::TimerId> {
+    pub fn check_and_fire(&mut self) -> Vec<crate::ir::Ir::TimerId> {
         let now = std::time::Instant::now();
         let mut fired = Vec::new();
         for (i, t) in self.timers.iter_mut().enumerate() {
             if !t.fired && now >= t.deadline {
                 t.fired = true;
-                fired.push(crate::Ir::TimerId(i as u32));
+                fired.push(crate::ir::Ir::TimerId(i as u32));
             }
         }
         fired
     }
-    pub fn is_fired(&self, id: crate::Ir::TimerId) -> bool {
+    pub fn is_fired(&self, id: crate::ir::Ir::TimerId) -> bool {
         self.timers.get(id.0 as usize).map(|t| t.fired).unwrap_or(false)
     }
     /// 清理已触发的 timer 条目以回收内存。
@@ -3171,30 +3171,30 @@ pub struct AsyncJoinRuntime {
     next_async_id: u32,
 }
 struct AsyncJoinEntry {
-    async_id: crate::Ir::AsyncHandleId,
+    async_id: crate::ir::Ir::AsyncHandleId,
     child_fid: FrameId,
     result: Option<Value>,
 }
 impl AsyncJoinRuntime {
     pub fn new() -> Self { Self { entries: Vec::new(), next_async_id: 0 } }
     /// 分配新的 async_id（i32 标量值）
-    pub fn alloc_id(&mut self) -> crate::Ir::AsyncHandleId {
+    pub fn alloc_id(&mut self) -> crate::ir::Ir::AsyncHandleId {
         assert!(self.next_async_id < u32::MAX, "AsyncHandleId overflow: too many async calls");
-        let id = crate::Ir::AsyncHandleId(self.next_async_id);
+        let id = crate::ir::Ir::AsyncHandleId(self.next_async_id);
         self.next_async_id += 1;
         id
     }
-    pub fn register(&mut self, async_id: crate::Ir::AsyncHandleId, child_fid: FrameId) {
+    pub fn register(&mut self, async_id: crate::ir::Ir::AsyncHandleId, child_fid: FrameId) {
         self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
     }
     /// 原子地分配 async_id 并注册 child_fid（消除 alloc_id + register 的竞态窗口）。
-    pub fn alloc_and_register(&mut self, child_fid: FrameId) -> crate::Ir::AsyncHandleId {
-        let async_id = crate::Ir::AsyncHandleId(self.next_async_id);
+    pub fn alloc_and_register(&mut self, child_fid: FrameId) -> crate::ir::Ir::AsyncHandleId {
+        let async_id = crate::ir::Ir::AsyncHandleId(self.next_async_id);
         self.next_async_id += 1;
         self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
         async_id
     }
-    pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::Ir::AsyncHandleId> {
+    pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::ir::Ir::AsyncHandleId> {
         // 仅匹配未完成（result=None）的 entry：帧 ID 会被复用，
         // 已完成的旧 entry 若仍匹配会导致新 async call 的完成事件被错误路由到旧 async_id。
         self.entries
@@ -3202,13 +3202,13 @@ impl AsyncJoinRuntime {
             .find(|e| e.child_fid == child_fid && e.result.is_none())
             .map(|e| e.async_id)
     }
-    pub fn find_child_by_async_id(&self, async_id: crate::Ir::AsyncHandleId) -> Option<FrameId> {
+    pub fn find_child_by_async_id(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<FrameId> {
         self.entries.iter().find(|e| e.async_id == async_id).map(|e| e.child_fid)
     }
-    pub fn try_get_result(&self, async_id: crate::Ir::AsyncHandleId) -> Option<Value> {
+    pub fn try_get_result(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<Value> {
         self.entries.iter().find(|e| e.async_id == async_id).and_then(|e| e.result.clone())
     }
-    pub fn set_result(&mut self, async_id: crate::Ir::AsyncHandleId, value: Value) {
+    pub fn set_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId, value: Value) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.async_id == async_id) {
             e.result = Some(value);
         }
@@ -3216,7 +3216,7 @@ impl AsyncJoinRuntime {
     /// 清理已完成且 result 已被读取的 entry，释放内存。
     /// 注意：AsyncHandleId 是 alloc_id 分配的递增值，不是 entries 索引，
     /// 所以移除 entry 不影响 ID 有效性。
-    pub fn cleanup_consumed(&mut self, consumed_ids: &[crate::Ir::AsyncHandleId]) {
+    pub fn cleanup_consumed(&mut self, consumed_ids: &[crate::ir::Ir::AsyncHandleId]) {
         self.entries.retain(|e| {
             // 保留未完成的，或已完成但未被消费的
             e.result.is_none() || !consumed_ids.contains(&e.async_id)
@@ -3732,9 +3732,9 @@ pub struct Engine<S: LockStrategy> {
     pub arena: S::Mutex<ValueArena>,
     pub timer_runtime: S::Mutex<TimerRuntime>,
     pub async_join_runtime: S::Mutex<AsyncJoinRuntime>,
-    pub event_waiters: S::Mutex<Vec<(crate::Ir::RuntimeEvent, FrameId)>>,
+    pub event_waiters: S::Mutex<Vec<(crate::ir::Ir::RuntimeEvent, FrameId)>>,
     pub pending_completions:
-        S::Mutex<HashMap<FrameId, (crate::Ir::NodeId, Value, crate::Ir::ControlSignal)>>,
+        S::Mutex<HashMap<FrameId, (crate::ir::Ir::NodeId, Value, crate::ir::Ir::ControlSignal)>>,
     pub result: S::Mutex<Option<Value>>,
     /// 单线程队列（Multi 模式为 None）
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
@@ -3848,14 +3848,14 @@ impl<S: LockStrategy> Engine<S> {
                     let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
                     let recv_val = frame.get_value_by_global(inputs[0]);
 
-                    let (target_sg, upvalues): (crate::Ir::SubGraphId, Vec<Value>) = match recv_val
+                    let (target_sg, upvalues): (crate::ir::Ir::SubGraphId, Vec<Value>) = match recv_val
                         .heap_obj()
                     {
                         Some(crate::Value::HeapObj::TraitVal(tv)) => {
                             let idx = method_idx as usize;
                             match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
                                 Some(crate::Value::HeapObj::Closure(c)) => {
-                                    (crate::Ir::SubGraphId(c.func_id), c.upvalues.clone())
+                                    (crate::ir::Ir::SubGraphId(c.func_id), c.upvalues.clone())
                                 }
                                 _ => panic!("vtable method_idx {} is not a Closure", method_idx),
                             }
@@ -3886,7 +3886,7 @@ impl<S: LockStrategy> Engine<S> {
             let pending = frame.pending.take();
             if let Some(pending) = pending {
                 match pending {
-                    crate::Ir::Pending::Call(pending) => {
+                    crate::ir::Ir::Pending::Call(pending) => {
                         // 尾调用图跳转
                         let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
                         if graph.tail_call_flags[graph_call_id.0 as usize] {
@@ -3908,7 +3908,7 @@ impl<S: LockStrategy> Engine<S> {
                                             .kind
                                             == NodeKind::Gate;
                                         caller_is_gate
-                                            && caller_loop_kind != crate::Ir::LoopKind::LoopBody
+                                            && caller_loop_kind != crate::ir::Ir::LoopKind::LoopBody
                                             && caller_has_caller
                                     } else {
                                         false
@@ -3947,7 +3947,7 @@ impl<S: LockStrategy> Engine<S> {
                         let target_loop_kind =
                             graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
                         let child_fid = if target_loop_kind
-                            == crate::Ir::LoopKind::LoopBody
+                            == crate::ir::Ir::LoopKind::LoopBody
                         {
                             if let Some(bfid) = frame.body_frame_id {
                                 // 复用 body_sg 帧：注入参数 + 入就绪队列
@@ -4049,7 +4049,7 @@ impl<S: LockStrategy> Engine<S> {
                         }
                     }
 
-                    crate::Ir::Pending::ChannelNotify(ch_id) => {
+                    crate::ir::Ir::Pending::ChannelNotify(ch_id) => {
                         self.on_event_arrived(
                             RuntimeEvent::ChannelReady(ch_id),
                             Value::VOID,
@@ -4057,7 +4057,7 @@ impl<S: LockStrategy> Engine<S> {
                         );
                     }
 
-                    crate::Ir::Pending::Await(pending) => {
+                    crate::ir::Ir::Pending::Await(pending) => {
                         let (event, ready_value) = self.resolve_and_check_await(&pending);
 
                         if let Some(value) = ready_value {
@@ -4085,7 +4085,7 @@ impl<S: LockStrategy> Engine<S> {
                         }
                     }
 
-                    crate::Ir::Pending::Cancel(async_id) => {
+                    crate::ir::Ir::Pending::Cancel(async_id) => {
                         let child_fid = self
                             .async_join_runtime
                             .lock()
@@ -4106,7 +4106,7 @@ impl<S: LockStrategy> Engine<S> {
                         continue;
                     }
 
-                    crate::Ir::Pending::SelectWait(gate_local) => {
+                    crate::ir::Ir::Pending::SelectWait(gate_local) => {
                         let info = graph.select_infos[graph_node_id.0 as usize].clone();
 
                         if let Some(info) = info {
@@ -4175,7 +4175,7 @@ impl<S: LockStrategy> Engine<S> {
                                                 .and_then(|h| h.channel())
                                             {
                                                 RuntimeEvent::ChannelReady(
-                                                    crate::Ir::ChannelId(ch.id()),
+                                                    crate::ir::Ir::ChannelId(ch.id()),
                                                 )
                                             } else {
                                                 continue;
@@ -4469,7 +4469,7 @@ impl<S: LockStrategy> Engine<S> {
         // LoopBody 完成检测（从 Engine 版本移植）
         let child_sg_id = child_frame.subgraph_id;
         let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
-        if child_loop_kind == crate::Ir::LoopKind::LoopBody {
+        if child_loop_kind == crate::ir::Ir::LoopKind::LoopBody {
             let child_signal = child_frame.control_signal.clone();
             let (loop_fid, _call_node) = child_frame
                 .caller
@@ -4546,7 +4546,7 @@ impl<S: LockStrategy> Engine<S> {
 
                 // Gate 分支子图的控制信号传播
                 let is_gate =
-                    self.graph.nodes[call_graph_id.0 as usize].kind == crate::Ir::NodeKind::Gate;
+                    self.graph.nodes[call_graph_id.0 as usize].kind == crate::ir::Ir::NodeKind::Gate;
                 if is_gate && !matches!(child_signal, ControlSignal::None) {
                     caller_frame.control_signal = child_signal;
                 }
@@ -4584,7 +4584,7 @@ impl<S: LockStrategy> Engine<S> {
         let loop_offset = loop_frame.node_offset;
 
         // 1. For 循环：额外重置 iter_next_node
-        if loop_kind == crate::Ir::LoopKind::For {
+        if loop_kind == crate::ir::Ir::LoopKind::For {
             if let Some(next_node) = iter_next_node {
                 let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
                 Self::reset_node_ready(loop_frame, next_local);
@@ -4595,12 +4595,12 @@ impl<S: LockStrategy> Engine<S> {
         // 2. 重置 cond_node
         if let Some(cond_node) = cond_node {
             let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
-            if loop_kind == crate::Ir::LoopKind::For {
+            if loop_kind == crate::ir::Ir::LoopKind::For {
                 Self::reset_node_pending(loop_frame, cond_local, 1);
             } else {
                 Self::reset_node_ready(loop_frame, cond_local);
                 // Const cond_node 重新预填充
-                if self.graph.nodes[cond_node.0 as usize].kind == crate::Ir::NodeKind::Const {
+                if self.graph.nodes[cond_node.0 as usize].kind == crate::ir::Ir::NodeKind::Const {
                     if let Some(cv) = self.graph.const_values[cond_node.0 as usize] {
                         let handle = alloc_const_value(cv);
                         let consumer_count =
@@ -4662,12 +4662,12 @@ impl<S: LockStrategy> Engine<S> {
     /// 解析 await 事件源 + 检查就绪。
     fn resolve_and_check_await(
         &self,
-        pending: &crate::Ir::PendingAwait,
+        pending: &crate::ir::Ir::PendingAwait,
     ) -> (RuntimeEvent, Option<Value>) {
-        use crate::Ir::EventSourceKind;
+        use crate::ir::Ir::EventSourceKind;
         match pending.event_kind {
             EventSourceKind::AsyncJoin => {
-                let async_id = crate::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
+                let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
                 let event = RuntimeEvent::AsyncJoin(async_id);
                 let val = self.async_join_runtime.lock().try_get_result(async_id);
                 (event, val)
@@ -4679,7 +4679,7 @@ impl<S: LockStrategy> Engine<S> {
                     .and_then(|h| h.channel())
                     .expect("await on non-channel value");
                 let v = ch.recv().or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
-                let event = RuntimeEvent::ChannelReady(crate::Ir::ChannelId(ch.id()));
+                let event = RuntimeEvent::ChannelReady(crate::ir::Ir::ChannelId(ch.id()));
                 (event, v)
             }
             EventSourceKind::Timer => {

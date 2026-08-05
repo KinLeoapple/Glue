@@ -22,11 +22,9 @@ pub mod Ffi;
 #[path = "ModuleLoader.rs"]
 pub mod ModuleLoader;
 
-#[path = "Ir.rs"]
-pub mod Ir;
+pub mod ir;
 
 #[path = "Engine.rs"]
 pub mod Engine;
 
-#[path = "Optimizer.rs"]
-pub mod Optimizer;
+pub mod pass;
