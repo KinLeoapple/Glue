@@ -488,6 +488,14 @@ pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(a == b)
 }
 
+/// compute_fn: bool 不等（与 eq_bool 对称）
+pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_bool();
+    let b = frame.get_value_by_global(inputs[1]).as_bool();
+    Value::bool_val(a != b)
+}
+
 // ---- throw 包装（索引 28，无 try-catch）----
 
 /// compute_fn: 将值包装为 ThrowVal(Err)（throw 语句用）。
@@ -2549,8 +2557,9 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
         thunk_frame.push_ready(local_id);
     }
 
-    // 设置 parent_frame_ptr：thunk 内可通过帧链穿透访问外层变量
-    thunk_frame.parent_frame_ptr = caller_frame as *mut Frame;
+    // thunk 帧的 upvalues 已作为参数注入（上方循环），不需通过 parent_frame_ptr 访问外层变量。
+    // 设为 null 避免 caller_frame 的 &mut 借用与裸指针解引用构成别名 UB。
+    thunk_frame.parent_frame_ptr = std::ptr::null_mut();
 
     // 同步执行 thunk 帧
     let result = run_frame_sync(&mut thunk_frame, &graph);
@@ -2562,6 +2571,89 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
     }
 
     result
+}
+
+/// 同步路径循环迭代重置：LoopBody 完成 Continue/None 后重置循环帧的
+/// cond/gate/iter_next，使其重新进入下一迭代。
+///
+/// 与 Engine::reset_loop_iteration 对应，但不处理 body_frame 复用
+/// （同步路径每次迭代都新建 child_frame，不复用）。
+/// 同步路径不通过帧队列驱动，而是 run_frame_sync_inner 主循环直接从
+/// ready_queue pop 节点执行，因此 reset 后 cond/iter_next 入队即可
+/// 被主循环重新拾取执行。
+fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph) {
+    let loop_sg_id = frame.subgraph_id;
+    let (loop_kind, cond_node, return_node, iter_next_node) = {
+        let sg = &graph.subgraphs[loop_sg_id.0 as usize];
+        (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node)
+    };
+    let loop_offset = frame.node_offset;
+
+    // 0. 清空 ready_queue（必须在 push cond/iter_next 之前）
+    // 若不清空，旧就绪条目残留，会先于 cond/iter_next 执行，引用过时值
+    frame.ready_queue.clear();
+
+    // 1. For 循环：重置 iter_next_node
+    if loop_kind == LoopKind::For {
+        if let Some(next_node) = iter_next_node {
+            let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
+            let i = next_local.0 as usize;
+            if i < frame.pending_inputs.len() {
+                frame.pending_inputs[i] = 0;
+            }
+            if i < frame.value_table.len() {
+                frame.value_table.reset_slot(i);
+            }
+            frame.push_ready(next_local);
+        }
+    }
+
+    // 2. 重置 cond_node
+    if let Some(cond_node) = cond_node {
+        let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
+        let i = cond_local.0 as usize;
+        if loop_kind == LoopKind::For {
+            // For 循环 cond 依赖 iter_next，pending=1
+            if i < frame.pending_inputs.len() {
+                frame.pending_inputs[i] = 1;
+            }
+            if i < frame.value_table.len() {
+                frame.value_table.reset_slot(i);
+            }
+        } else {
+            // While/Loop cond 无输入依赖，pending=0
+            if i < frame.pending_inputs.len() {
+                frame.pending_inputs[i] = 0;
+            }
+            if i < frame.value_table.len() {
+                frame.value_table.reset_slot(i);
+            }
+            // Const cond_node 重新预填充
+            if graph.nodes[cond_node.0 as usize].kind == NodeKind::Const {
+                if let Some(cv) = graph.const_values[cond_node.0 as usize] {
+                    let handle = cv.to_value();
+                    let consumer_count =
+                        graph.downstreams[cond_node.0 as usize].len() as u16;
+                    frame.set_value(cond_local, handle, consumer_count);
+                }
+            }
+            frame.push_ready(cond_local);
+        }
+    }
+
+    // 3. 重置 Gate 节点（= return_node，pending=1，等 cond notify）
+    let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
+    let gi = gate_local.0 as usize;
+    if gi < frame.pending_inputs.len() {
+        frame.pending_inputs[gi] = 1;
+    }
+    if gi < frame.value_table.len() {
+        frame.value_table.reset_slot(gi);
+    }
+
+    // 4. 重置循环帧状态
+    frame.control_signal = ControlSignal::None;
+    frame.state = FrameState::Ready;
 }
 
 /// 同步执行帧至完成，处理嵌套函数调用、控制信号、vtable 分派。
@@ -2615,7 +2707,8 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     loop {
         iter_guard += 1;
         if iter_guard > 100000 {
-            return Value::VOID;
+            // 超限：返回 NULL 表示计算失败（静默返回 VOID 会掩盖死锁）
+            return Value::NULL;
         }
         // 1. 检查控制信号（return/break/continue 已触发）
         let cs = frame.control_signal.clone();
@@ -2631,6 +2724,14 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             None => {
                 // 无就绪节点：从 return_node 提取返回值
                 let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
+                let return_local = sg.return_node.0.wrapping_sub(frame.node_offset);
+                // 检查 return_node 是否已就绪：未就绪说明图存在死锁/调度错误，
+                // 返回 NULL 表示计算失败（静默返回未初始化值会掩盖错误）
+                if (return_local as usize) < frame.value_table.ready.len()
+                    && !frame.value_table.ready[return_local as usize]
+                {
+                    return Value::NULL;
+                }
                 return frame.get_value_by_global(sg.return_node);
             }
         };
@@ -2780,10 +2881,11 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                         continue;
                     }
                     ControlSignal::Continue | ControlSignal::None => {
-                        // 循环继续：通知下游，循环帧会重新触发 body 调用
-                        notify_downstream(
-                            frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start),
-                        );
+                        // 循环继续：重置循环帧的 cond/gate/iter_next，
+                        // 使主循环重新拾取 cond 执行 → Gate 判定 → body 调用。
+                        // 此前仅 notify_downstream body Call 节点的下游，但 cond_node
+                        // 已执行过（值缓存、pending=0）不会被重新执行，导致循环只跑一次。
+                        reset_loop_frame_for_next_iteration(frame, graph);
                         continue;
                     }
                 }
@@ -2800,6 +2902,11 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             }
 
             notify_downstream(frame, graph, pending.call_node_local, graph_node_id, NodeId(node_start));
+        } else if pending.is_some() {
+            // 非 Call 的 Pending（Await/ChannelNotify/Cancel/SelectWait）在同步路径不支持
+            // 清除 pending 防止后续节点被错误当普通节点处理直到 iter_guard 超限
+            frame.pending = None;
+            return Value::NULL;
         } else {
             // 6. 普通节点：写值表 + 检查控制信号 + 通知下游
             let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
@@ -2944,9 +3051,14 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId) -> Value {
     args.extend(upvalues);
 
     // 递归闭包：将自身引用注入到 self_upvalue_idx 对应的 upvalue slot
+    // 边界检查：防止 usize 下溢与数组越界（self_upvalue_idx 必须落在 upvalues 区间内）
     if self_upvalue_idx >= 0 {
+        assert!(upvalues_len <= args.len(), "upvalues_len exceeds args.len()");
+        let self_upvalue_idx = self_upvalue_idx as usize;
+        assert!(self_upvalue_idx < upvalues_len, "self_upvalue_idx out of bounds");
         let upvalues_start = args.len() - upvalues_len;
-        let self_idx = upvalues_start + self_upvalue_idx as usize;
+        let self_idx = upvalues_start + self_upvalue_idx;
+        assert!(self_idx < args.len(), "self_idx out of bounds");
         args[self_idx] = callable_val.clone();
     }
 
@@ -3031,7 +3143,10 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
         .expect("WriteBack node missing target");
     let consumer_count = graph.downstreams[target.0 as usize].len() as u16;
 
-    // 路径 1：遍历 parent_frame_ptr 链，写入第一个包含 target 的帧（最近的父帧）。
+    // 路径 1：遍历 parent_frame_ptr 链，写入所有包含 target 的祖先帧。
+    // 不能只写最近父帧就 break：嵌套 same_function 子图（如 if 分支 → 循环体 →
+    // 循环帧 → main）中，中间帧（循环帧）也需要更新，否则下一迭代的 body
+    // 从循环帧拷贝时会读到旧值。
     // SAFETY: parent_frame_ptr 指向同函数帧（setup_frame_chain 设置），
     // caller 帧在 callee 执行期间处于 Suspended 状态，无并发访问。
     let mut written_parent = false;
@@ -3042,7 +3157,6 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
         if (local as usize) < f.value_table.len() {
             f.set_value(NodeId(local), val.clone(), consumer_count);
             written_parent = true;
-            break;
         }
         ptr = f.parent_frame_ptr;
     }

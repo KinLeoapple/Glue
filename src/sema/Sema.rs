@@ -396,15 +396,17 @@ pub struct ReflectMeta {
 }
 
 /// 单态化实例（一个泛型函数 + 一组 type_args → 一个实例）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MonomorphInstance {
     pub instance_id: u32,
     pub func_name: Box<str>,
+    /// 函数所在模块名（用于 expr_types 复合 key，确保跨模块单态化时 key 一致）
+    pub module_name: Box<str>,
     pub type_args: Box<[TypeHandle]>,
     pub chan_layout: ChanLayout,
     pub return_type: TypeHandle,
     pub is_async: bool,
-    /// 实例本地表达式类型表（key = AST Expr 句柄地址）
+    /// 实例本地表达式类型表（key = module_expr_key(module_name, expr_id)）
     pub expr_types: FxHashMap<u64, ExprInfo>,
     /// 字段访问元信息（key = AST field_access Expr 句柄地址）
     pub field_accesses: FxHashMap<u64, FieldAccessInfo>,
@@ -533,6 +535,13 @@ pub struct SemaResult {
     /// 检测到此情况后，在此集合标记 recv 的 expr key，使 IR 编译时不传 recv
     /// （`Duration.from_millis(100)` → `from_millis(100)` 而非 `from_millis(Duration, 100)`）。
     pub module_func_recv_exprs: FxHashSet<u64>,
+    /// 模块常量访问的 recv ExprId key → mangled 名（module_path.field）。
+    ///
+    /// 当 `Math.PI` 这样的 FieldAccess 的 recv 是 ModuleRef 且 field 是模块内常量时，
+    /// sema 在此映射记录 recv 的 expr key → 全局变量 mangled 名（如 "std.math.Math.PI"）。
+    /// IR 编译时据此跳过 recv 编译，直接发 compile_global_load 读取全局变量 slot，
+    /// 与本地全局变量访问同路径，避免把模块名编译成僵尸 Const 节点。
+    pub module_const_recv_exprs: FxHashMap<u64, String>,
 }
 
 impl Default for SemaResult {
@@ -591,6 +600,7 @@ impl SemaResult {
             field_id_map: FxHashMap::default(),
             witness_table: WitnessTable::new(),
             module_func_recv_exprs: FxHashSet::default(),
+            module_const_recv_exprs: FxHashMap::default(),
         }
     }
 
@@ -1037,6 +1047,10 @@ fn type_handle_name_matches(arena: &TypeArena, h: TypeHandle, name: &str) -> boo
     }
 }
 
+/// 类型解析递归深度上限：防止极深 alias/newtype 链导致栈溢出。
+/// visiting.len() 即当前递归深度，达到上限时停止递归。
+const MAX_TYPE_RECURSION_DEPTH: usize = 256;
+
 /// 按名解析类型（resolved 版本，含 alias/newtype 链展开）。
 ///
 /// 优先级：type_args 绑定 → 内置标量/str/void → type_defs alias/newtype 递归 →
@@ -1064,6 +1078,10 @@ fn resolve_named_type_resolved(
     }
     // 循环 alias 检测：name 已在 visiting 中说明出现循环，停止递归
     if visiting.contains(name) {
+        return arena.make_adt(name.into(), Box::new([]));
+    }
+    // 递归深度上限：visiting.len() 即当前递归深度，超限停止递归防止栈溢出
+    if visiting.len() >= MAX_TYPE_RECURSION_DEPTH {
         return arena.make_adt(name.into(), Box::new([]));
     }
     visiting.insert(name.to_string());

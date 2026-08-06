@@ -125,13 +125,15 @@ impl<S: LockStrategy> Engine<S> {
                     child.pending_inputs[i] = 0;
                 } else {
                     // Gate（非 select）和普通节点统一：按实际 in-frame 未就绪输入计数
+                    // 帧范围外的输入（effect 链、外层变量）通过帧链穿透访问，不计为 pending
                     let inputs = self.graph.inputs_pool.get(node.inputs_offset, node.input_count);
-                    let mut pending = 0u8;
+                    let mut pending = 0u16;
                     for &inp in inputs {
                         let il = inp.0.wrapping_sub(parent_start) as usize;
                         if il < parent_node_count {
                             if !child.value_table.ready[il] { pending += 1; }
-                        } else { pending += 1; }
+                        }
+                        // 帧范围外（il >= parent_node_count 或下溢）→ 帧链穿透，不计 pending
                     }
                     child.pending_inputs[i] = pending;
                 }
@@ -243,11 +245,15 @@ impl<S: LockStrategy> Engine<S> {
 
     /// 子图完成后：回写返回值到调用方 + 唤醒调用方。
     /// 含 LoopBody 完成检测 + pending_completions 竞态处理。
-    pub(super) fn complete_and_wake_caller(&self, child_frame: Frame, queue: &QueueHandle<'_>) {
-        // LoopBody 完成检测（从 Engine 版本移植）
-        let child_sg_id = child_frame.subgraph_id;
-        let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
-        if child_loop_kind == crate::ir::Ir::LoopKind::LoopBody {
+    /// 使用迭代式处理 LoopBody break/return 传播，避免深度嵌套循环的栈溢出。
+    pub(super) fn complete_and_wake_caller(&self, mut child_frame: Frame, queue: &QueueHandle<'_>) {
+        // LoopBody break/return 传播循环（迭代式，替代递归）
+        loop {
+            let child_sg_id = child_frame.subgraph_id;
+            let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
+            if child_loop_kind != crate::ir::Ir::LoopKind::LoopBody {
+                break; // 非 LoopBody，进入正常完成路径
+            }
             let child_signal = child_frame.control_signal.clone();
             let (loop_fid, _call_node) = child_frame
                 .caller
@@ -260,29 +266,34 @@ impl<S: LockStrategy> Engine<S> {
                         lf.body_frame_id = None;
                         lf.control_signal = child_signal;
                     }
-                    // 递归处理 loop_frame（loop_kind 是 While/Loop/For，非 LoopBody）
-                    if let Some(lf) = loop_frame {
-                        self.complete_and_wake_caller(*lf, queue);
+                    // 迭代处理 loop_frame（loop_kind 通常是 While/Loop/For，非 LoopBody，
+                    // 但若为嵌套 LoopBody 则继续迭代传播，避免递归栈溢出）
+                    match loop_frame {
+                        Some(lf) => {
+                            child_frame = *lf; // 迭代而非递归
+                            continue;
+                        }
+                        None => panic!(
+                            "complete_and_wake_caller: LoopBody break/return 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            loop_fid
+                        ),
                     }
-                    // child_frame (body) 已 drop，不放回
-                    return;
                 }
                 ControlSignal::Continue | ControlSignal::None => {
                     // continue/正常完成 → 循环重置（帧复用）
-                    let mut loop_frame = self.frames.lock().remove(&loop_fid);
+                    let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
+                        panic!(
+                            "complete_and_wake_caller: LoopBody continue/none 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            loop_fid
+                        )
+                    });
                     let mut child = child_frame; // 取得所有权以便修改
-                    if let Some(lf) = loop_frame.as_deref_mut() {
-                        self.reset_loop_iteration(lf, loop_fid, &mut child);
-                    }
-                    if let Some(lf) = loop_frame {
-                        self.frames.lock().insert(loop_fid, lf);
-                        queue.push(loop_fid);
-                    }
+                    self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
+                    self.frames.lock().insert(loop_fid, loop_frame);
+                    queue.push(loop_fid);
                     // body 帧已重置，放回 HashMap（不入队）。
                     // body 的重新执行只应由 loop 帧在 cond 为真时通过
                     // 帧复用路径（start_subgraph / queue.push）触发。
-                    // 若在此入队，会导致 body 双重执行 + 循环退出后
-                    // stale caller 引用（loop 帧已 drop）。
                     let body_id = child.id;
                     self.frames.lock().insert(body_id, Box::new(child));
                     return;
@@ -299,11 +310,13 @@ impl<S: LockStrategy> Engine<S> {
         if let Some((caller_fid, call_node)) = caller {
             let mut caller_frame_opt = self.frames.lock().remove(&caller_fid);
             if caller_frame_opt.is_none() {
-                // 父帧尚未 insert 回 HashMap，存储完成信息等待重试
-                self.pending_completions.lock().insert(
-                    caller_fid,
-                    (call_node, return_value, child_signal),
-                );
+                // 父帧尚未 insert 回 HashMap，存储完成信息等待重试。
+                // 使用 Vec 避免同一 caller 多个子帧并发完成时互相覆盖。
+                self.pending_completions
+                    .lock()
+                    .entry(caller_fid)
+                    .or_insert_with(Vec::new)
+                    .push((call_node, return_value, child_signal));
                 return;
             }
             if let Some(caller_frame) = caller_frame_opt.as_deref_mut() {

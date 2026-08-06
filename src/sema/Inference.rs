@@ -35,6 +35,30 @@ macro_rules! numeric_lit {
 /// 推导上下文：封装类型推导所需的所有状态。
 ///
 /// 生命周期：整个模块的 sema 阶段共享一个 TypeArena，InferContext 持有 &mut 引用。
+/// 实例化模式上下文：单态化函数体类型解析时使用。
+///
+/// 设计：双阶段写入避免别名冲突
+/// - 运行时类型结果暂存到 local_expr_types
+/// - 运行结束后 take_local_expr_types() 转移到 MonomorphInstance.expr_types
+///
+/// 不持有 func_decls（带生命周期引用），Call 分支的单态化触发由外部编排。
+pub struct InstantiationCtx {
+    /// 当前实例的函数名（用于泛型递归短路：func_name == cur_func_name）
+    pub func_name: Box<str>,
+    /// 当前实例的 type_args（与 type_params 等长，按位置对应）
+    pub type_args: Box<[TypeHandle]>,
+    /// 类型参数名 → type_args 索引（快速查找）
+    pub type_param_map: FxHashMap<String, u16>,
+    /// 被调函数所在模块名（跨模块时 expr_types key 必须与 IR Builder 查找一致）
+    pub module_name: String,
+    /// 暂存的表达式类型表（key = module_expr_key(module_name, expr_id)）
+    pub local_expr_types: FxHashMap<u64, ExprInfo>,
+    /// 暂存的 field_accesses 元信息（key = module_expr_key）
+    pub local_field_accesses: FxHashMap<u64, FieldAccessInfo>,
+    /// 循环检测：正在实例化的 cache_key → instance_id（前向引用支持）
+    pub in_progress: FxHashMap<String, u32>,
+}
+
 /// type_binding_stack 和 self_binding_stack 随 impl/trait/fn 块进出而 push/pop。
 /// env 为局部变量环境（EnvArena），expected_return 用于反向推导 return 类型。
 pub struct InferContext<'a> {
@@ -85,6 +109,9 @@ pub struct InferContext<'a> {
     /// "类型名 → 源模块 env"，使 MethodCall 路径 0b 能回退查找模块内自由函数
     /// （类型名 == 文件名时，类型视作模块命名空间）。
     pub ctor_module_envs: FxHashMap<String, EnvId>,
+    /// 实例化模式上下文：None = HM 模式，Some = 实例化模式
+    /// 单态化函数体类型解析时设为 Some，HM 类型检查时为 None
+    pub instantiation_ctx: Option<InstantiationCtx>,
 }
 
 /// 检查类型是否引用了任何未解析的 TypeVar（在 unresolved_set 中）。
@@ -161,6 +188,7 @@ impl<'a> InferContext<'a> {
             current_module_name: String::new(),
             type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
+            instantiation_ctx: None,
         }
     }
 
@@ -213,6 +241,63 @@ impl<'a> InferContext<'a> {
     /// 查询类型参数绑定。
     pub fn lookup_type_binding(&self, name: &str) -> Option<TypeHandle> {
         self.type_binding_stack.lookup(name)
+    }
+
+    // ── 实例化模式（单态化函数体类型解析）──
+
+    /// 进入实例化模式：用具体 type_args 替换类型参数绑定。
+    ///
+    /// 调用前应已 push_type_bindings（rigid var），此方法将栈顶帧的 rigid var
+    /// 替换为 type_args 中的具体 TypeHandle（insert_top 内部 HashMap::insert 覆盖同名 key）。
+    pub fn enter_instantiation_mode(
+        &mut self,
+        func_name: Box<str>,
+        type_args: Box<[TypeHandle]>,
+        type_param_names: &[&str],
+        module_name: String,
+        in_progress: FxHashMap<String, u32>,
+    ) {
+        // 将 type_binding_stack 栈顶的 rigid var 替换为具体 type_args
+        for (i, &name) in type_param_names.iter().enumerate() {
+            if i < type_args.len() {
+                self.type_binding_stack.insert_top(name, type_args[i]);
+            }
+        }
+
+        // 构建 type_param_map
+        let mut type_param_map: FxHashMap<String, u16> = FxHashMap::default();
+        for (i, &name) in type_param_names.iter().enumerate() {
+            type_param_map.insert(name.to_string(), i as u16);
+        }
+
+        self.instantiation_ctx = Some(InstantiationCtx {
+            func_name,
+            type_args,
+            type_param_map,
+            module_name,
+            local_expr_types: FxHashMap::default(),
+            local_field_accesses: FxHashMap::default(),
+            in_progress,
+        });
+    }
+
+    /// 离开实例化模式：取出暂存的 local_expr_types 和 local_field_accesses。
+    ///
+    /// 调用方负责将返回值转移到 MonomorphInstance。
+    pub fn leave_instantiation_mode(
+        &mut self,
+    ) -> Option<(
+        FxHashMap<u64, ExprInfo>,
+        FxHashMap<u64, FieldAccessInfo>,
+        FxHashMap<String, u32>,
+    )> {
+        self.instantiation_ctx.take().map(|ctx| {
+            (
+                ctx.local_expr_types,
+                ctx.local_field_accesses,
+                ctx.in_progress,
+            )
+        })
     }
 
     // ── Self 绑定栈操作 ──
@@ -349,65 +434,6 @@ impl<'a> InferContext<'a> {
                 }
             }
         }
-    }
-
-    // ── 泛型调用推导（phase3c）──
-
-    /// 推导泛型函数调用的类型参数绑定。
-    ///
-    /// **算法**（保留 Zig 延迟求解语义）：
-    /// 1. 为每个泛型参数（按 `generic_params` 顺序）分配 fresh 非刚性 TypeVar
-    /// 2. 构建 rigid var idx → fresh var 的替换映射
-    /// 3. substitute 形参类型后与实参 unify，求解 fresh var
-    /// 4. 未求解的 fresh var 保留（延迟到后续 unify 或最终报错）
-    ///
-    /// **参数**：
-    /// - `generic_params`：形参声明中的泛型参数 TypeHandle 列表（rigid var），按函数声明顺序
-    /// - `param_types`：形参类型列表（其中引用了 generic_params 中的 rigid var）
-    /// - `arg_types`：实参类型列表
-    ///
-    /// **返回值**：`Some(Vec<TypeHandle>)` 表示推导的类型实参列表（与 generic_params 等长）；
-    /// `None` 表示非泛型函数。
-    pub fn infer_call_type_args(
-        &mut self,
-        generic_params: &[TypeHandle],
-        param_types: &[TypeHandle],
-        arg_types: &[TypeHandle],
-    ) -> Option<Vec<TypeHandle>> {
-        if generic_params.is_empty() {
-            return None;
-        }
-
-        // 1. 为每个泛型参数分配 fresh 非刚性 TypeVar，建立 rigid idx → fresh var 映射
-        let mut subst: FxHashMap<u32, TypeHandle> = FxHashMap::default();
-        let type_args: Vec<TypeHandle> = generic_params
-            .iter()
-            .map(|&rigid_ty| {
-                let fresh = self.arena.fresh_type_var();
-                let resolved = self.arena.resolve(rigid_ty);
-                if let Ty::TypeVar(idx) = self.arena.get(resolved) {
-                    subst.insert(idx, fresh);
-                }
-                fresh
-            })
-            .collect();
-
-        // 2. unify 实参与形参（形参已通过 subst 替换为非刚性 var）
-        let n = param_types.len().min(arg_types.len());
-        for i in 0..n {
-            let param_ty = self.substitute_type(param_types[i], &subst);
-            let arg_ty = arg_types[i];
-            // unify 成功立即绑定，失败注册约束供不动点迭代重试
-            self.unify_or_constrain(param_ty, arg_ty);
-        }
-
-        // 3. resolve 所有 TypeVar（未绑定的保持 TypeVar）
-        let mut result: Vec<TypeHandle> = Vec::with_capacity(type_args.len());
-        for &ta in type_args.iter() {
-            result.push(self.arena.resolve(ta));
-        }
-
-        Some(result)
     }
 
     /// 递归收集类型中的所有 TypeVar idx，填入 subst（值为占位 TypeHandle(0)，仅用 key）。
@@ -1100,6 +1126,10 @@ impl<'a> InferContext<'a> {
     ///   （其他约束可能先绑定相关 TypeVar，使后续 unify 成功）
     #[inline]
     pub fn unify_or_constrain(&mut self, t1: TypeHandle, t2: TypeHandle) {
+        // 实例化模式：跳过 HM 约束求解（类型已在 sema HM 阶段检查）
+        if self.instantiation_ctx.is_some() {
+            return;
+        }
         if self.arena.unify(t1, t2).is_err() {
             self.solver.add_equality(t1, t2);
         }
@@ -1443,8 +1473,20 @@ impl<'a> InferContext<'a> {
             is_ref_type: is_ref,
             is_raw_ref,
         };
-        let key = module_expr_key(&self.current_module_name, expr.0 as u64);
-        self.sema_result.put_expr(key, info);
+        let key = if let Some(ref ictx) = self.instantiation_ctx {
+            // 实例化模式：用实例模块名计算 key，写入实例本地暂存表 + 全局 resolved_types
+            module_expr_key(&ictx.module_name, expr.0 as u64)
+        } else {
+            // HM 模式：用当前模块名计算 key
+            module_expr_key(&self.current_module_name, expr.0 as u64)
+        };
+
+        if let Some(ref mut ictx) = self.instantiation_ctx {
+            ictx.local_expr_types.insert(key, info);
+            self.sema_result.resolved_types.insert(key, resolved);
+        } else {
+            self.sema_result.put_expr(key, info);
+        }
     }
 
     // ── infer_expr ──
@@ -1516,6 +1558,17 @@ impl<'a> InferContext<'a> {
                 }
                 if let Some(scheme) = self.env.lookup(env, name) {
                     return self.freshen_type(scheme);
+                }
+                // 实例化模式：临时 InferContext 的 env 不含模块级声明，
+                // 从 sema_result 查询（HM 阶段已解析）
+                if self.instantiation_ctx.is_some() {
+                    // 从 expr_types 查询（HM 阶段已解析该表达式的类型）
+                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                    if let Some(info) = self.sema_result.get_expr(key) {
+                        return info.ty;
+                    }
+                    // 实例化模式下不报错，返回 fresh_type_var
+                    return self.arena.fresh_type_var();
                 }
                 let span = ast.expr(expr).span;
                 self.add_error_at(&format!("undefined variable '{}'", name), span.line, span.column);
@@ -1674,6 +1727,43 @@ impl<'a> InferContext<'a> {
                 let callee_ty = self.infer_expr(*callee, ast, env, None);
                 let resolved_callee = self.arena.resolve(callee_ty);
 
+                // 实例化模式：跳过 HM unify（类型已在 sema HM 阶段检查），
+                // 仅推断参数类型并返回返回类型。单态化触发由外部编排。
+                if self.instantiation_ctx.is_some() {
+                    // ModuleRef 调用：从模块 env 查找函数签名
+                    if let Ty::ModuleRef(_) = self.arena.get(resolved_callee) {
+                        let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
+                        if let Some(func_name) = path.rsplit('.').next() {
+                            if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                        let _ = self.infer_expr(arg, ast, env, Some(param_ty));
+                                    }
+                                    return return_type;
+                                }
+                            }
+                        }
+                    }
+                    // 普通函数调用：推断参数类型，返回返回类型
+                    let inst_callee = self.instantiate_fn_type(resolved_callee);
+                    if let Ty::Fn(_) = self.arena.get(inst_callee) {
+                        let (params, return_type) = self.arena.fn_parts(inst_callee);
+                        let params: Vec<TypeHandle> = params.to_vec();
+                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                            let _ = self.infer_expr(arg, ast, env, Some(param_ty));
+                        }
+                        return return_type;
+                    }
+                    // 兜底：推断所有参数，返回 fresh var
+                    for &a in args.iter() {
+                        let _ = self.infer_expr(a, ast, env, None);
+                    }
+                    return self.arena.fresh_type_var();
+                }
+
                 // ModuleRef 调用：callee 是模块路径引用（如 "std.reflect.Reflect.format"），
                 // 直接在 ModuleRef 携带的模块 env 中按末段裸名查找函数签名（不穿透父 env）
                 if let Ty::ModuleRef(_) = self.arena.get(resolved_callee) {
@@ -1743,8 +1833,15 @@ impl<'a> InferContext<'a> {
                 // 直接在 ModuleRef 携带的模块 env 中按 method 裸名查找（不穿透父 env）。
                 let recv_resolved_0a = self.arena.resolve(recv_ty);
                 if let Ty::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
-                    let (_, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
-                    if let Some(fn_ty) = self.env.lookup_local(module_env, method) {
+                    let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
+                    let found = self.env.lookup_local(module_env, method);
+                    // 目录模块语义：当 lookup_local 在当前模块 env 未命中时，
+                    // 搜索同目录兄弟模块的 env（如 Math.sqrt 中 sqrt 在 Power.glue，
+                    // Math 与 Power 同属 std.math 目录）。
+                    let found = found.or_else(|| {
+                        self.lookup_sibling_module_fn(mod_path, module_env, method)
+                    });
+                    if let Some(fn_ty) = found {
                         let inst_fn = self.instantiate_fn_type(fn_ty);
                         if let Ty::Fn(_) = self.arena.get(inst_fn) {
                             let (params, return_type) = self.arena.fn_parts(inst_fn);
@@ -1754,6 +1851,13 @@ impl<'a> InferContext<'a> {
                                 let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
                                 self.unify_or_constrain(params[i], arg_ty);
                             }
+                            // 标记 recv 为模块函数调用接收者，IR 编译时不传 recv
+                            //（与路径 0b 一致：ModuleRef recv 的 Module.fun(args) 语义）
+                            let recv_key = module_expr_key(
+                                &self.current_module_name,
+                                recv.0 as u64,
+                            );
+                            self.sema_result.module_func_recv_exprs.insert(recv_key);
                             return return_type;
                         }
                     }
@@ -1878,6 +1982,21 @@ impl<'a> InferContext<'a> {
             // ── 字段访问 ──
             Expr::FieldAccess { recv, field } => {
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                // 检测 ModuleRef 接收者：Math.PI 这样的跨模块常量访问。
+                // 命中时把 recv 的 expr key → mangled 名（module_path.field）记入
+                // module_const_recv_exprs，供 IR 编译时跳过 recv 直接发 global_load。
+                let recv_resolved = self.arena.resolve(recv_ty);
+                if let Ty::ModuleRef(_) = self.arena.get(recv_resolved) {
+                    let (path, module_env) = self.arena.module_ref_parts(recv_resolved);
+                    if self.env.lookup_local(module_env, field).is_some() {
+                        let mangled = format!("{}.{}", path, field);
+                        let recv_key = crate::sema::Sema::module_expr_key(
+                            &self.current_module_name,
+                            recv.0 as u64,
+                        );
+                        self.sema_result.module_const_recv_exprs.insert(recv_key, mangled);
+                    }
+                }
                 let span = ast.expr(expr).span;
                 self.lookup_field_type(recv_ty, field, span.line, span.column)
             }
@@ -3200,6 +3319,41 @@ impl<'a> InferContext<'a> {
         parent_env
     }
 
+    /// 目录模块语义：在兄弟模块的 env 中查找函数。
+    ///
+    /// 当 `Math.sqrt` 中 `sqrt` 定义在 `Power.glue`（而非 `Math.glue`）时，
+    /// 从 `mod_path`（如 "std.math.Math"）推导目录前缀（"std.math"），
+    /// 遍历同目录下所有兄弟模块（"std.math.Power", "std.math.Trig", ...）的 env，
+    /// 按 `method` 裸名查找函数。跳过自身 env（已由调用方 lookup_local 查过）。
+    fn lookup_sibling_module_fn(
+        &self,
+        mod_path: &str,
+        self_env: EnvId,
+        method: &str,
+    ) -> Option<TypeHandle> {
+        // 推导目录前缀：mod_path 的最后一个 '.' 之前部分
+        let dot_pos = mod_path.rfind('.')?;
+        let dir_prefix = &mod_path[..dot_pos]; // 如 "std.math"
+        let sibling_prefix = format!("{}.", dir_prefix); // "std.math."
+
+        // 遍历 module_envs 中以 "std.math." 开头的兄弟模块
+        for (path, &env_id) in self.module_envs.iter() {
+            if !path.starts_with(&sibling_prefix) {
+                continue;
+            }
+            if path == mod_path {
+                continue; // 跳过自身
+            }
+            if env_id == self_env {
+                continue; // 跳过自身 env
+            }
+            if let Some(ty) = self.env.lookup_local(env_id, method) {
+                return Some(ty);
+            }
+        }
+        None
+    }
+
     /// 注册模块路径别名到环境（用于同包模块符号可见性）。
     ///
     /// 为每个模块路径创建层级 env，并在 root_env 中注册末段短名 → ModuleRef，
@@ -3242,7 +3396,8 @@ impl<'a> InferContext<'a> {
         self.reset_state();
         let root_env = self.env.root();
         self.register_builtins(root_env);
-        self.check_module_with_env(module, root_env)
+        let all_modules = [module];
+        self.check_module_with_env(module, root_env, &all_modules)
     }
 
     /// 多模块共享 env 检查入口。
@@ -3250,7 +3405,12 @@ impl<'a> InferContext<'a> {
     /// 接受外部共享的 `root_env`（已注册 builtins 和前置模块的符号），
     /// 在此基础上处理 import、预声明、检查当前模块。
     /// 跨模块符号通过共享 env 链查找。
-    pub fn check_module_with_env(&mut self, module: &Module<'_>, root_env: EnvId) -> bool {
+    pub fn check_module_with_env<'m>(
+        &mut self,
+        module: &'m Module<'m>,
+        root_env: EnvId,
+        all_modules: &[&'m Module<'m>],
+    ) -> bool {
         // 1. 填充定义表（若尚未填充）
         populate_module(self.arena, self.sema_result, module);
 
@@ -3284,7 +3444,7 @@ impl<'a> InferContext<'a> {
         self.run_kind_checks(module);
 
         // 8. 收集单态化实例（泛型函数实例，不依赖 witness_table）
-        crate::sema::Monomorph::collect_monomorph_instances(module, self.sema_result, self.arena);
+        crate::sema::Monomorph::collect_monomorph_instances(module, all_modules, self.sema_result, self.arena);
 
         // 9. 求解延迟约束（带 witness table 支持 trait bound 求解）
         // 分离借用 self 的不同字段：arena 可变借用，witness_table 只读借用

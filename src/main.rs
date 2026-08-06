@@ -507,9 +507,26 @@ fn run_sema_pipeline(
     }
     populate_module(ctx.arena, ctx.sema_result, entry_module);
 
+    // 构造 all_modules 列表：供跨模块单态化使用（泛型调用需访问被调函数所在模块的 arena）
+    let mut all_modules: Vec<&Module> = Vec::new();
+    for (_, m) in loader.builtin_modules() {
+        all_modules.push(m);
+    }
+    for key in std_keys {
+        if let Some(m) = loader.get_module_by_key(key) {
+            all_modules.push(m);
+        }
+    }
+    for k in dep_keys {
+        if let Some(m) = loader.get_module_by_key(k) {
+            all_modules.push(m);
+        }
+    }
+    all_modules.push(entry_module);
+
     // check: builtin → std → dep → entry
     for (path, m) in loader.builtin_modules() {
-        ctx.check_module_with_env(m, root_env);
+        ctx.check_module_with_env(m, root_env, &all_modules);
         for err in &ctx.sema_result.errors[prev_err_len..] {
             eprintln!("{}:{}:{}: {}", path, err.line, err.column, err.message);
         }
@@ -517,7 +534,7 @@ fn run_sema_pipeline(
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            ctx.check_module_with_env(m, root_env);
+            ctx.check_module_with_env(m, root_env, &all_modules);
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
             }
@@ -526,14 +543,14 @@ fn run_sema_pipeline(
     }
     for k in dep_keys {
         if let Some(m) = loader.get_module_by_key(k) {
-            ctx.check_module_with_env(m, root_env);
+            ctx.check_module_with_env(m, root_env, &all_modules);
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", k, err.line, err.column, err.message);
             }
             prev_err_len = ctx.sema_result.errors.len();
         }
     }
-    ctx.check_module_with_env(entry_module, root_env);
+    ctx.check_module_with_env(entry_module, root_env, &all_modules);
     for err in &ctx.sema_result.errors[prev_err_len..] {
         eprintln!("{}:{}:{}: {}", entry_filename, err.line, err.column, err.message);
     }

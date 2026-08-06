@@ -76,5 +76,14 @@ fun main(): void {
     check(cast(true).to(str) == "true", "bool true to str")
     check(cast(false).to(str) == "false", "bool false to str")
 
+    // 嵌套泛型 cast：cast(cast(x).to(f64)).to(T)
+    check(double_cast(3.14) == 3.14, "nested cast f64 roundtrip")
+    check(double_cast(42) == 42, "nested cast i32 roundtrip")
+
     summary()
+}
+
+// 嵌套泛型 cast：cast(cast(x).to(f64)).to(T)
+fun double_cast<T>(x: T): T {
+    cast(cast(x).to(f64)).to(T)
 }

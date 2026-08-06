@@ -66,6 +66,14 @@ pub struct IrBuilder<'a> {
     /// compile_function 入口设 true，Return value 设 true，
     /// Block trailing 继承，If/Match 分支继承，参数/条件/赋值右侧设 false。
     pub in_tail_position: bool,
+    /// 当前正在编译的单态化实例的类型参数映射（类型参数名 → TypeHandle）。
+    /// 为空表示不在泛型实例上下文中（普通非泛型函数）。
+    /// compile_cast_call 解析 target 类型参数时查此表替换为具体类型；
+    /// expr_type_name 在 sema.expr_types 未命中时回退查实例局部 expr_types。
+    pub current_type_args: Vec<(String, crate::sema::Sema::TypeHandle)>,
+    /// 当前正在编译的单态化实例 ID（None = 非泛型函数）。
+    /// 用作 sema.monomorph_instances 的索引，查实例局部 expr_types。
+    pub current_instance_id: Option<u32>,
     /// 编译期错误列表（未实现特性、找不到函数等，编译结束后可检查）
     pub errors: Vec<String>,
     /// 全局变量名 → slot index 映射（顶层 var/val 声明，跨函数共享）
@@ -141,6 +149,8 @@ impl<'a> IrBuilder<'a> {
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
+            current_type_args: Vec::new(),
+            current_instance_id: None,
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
@@ -452,7 +462,7 @@ impl<'a> IrBuilder<'a> {
                 self.compile_call(expr_id, *callee, args)
             }
             crate::ast::Ast::Expr::MethodCall { recv, method, args, .. } => {
-                self.compile_method_call(*recv, method, args)
+                self.compile_method_call(expr_id, *recv, method, args)
             }
 
             // 字段访问
@@ -748,7 +758,7 @@ impl<'a> IrBuilder<'a> {
 
             // 安全方法调用 recv?.method(args)：编译为普通方法调用 + safe 标记
             crate::ast::Ast::Expr::SafeMethodCall { recv, method, args, .. } => {
-                let node = self.compile_method_call(*recv, method, args);
+                let node = self.compile_method_call(expr_id, *recv, method, args);
                 self.graph.set_safe_op(node);
                 node
             }
@@ -867,10 +877,28 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Expr::FloatLit { raw, suffix } => {
                 // 去除下划线分隔符（Rust parse 不接受下划线）
                 let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+                let is_hex = cleaned.starts_with("0x") || cleaned.starts_with("0X");
                 match suffix {
-                    None | Some("f64") => cleaned.parse::<f64>().ok().map(ConstValue::F64),
-                    Some("f32") => cleaned.parse::<f32>().ok().map(ConstValue::F32),
-                    _ => cleaned.parse::<f64>().ok().map(ConstValue::F64),
+                    None | Some("f64") => {
+                        if is_hex { parse_hex_float_f64(&cleaned).map(ConstValue::F64) }
+                        else { cleaned.parse::<f64>().ok().map(ConstValue::F64) }
+                    }
+                    Some("f32") => {
+                        if is_hex { parse_hex_float_f32(&cleaned).map(ConstValue::F32) }
+                        else { cleaned.parse::<f32>().ok().map(ConstValue::F32) }
+                    }
+                    Some("f16") => {
+                        if is_hex { parse_hex_float_f16(&cleaned).map(ConstValue::F16) }
+                        else { Some(crate::value::F16::from_f64(cleaned.parse::<f64>().ok()?).to_bits()).map(ConstValue::F16) }
+                    }
+                    Some("f128") => {
+                        if is_hex { parse_hex_float_f128(&cleaned).map(ConstValue::F128) }
+                        else { parse_decimal_f128(&cleaned).map(ConstValue::F128) }
+                    }
+                    _ => {
+                        if is_hex { parse_hex_float_f64(&cleaned).map(ConstValue::F64) }
+                        else { cleaned.parse::<f64>().ok().map(ConstValue::F64) }
+                    }
                 }
             }
             crate::ast::Ast::Expr::BoolLit(b) => Some(ConstValue::Bool(*b)),
@@ -1798,7 +1826,7 @@ impl<'a> IrBuilder<'a> {
     /// - (Some("Iterator"), true) → vtable 动态分派（inline_trait 值）
     /// - (None, false) → 类型推断失败，走 vtable 兜底
     fn lookup_expr_iter_info(&self, expr: crate::ast::Ast::ExprId) -> (Option<String>, bool) {
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, expr.0 as u64);
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
             return (info.type_name.as_deref().map(|s| s.to_string()), info.is_trait_object);
         }
@@ -2701,6 +2729,21 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
+    /// 返回用于 expr_types 复合 key 的模块名。
+    ///
+    /// 单态化实例上下文中，函数体表达式属于被调函数所在模块，
+    /// expr_types 的 key 必须用实例的 module_name（而非调用点模块名），
+    /// 否则跨模块泛型调用时类型查找失败（如 Math.abs 调用 cast(x).to(i32)
+    /// 时 source_ty 解析为 void）。
+    fn expr_key_module(&self) -> &'a str {
+        if let Some(inst_id) = self.current_instance_id {
+            if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
+                return &*inst.module_name;
+            }
+        }
+        self.current_module().name
+    }
+
     /// 查询表达式的类型名（来自 Sema）。
     ///
     /// 优先取 ExprInfo.type_name（adt/generic 等场景），无记录时回退到 "unknown"。
@@ -2716,15 +2759,30 @@ impl<'a> IrBuilder<'a> {
                 }
             }
         }
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, expr_id.0 as u64);
-        self.sema.expr_types.get(&key).map(|info| {
-            // 优先使用 type_name（用户类型携带具体名，如 "DateTime"）；
-            // 为 None 时从 Ty 变体名派生（如 "array"/"nullable"/"Channel"）。
-            info.type_name
-                .as_deref()
-                .map(|n| n)
-                .unwrap_or_else(|| self.type_arena.get(info.ty).name())
-        })
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        // 实例上下文：优先查实例局部 expr_types（类型参数已替换为具体类型）
+        if let Some(inst_id) = self.current_instance_id {
+            if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
+                if let Some(info) = inst.expr_types.get(&key) {
+                    return Some(
+                        info.type_name
+                            .as_deref()
+                            .map(|n| n)
+                            .unwrap_or_else(|| self.type_arena.get(info.ty).name()),
+                    );
+                }
+            }
+        }
+        // 全局 expr_types 回退
+        if let Some(info) = self.sema.expr_types.get(&key) {
+            return Some(
+                info.type_name
+                    .as_deref()
+                    .map(|n| n)
+                    .unwrap_or_else(|| self.type_arena.get(info.ty).name()),
+            );
+        }
+        None
     }
 
     /// 判断表达式是否为 nullable 类型（Ty::Nullable）。
@@ -2732,7 +2790,7 @@ impl<'a> IrBuilder<'a> {
     /// 产生 Value::Null，str/i32 等专用比较函数不处理 Null 导致结果错误。
     /// 分派到 CF_EQ_OBJ/CF_NE_OBJ（value_equals_with_arena 正确处理 Null）。
     fn expr_is_nullable(&self, expr_id: crate::ast::Ast::ExprId) -> bool {
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, expr_id.0 as u64);
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
         self.sema
             .expr_types
             .get(&key)
@@ -2747,6 +2805,16 @@ impl<'a> IrBuilder<'a> {
         match crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
             Some(m) => m.family,
             None => crate::types::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
+        }
+    }
+
+    /// 从类型名获取 TypeFamily（含 Str 等非标量内置类型）。
+    /// 与 int_family 不同，此方法直接用 ValueTag::from_name + family()，
+    /// 不经过 scalar_meta，因此对 str 返回 TypeFamily::Str 而非回退到 SignedInt32。
+    fn type_family(ty_name: &str) -> crate::types::TypeFamily {
+        match crate::value::ValueTag::from_name(ty_name) {
+            Some(tag) => tag.family(),
+            None => crate::types::TypeFamily::SignedInt32,
         }
     }
 
@@ -2792,13 +2860,15 @@ impl<'a> IrBuilder<'a> {
         }
 
         // str + str → 字符串拼接（compute_str_concat, 269）
-        if ty_name == "str" && matches!(op, crate::ast::Ast::BinaryOp::Add) {
+        if Self::type_family(ty_name) == crate::types::TypeFamily::Str
+            && matches!(op, crate::ast::Ast::BinaryOp::Add)
+        {
             return CF_STR_CONCAT;
         }
 
         // str 比较 → 专用 str 比较 compute_fn（292-297）
         // 不走 i32 路径：str 无 as_i32 语义，走 i32 会恒为 0 导致结果错误
-        if ty_name == "str" {
+        if Self::type_family(ty_name) == crate::types::TypeFamily::Str {
             return match op {
                 crate::ast::Ast::BinaryOp::Eq => CF_EQ_STR,
                 crate::ast::Ast::BinaryOp::NotEq => CF_NE_STR,
@@ -2876,6 +2946,7 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::BinaryOp::NotEq => {
                 if is_float { CF_NE_F64 }     // ne_f64
+                else if fam == TypeFamily::Bool { CF_NE_BOOL } // ne_bool
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_NE_I128 } // ne_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_NE_I64 }  // ne_i64
                 else { CF_NE_I32 }              // ne_i32
@@ -2969,8 +3040,8 @@ impl<'a> IrBuilder<'a> {
                 if matches!(op, crate::ast::Ast::BinaryOp::Add) {
                     let lhs_ty = self.expr_type_name(lhs).unwrap_or("");
                     let rhs_ty = self.expr_type_name(rhs).unwrap_or("");
-                    let lhs_is_str = lhs_ty == "str";
-                    let rhs_is_str = rhs_ty == "str";
+                    let lhs_is_str = Self::type_family(lhs_ty) == crate::types::TypeFamily::Str;
+                    let rhs_is_str = Self::type_family(rhs_ty) == crate::types::TypeFamily::Str;
                     if lhs_is_str || rhs_is_str {
                         let lhs_node = self.compile_subexpr(lhs);
                         let rhs_node = self.compile_subexpr(rhs);
@@ -3097,6 +3168,7 @@ impl<'a> IrBuilder<'a> {
         type_args: Option<&[crate::ast::Ast::TypeRef]>,
     ) -> NodeId {
         // 获取目标类型名
+        // 泛型上下文中，target 可能是类型参数名（如 "T"），需查 current_type_args 替换为具体类型名
         let target_ty = type_args
             .and_then(|ta| ta.first())
             .and_then(|&tid| {
@@ -3107,7 +3179,16 @@ impl<'a> IrBuilder<'a> {
                     None
                 }
             })
-            .unwrap_or("i64");
+            .map(|name| {
+                // 类型参数替换：查 current_type_args（单态化实例上下文）
+                if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
+                    if let Some(resolved) = self.type_arena.type_name(*h) {
+                        return resolved.to_string();
+                    }
+                }
+                name.to_string()
+            })
+            .unwrap_or_else(|| "i64".to_string());
 
         // 获取源类型名（从 Sema expr_types）
         let source_ty = self.expr_type_name(args[0]).unwrap_or("i64").to_string();
@@ -3115,7 +3196,7 @@ impl<'a> IrBuilder<'a> {
         let input = self.compile_subexpr(args[0]);
 
         // 通用路径 1：任意类型 → str
-        if target_ty == "str" {
+        if Self::type_family(&target_ty) == crate::types::TypeFamily::Str {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
             return self.graph.add_node(Node {
                 kind: NodeKind::UnOp,
@@ -3127,7 +3208,7 @@ impl<'a> IrBuilder<'a> {
 
         // 通用路径 2：标量 → 标量（int↔int, int↔float, float↔float, bool↔int, char↔int）
         if Self::ty_name_to_scalar_tag(&source_ty).is_some()
-            && Self::ty_name_to_scalar_tag(target_ty).is_some()
+            && Self::ty_name_to_scalar_tag(&target_ty).is_some()
         {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
             let node = self.graph.add_node(Node {
@@ -3136,12 +3217,12 @@ impl<'a> IrBuilder<'a> {
                 inputs_offset,
                 compute_fn: CF_CAST_SCALAR, // compute_cast_scalar
             });
-            self.graph.set_cast_target_type(node, target_ty.to_string());
+            self.graph.set_cast_target_type(node, target_ty.clone());
             return node;
         }
 
         // 特殊路径：u8[]/bytes → str 等 FFI cast
-        let mangled = cast_mangled_name(&source_ty, target_ty);
+        let mangled = cast_mangled_name(&source_ty, &target_ty);
         let inputs_offset = self.graph.inputs_pool.push(&[input]);
         let call_node = self.graph.add_node(Node {
             kind: NodeKind::Call,
@@ -3165,13 +3246,24 @@ impl<'a> IrBuilder<'a> {
         callee: crate::ast::Ast::ExprId,
         args: &[crate::ast::Ast::ExprId],
     ) -> NodeId {
+        // 泛型调用优先走单态化实例路径：inline expansion 不处理类型参数替换，
+        // 对泛型函数 inline 会导致 body 中类型参数 T 无法解析为具体类型。
+        let call_inst_key = crate::sema::Sema::module_expr_key(
+            self.expr_key_module(),
+            call_expr_id.0 as u64,
+        );
+        let is_generic_call = self.sema.call_instantiations.contains_key(&call_inst_key);
+
         // ── 内联展开：分析器标记的调用点，直接编译 callee body 而非 launch 子图 ──
         // 纯函数 + 小体 + 非递归 → 绑定实参到形参，编译 body，避免调用开销
-        if let Some(callee_func) = self.inline_target(call_expr_id) {
-            if let crate::ast::Ast::Decl::FunDecl { params, body, .. } =
-                &self.module.declarations[callee_func.0 as usize].node
-            {
-                return self.compile_inline_expansion(*body, params, args);
+        // 泛型调用跳过 inline（类型参数需通过 monomorph 实例子图替换）
+        if !is_generic_call {
+            if let Some(callee_func) = self.inline_target(call_expr_id) {
+                if let crate::ast::Ast::Decl::FunDecl { params, body, .. } =
+                    &self.module.declarations[callee_func.0 as usize].node
+                {
+                    return self.compile_inline_expansion(*body, params, args);
+                }
             }
         }
 
@@ -3369,8 +3461,12 @@ impl<'a> IrBuilder<'a> {
         });
 
         // 绑定目标子图（如果 callee 是已知函数名）
+        // 优先查 call_instantiations：泛型调用点 → 单态化实例，用 mangled name 绑定特化子图
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
-            if let Some(&target_sg) = self.func_subgraphs.get(*name) {
+            let inst_id = self.sema.call_instantiations.get(&call_inst_key);
+            let mangled = inst_id.map(|&id| format!("{}#{}", name, id));
+            let target_key: &str = mangled.as_deref().unwrap_or(name);
+            if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
                 self.graph.set_call_target(call_node, target_sg);
                 // async 函数：切换 compute_fn 为 compute_async_call_launch（idx 39）
                 let is_async = if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
@@ -3453,6 +3549,7 @@ impl<'a> IrBuilder<'a> {
     /// - 类型/trait 方法编译为 Call 节点，通过 (type_id, method_idx) 查 method_subgraphs
     fn compile_method_call(
         &mut self,
+        call_expr_id: crate::ast::Ast::ExprId,
         recv: crate::ast::Ast::ExprId,
         method: &str,
         args: &[crate::ast::Ast::ExprId],
@@ -3477,15 +3574,24 @@ impl<'a> IrBuilder<'a> {
         }
 
         // 路径 0：模块函数调用（recv 是构造器/模块命名空间，不传 recv）
-        // sema MethodCall 路径 0b 标记的 recv：TypeName.free_func(args) → free_func(args)
-        // 不把 recv 作为参数传递（from_millis 是自由函数，不接收 Duration 构造器）
+        // sema MethodCall 路径 0a/0b 标记的 recv：ModuleRef.free_func(args) / TypeName.free_func(args)
+        // 不把 recv 作为参数传递（free_func 是自由函数，不接收 recv）
+        // 泛型调用优先查 call_instantiations 用 mangled name 绑定特化子图，
+        // 非泛型调用回退裸名（与 compile_call 的 mangled 查找逻辑一致）
         {
             let recv_key = crate::sema::Sema::module_expr_key(
-                self.current_module().name,
+                self.expr_key_module(),
                 recv.0 as u64,
             );
             if self.sema.module_func_recv_exprs.contains(&recv_key) {
-                if let Some(&target_sg) = self.func_subgraphs.get(method) {
+                let call_inst_key = crate::sema::Sema::module_expr_key(
+                    self.expr_key_module(),
+                    call_expr_id.0 as u64,
+                );
+                let inst_id = self.sema.call_instantiations.get(&call_inst_key);
+                let mangled = inst_id.map(|&id| format!("{}#{}", method, id));
+                let target_key: &str = mangled.as_deref().unwrap_or(method);
+                if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
                     let mut inputs = Vec::with_capacity(args.len() + 1);
                     for &arg in args {
                         inputs.push(self.compile_subexpr(arg));
@@ -3684,7 +3790,7 @@ impl<'a> IrBuilder<'a> {
     ///
     /// 查 recv 的类型名，若为 sema.trait_defs 中已注册的 trait 名则需走 vtable 动态分派。
     fn is_trait_object_recv(&self, recv: crate::ast::Ast::ExprId) -> bool {
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, recv.0 as u64);
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(tn) = &info.type_name {
                 return self
@@ -3715,7 +3821,7 @@ impl<'a> IrBuilder<'a> {
                 }
             }
         }
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, expr.0 as u64);
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         let info = self.sema.expr_types.get(&key)?;
         // 与 expr_type_name 一致：优先 type_name，fallback 到 Ty::name()
         // （array/nullable/str/Throw 等内置结构变体通过 Ty::name() 返回注册名，
@@ -3779,7 +3885,7 @@ impl<'a> IrBuilder<'a> {
     /// 默认 → AsyncJoin（5a-2 主要支持 await async handle）
     fn infer_event_source_kind(&self, recv: crate::ast::Ast::ExprId) -> EventSourceKind {
         // 查 Sema expr_types 获取 recv 的类型名
-        let key = crate::sema::Sema::module_expr_key(self.current_module().name, recv.0 as u64);
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
@@ -3810,6 +3916,18 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         field: &str,
     ) -> NodeId {
+        // 跨模块常量访问（Math.PI）：sema 已把 recv 的 expr key → mangled 名记入
+        // module_const_recv_exprs。命中时跳过 recv 编译，直接用 mangled 名查
+        // global_var_slots 发 compile_global_load，与本地全局变量访问同路径。
+        let recv_key = crate::sema::Sema::module_expr_key(
+            self.expr_key_module(),
+            recv.0 as u64,
+        );
+        if let Some(mangled) = self.sema.module_const_recv_exprs.get(&recv_key) {
+            if let Some(&slot) = self.global_var_slots.get(mangled.as_str()) {
+                return self.compile_global_load(slot);
+            }
+        }
         let recv_node = self.compile_subexpr(recv);
         let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
         let node = self.graph.add_node(Node {
@@ -4466,7 +4584,7 @@ impl<'a> IrBuilder<'a> {
         let is_void_fn = match return_type {
             None => true,
             Some(tr) => {
-                matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if name == "void")
+                matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
         let return_node = {
@@ -4490,6 +4608,128 @@ impl<'a> IrBuilder<'a> {
 
         self.func_subgraphs.insert(name.to_string(), sg_id);
         sg_id
+    }
+
+    /// 编译单态化实例为特化子图。
+    ///
+    /// 与 `compile_function` 的区别：
+    /// - 使用 mangled name（`func_name#instance_id`）注册到 func_subgraphs，避免与非泛型版本冲突
+    /// - 设置 `current_type_args`（类型参数名 → TypeHandle），供 cast/expr_type_name 查询
+    /// - 编译完成后清空 `current_type_args`
+    ///
+    /// 仅对有 type_args 的泛型实例调用（非泛型实例由 compile_function 处理）。
+    fn compile_monomorph_instance(&mut self, instance: &crate::sema::Sema::MonomorphInstance) {
+        let func_name = instance.func_name.as_ref();
+
+        // 查找函数声明位置（用户模块或 builtin 模块）
+        let location = match self.find_function_location(func_name) {
+            Some(loc) => loc,
+            None => {
+                self.errors.push(format!("monomorph instance function {} not found", func_name));
+                return;
+            }
+        };
+
+        let module = match location {
+            None => self.module,
+            Some(i) => self.builtin_modules[i],
+        };
+
+        let prev_builtin = self.compiling_builtin;
+        self.compiling_builtin = match location {
+            None => None,
+            Some(i) => Some(self.builtin_modules[i]),
+        };
+
+        let (body_expr, is_async, params, return_type) = match module.find_function(func_name) {
+            Some(d) => match &d.node {
+                crate::ast::Ast::Decl::FunDecl {
+                    body, is_async, params, return_type, ..
+                } => (*body, *is_async, params.clone(), *return_type),
+                _ => {
+                    self.errors.push(format!("{} is not a function", func_name));
+                    self.compiling_builtin = prev_builtin;
+                    return;
+                }
+            },
+            None => {
+                self.errors.push(format!("monomorph instance function {} not found", func_name));
+                self.compiling_builtin = prev_builtin;
+                return;
+            }
+        };
+        let param_count = params.len();
+
+        // 构造类型参数映射：type_params 名 → type_args TypeHandle
+        // type_params 从 FuncSigInfo 获取（与 instance.type_args 顺序一致）
+        let type_param_names: Vec<String> = self.sema.get_func_sig(func_name)
+            .map(|sig| sig.type_params.iter().map(|n| n.to_string()).collect())
+            .unwrap_or_default();
+        let prev_type_args = std::mem::take(&mut self.current_type_args);
+        self.current_type_args = type_param_names.iter().zip(instance.type_args.iter())
+            .map(|(name, &h)| (name.clone(), h))
+            .collect();
+        let prev_instance_id = self.current_instance_id;
+        self.current_instance_id = Some(instance.instance_id);
+
+        // mangled name：func_name#instance_id（与 sema 的 cache_key func_name#hash 格式一致）
+        let mangled = format!("{}#{}", func_name, instance.instance_id);
+
+        // 预注册子图（复用占位符机制）
+        let sg_id = if let Some(&existing) = self.func_subgraphs.get(mangled.as_str()) {
+            existing
+        } else {
+            let new_id = self.register_subgraph_placeholder(&mangled, param_count as u8, is_async);
+            self.func_subgraphs.insert(mangled.clone(), new_id);
+            new_id
+        };
+        let node_start = self.graph.nodes.len() as u32;
+
+        self.current_function_sg = Some(sg_id);
+        self.current_function_id = sg_id.0;
+        self.enter_scope();
+
+        // 创建参数节点（Const 占位，值在运行时由 start_subgraph 注入）
+        for param in &params {
+            let inputs_offset = self.graph.inputs_pool.push(&[]);
+            let param_node = self.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: CF_NOOP,
+            });
+            self.bind_var(param.name, param_node);
+        }
+
+        // 编译函数体
+        let is_void_fn = match return_type {
+            None => true,
+            Some(tr) => {
+                matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+            }
+        };
+        let return_node = {
+            let prev_tail = self.in_tail_position;
+            self.in_tail_position = !is_void_fn;
+            let r = self.compile_expr(body_expr);
+            self.in_tail_position = prev_tail;
+            r
+        };
+        self.exit_scope();
+        self.current_function_sg = None;
+        self.compiling_builtin = prev_builtin;
+
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = return_node;
+        sg.has_suspend = is_async;
+        sg.function_id = sg_id.0;
+
+        // 恢复外层 type_args 上下文
+        self.current_type_args = prev_type_args;
+        self.current_instance_id = prev_instance_id;
     }
 
     /// 编译 builtin 模块中 TypeDecl 的方法（通过 (type_id, method_idx) 查 method_subgraphs）。
@@ -5017,9 +5257,35 @@ impl<'a> IrBuilder<'a> {
             );
         }
 
+        // 2d. 预注册单态化实例子图占位符：使步骤 3 中编译用户函数时，
+        //     call node 可通过 mangled name 绑定到实例子图（实际编译体在步骤 3a 填充）。
+        //     若不预注册，compile_call 查不到 mangled name → set_call_target 未执行 → 运行时返回 void。
+        for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
+            let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
+            if !self.func_subgraphs.contains_key(mangled.as_str()) {
+                let param_count = self.sema.get_func_sig(&inst.func_name)
+                    .map(|sig| sig.param_is_ref.len() as u8)
+                    .unwrap_or(0);
+                let sg_id = self.register_subgraph_placeholder(&mangled, param_count, inst.is_async);
+                self.func_subgraphs.insert(mangled, sg_id);
+            }
+        }
+
         // 3. 编译用户模块函数
         for name in &fun_names {
             self.compile_function(name);
+        }
+
+        // 3a. 编译单态化实例：消费 Sema 的 monomorph_instances，
+        //     为每个泛型函数实例生成特化子图（mangled name 注册）。
+        //     仅处理有 type_args 的实例（非泛型实例由 compile_function 覆盖）。
+        let instances: Vec<crate::sema::Sema::MonomorphInstance> = self.sema.monomorph_instances
+            .iter()
+            .filter(|inst| !inst.type_args.is_empty())
+            .cloned()
+            .collect();
+        for inst in &instances {
+            self.compile_monomorph_instance(inst);
         }
 
         // 计算 fan-out
@@ -5050,5 +5316,542 @@ impl<'a> IrBuilder<'a> {
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
         self.graph
+    }
+}
+
+// =========================================================================
+// 十六进制浮点字面量解析（IEEE 754 精确位模式）
+// =========================================================================
+// 格式: 0x<整数部分>.<小数部分>p<指数部分>
+//   0x1.921fb54442d18p+1 = 1.* 16^... * 2^(+1) = PI (f64)
+// 支持正负指数、可选符号、大小写 0x/P。
+
+/// 解析十六进制浮点字面量为 f64 位模式，返回 f64。
+fn parse_hex_float_f64(s: &str) -> Option<f64> {
+    let bits = parse_hex_float_to_u128(s, 11, 52, 1023)?;
+    Some(f64::from_bits(bits as u64))
+}
+
+/// 解析十六进制浮点字面量为 f32 位模式，返回 f32。
+fn parse_hex_float_f32(s: &str) -> Option<f32> {
+    let bits = parse_hex_float_to_u128(s, 8, 23, 127)?;
+    Some(f32::from_bits(bits as u32))
+}
+
+/// 解析十六进制浮点字面量为 f16 位模式，返回 u16 bits。
+fn parse_hex_float_f16(s: &str) -> Option<u16> {
+    let bits = parse_hex_float_to_u128(s, 5, 10, 15)?;
+    Some(bits as u16)
+}
+
+/// 解析十六进制浮点字面量为 f128 位模式，返回 [u8; 16]。
+fn parse_hex_float_f128(s: &str) -> Option<[u8; 16]> {
+    let bits = parse_hex_float_to_u128(s, 15, 112, 16383)?;
+    Some(bits.to_le_bytes())
+}
+
+/// 通用十六进制浮点解析器。
+/// 参数: (字面量, 指数位数, 尾数位数, 指数偏置)
+/// 返回: u128 位模式（调用方截断到目标宽度）
+fn parse_hex_float_to_u128(s: &str, exp_bits: u32, mant_bits: u32, exp_bias: i64) -> Option<u128> {
+    // 去除 0x/0X 前缀
+    let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+
+    // 分割尾数部分和指数部分（p 或 P）
+    let p_pos = body.find(|c| c == 'p' || c == 'P')?;
+    let mantissa_str = &body[..p_pos];
+    let exp_str = &body[p_pos + 1..];
+
+    // 解析尾数：可能包含 '.'
+    let (int_part, frac_part) = match mantissa_str.find('.') {
+        Some(dot) => (&mantissa_str[..dot], &mantissa_str[dot + 1..]),
+        None => (mantissa_str, ""),
+    };
+
+    // 将十六进制尾数转为数值（忽略小数点位置，先收集所有 hex 数字）
+    let mut mantissa: u128 = 0;
+    let mut frac_hex_digits: i32 = 0; // 小数点后的 hex digit 数
+
+    // 整数部分
+    for c in int_part.chars() {
+        let d = c.to_digit(16)?;
+        mantissa = mantissa.checked_mul(16)?.checked_add(d as u128)?;
+    }
+
+    // 小数部分
+    for c in frac_part.chars() {
+        let d = c.to_digit(16)?;
+        mantissa = mantissa.checked_mul(16)?.checked_add(d as u128)?;
+        frac_hex_digits += 1;
+    }
+
+    if mantissa == 0 {
+        // 零：可能带符号，但当前实现不解析符号前缀（词法器已处理负号）
+        return Some(0);
+    }
+
+    // 解析二进制指数（p 后部分）
+    let exp2: i64 = exp_str.parse().ok()?;
+
+    // 实际指数 = exp2 - frac_hex_digits * 4（因为每个 hex digit = 4 bits）
+    let binary_exp = exp2 - (frac_hex_digits as i64) * 4;
+
+    // 规范化 mantissa：找到最高有效位，计算 unbiased exp
+    // mantissa 的 MSB 位置（0-indexed from LSB）
+    let msb = 127 - mantissa.leading_zeros() as i64;
+
+    // 我们要把 mantissa 规范化为 1.xxx 形式：
+    // 当前 mantissa 表示一个整数，其二进制小数点在末尾。
+    // 规范化后：mantissa = 1.fraction * 2^(msb + binary_exp)
+    // 但 mantissa 的 MSB 就是隐含的 1，所以 unbiased_exp = msb + binary_exp
+    let unbiased_exp = msb + binary_exp;
+
+    // 提取 fraction bits（去掉 MSB 后的位数）
+    let fraction_mant = mantissa & ((1u128 << msb) - 1);
+    let frac_bits_available = msb as u32;
+
+    // 舍入 fraction 到 mant_bits 位（round-to-nearest-even）
+    // 返回 (fraction_field, exp_adjust)
+    let (fraction, exp_adjust): (u128, i64) = if frac_bits_available > mant_bits {
+        let shift = frac_bits_available - mant_bits;
+        let kept = fraction_mant >> shift;
+        let remainder = fraction_mant & ((1u128 << shift) - 1);
+        let halfway = 1u128 << (shift - 1);
+        let mut rounded = kept;
+        if remainder > halfway {
+            rounded += 1;
+        } else if remainder == halfway {
+            if kept & 1 != 0 {
+                rounded += 1;
+            }
+        }
+        if rounded >> mant_bits != 0 {
+            (0, 1)
+        } else {
+            (rounded, 0)
+        }
+    } else if frac_bits_available < mant_bits {
+        (fraction_mant << (mant_bits - frac_bits_available), 0)
+    } else {
+        (fraction_mant, 0)
+    };
+
+    let biased_exp = unbiased_exp + exp_adjust + exp_bias;
+    let max_biased = (1i64 << exp_bits) - 1;
+
+    if biased_exp >= max_biased {
+        return Some((max_biased as u128) << mant_bits);
+    }
+
+    if biased_exp > 0 {
+        let exp_field = (biased_exp as u128) << mant_bits;
+        let frac_field = fraction & ((1u128 << mant_bits) - 1);
+        return Some(exp_field | frac_field);
+    }
+
+    // biased_exp <= 0：次正规数或零
+    let shift = (1 - biased_exp) as u32;
+    if shift >= 128 {
+        return Some(0);
+    }
+    let full_mant = (1u128 << mant_bits) | (fraction & ((1u128 << mant_bits) - 1));
+    let sub_fraction = (full_mant >> shift) & ((1u128 << mant_bits) - 1);
+    if sub_fraction == 0 {
+        return Some(0);
+    }
+    Some(sub_fraction)
+}
+
+// =========================================================================
+// 十进制浮点字面量 → IEEE 754 binary128 精确解析（不经 f64 中转）
+// =========================================================================
+// 算法：十进制 digits * 10^e10 → 大整数 M * 2^e2 → 规范化 113 位 mantissa
+//       + round-to-nearest-even 舍入 → binary128 位模式。
+// 大整数用 Vec<u64> little-endian 表示，仅需乘/除小整数与左/右移操作，
+// 避免大整数除以大整数（10^k = 2^k * 5^k，分步乘/除 5 即可）。
+
+/// 十进制数字字符串 → Vec<u64> 大整数（little-endian limbs）。
+fn bigint_from_dec(s: &str) -> Vec<u64> {
+    let mut limbs = vec![0u64];
+    for c in s.chars() {
+        let d = (c as u8 - b'0') as u64;
+        let mut carry = d;
+        for l in limbs.iter_mut() {
+            let prod = (*l as u128) * 10 + carry as u128;
+            *l = prod as u64;
+            carry = (prod >> 64) as u64;
+        }
+        if carry != 0 {
+            limbs.push(carry);
+        }
+    }
+    limbs
+}
+
+/// 大整数乘以小整数（原地）。
+fn bigint_mul_small(limbs: &mut Vec<u64>, m: u64) {
+    let mut carry = 0u128;
+    for l in limbs.iter_mut() {
+        let prod = (*l as u128) * (m as u128) + carry;
+        *l = prod as u64;
+        carry = prod >> 64;
+    }
+    if carry != 0 {
+        limbs.push(carry as u64);
+    }
+}
+
+/// 大整数除以小整数（原地），返回余数。
+fn bigint_divmod_small(limbs: &mut Vec<u64>, d: u64) -> u64 {
+    let mut rem = 0u128;
+    for l in limbs.iter_mut().rev() {
+        let cur = (rem << 64) | (*l as u128);
+        *l = (cur / d as u128) as u64;
+        rem = cur % d as u128;
+    }
+    while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
+        limbs.pop();
+    }
+    rem as u64
+}
+
+/// 大整数左移 n 位（原地）。
+fn bigint_shl(limbs: &mut Vec<u64>, n: u32) {
+    let word_shift = (n / 64) as usize;
+    let bit_shift = n % 64;
+    if bit_shift > 0 {
+        let mut carry = 0u64;
+        for l in limbs.iter_mut() {
+            let new = (*l << bit_shift) | carry;
+            carry = *l >> (64 - bit_shift);
+            *l = new;
+        }
+        if carry != 0 {
+            limbs.push(carry);
+        }
+    }
+    if word_shift > 0 {
+        limbs.splice(0..0, std::iter::repeat(0u64).take(word_shift));
+    }
+}
+
+/// 大整数位长度（最高有效位位置 + 1）。
+fn bigint_bit_len(limbs: &[u64]) -> u32 {
+    let mut i = limbs.len();
+    while i > 0 && limbs[i - 1] == 0 {
+        i -= 1;
+    }
+    if i == 0 {
+        return 0;
+    }
+    ((i - 1) * 64 + (64 - limbs[i - 1].leading_zeros()) as usize) as u32
+}
+
+/// 提取大整数 bit [start, start+n-1]（n <= 128）。
+fn bigint_extract_bits(limbs: &[u64], start: u32, n: u32) -> u128 {
+    let mut result: u128 = 0;
+    for i in 0..n {
+        let pos = (start + i) as usize;
+        let word = pos / 64;
+        let bit = pos % 64;
+        if word < limbs.len() && (limbs[word] >> bit) & 1 != 0 {
+            result |= 1u128 << i;
+        }
+    }
+    result
+}
+
+/// 大整数第 pos 位是否为 1（pos 为 i64 以支持负值返回 false）。
+fn bigint_bit(limbs: &[u64], pos: i64) -> bool {
+    if pos < 0 {
+        return false;
+    }
+    let pos = pos as usize;
+    let word = pos / 64;
+    let bit = pos % 64;
+    word < limbs.len() && (limbs[word] >> bit) & 1 != 0
+}
+
+/// 大整数低 n 位是否非零。
+fn bigint_low_nonzero(limbs: &[u64], n: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let words = (n / 64) as usize;
+    let bits = n % 64;
+    for i in 0..words.min(limbs.len()) {
+        if limbs[i] != 0 {
+            return true;
+        }
+    }
+    if bits > 0 && words < limbs.len() {
+        let mask = (1u64 << bits) - 1;
+        if limbs[words] & mask != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// 大整数低 128 位转 u128。
+fn bigint_to_u128(limbs: &[u64]) -> u128 {
+    let mut r = 0u128;
+    for i in 0..2.min(limbs.len()) {
+        r |= (limbs[i] as u128) << (64 * i);
+    }
+    r
+}
+
+/// 十进制浮点字面量 → IEEE 754 binary128 位模式（[u8;16] little-endian）。
+///
+/// 不经 f64 中转，使用大整数运算实现精确转换（round-to-nearest-even）。
+/// 支持: [+-]digits[.digits][e[+-]digits]
+fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
+    // 1. 解析十进制格式
+    let s = s.trim();
+    let (sign, body) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, s)
+    };
+
+    // 分割指数部分 e/E
+    let (mantissa_str, exp_str) = match body.find(|c| c == 'e' || c == 'E') {
+        Some(pos) => (&body[..pos], &body[pos + 1..]),
+        None => (body, ""),
+    };
+    let exp10: i32 = if exp_str.is_empty() { 0 } else { exp_str.parse().ok()? };
+
+    // 分割小数点
+    let (int_part, frac_part) = match mantissa_str.find('.') {
+        Some(pos) => (&mantissa_str[..pos], &mantissa_str[pos + 1..]),
+        None => (mantissa_str, ""),
+    };
+
+    let digits_str: String = format!("{}{}", int_part, frac_part);
+    if digits_str.is_empty() || !digits_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let frac_len = frac_part.len() as i32;
+    let e10 = exp10 - frac_len;
+
+    // 零值快速返回
+    if digits_str.chars().all(|c| c == '0') {
+        let bits: u128 = if sign { 1u128 << 127 } else { 0 };
+        return Some(bits.to_le_bytes());
+    }
+
+    // 2. digits → 大整数 M
+    let mut m_big = bigint_from_dec(&digits_str);
+    let digits_bitlen = bigint_bit_len(&m_big);
+    let mut e2: i64 = 0;
+    let mut div_sticky = false;
+
+    // 3. 估算范围，快速处理 inf/0
+    let log2_est = (digits_bitlen as f64 - 1.0) + (e10 as f64) * 3.32193;
+    if log2_est > 16384.0 {
+        let bits: u128 = (if sign { 1u128 << 127 } else { 0 }) | (0x7FFFu128 << 112);
+        return Some(bits.to_le_bytes());
+    }
+    if log2_est < -16510.0 {
+        let bits: u128 = if sign { 1u128 << 127 } else { 0 };
+        return Some(bits.to_le_bytes());
+    }
+
+    // 4. 处理 e10：value = digits * 10^e10 = digits * 5^e10 * 2^e10
+    if e10 > 0 {
+        for _ in 0..e10 {
+            bigint_mul_small(&mut m_big, 5);
+        }
+        e2 = e10 as i64;
+    } else if e10 < 0 {
+        // value = digits / 10^k = (digits * 2^P / 5^k) * 2^(-k-P), k = -e10
+        let k = (-e10) as u64;
+        // P 需保证 M/5^k 后至少 114 位精度：P >= 114 - digits_bitlen + 2.322*k
+        let p_needed = (2.4 * (k as f64)) as u32 + 128;
+        bigint_shl(&mut m_big, p_needed);
+        e2 = -(k as i64) - (p_needed as i64);
+        for _ in 0..k {
+            let r = bigint_divmod_small(&mut m_big, 5);
+            if r != 0 {
+                div_sticky = true;
+            }
+        }
+    }
+
+    // 5. 规范化 + 提取 mantissa + guard + sticky
+    let msb = bigint_bit_len(&m_big) as i64 - 1;
+    if msb < 0 {
+        let bits: u128 = if sign { 1u128 << 127 } else { 0 };
+        return Some(bits.to_le_bytes());
+    }
+    let unbiased_exp = e2 + msb;
+
+    let (bits113, guard, sticky, final_exp): (u128, bool, bool, i64) =
+        if unbiased_exp >= -16382 {
+            // 正规数：mantissa 113 位（bit msb 为隐含1）
+            let shift = msb - 112;
+            if shift >= 0 {
+                let s = shift as u32;
+                let mant = bigint_extract_bits(&m_big, s, 113);
+                let g = bigint_bit(&m_big, (shift - 1) as i64);
+                let stk = if s >= 2 {
+                    bigint_low_nonzero(&m_big, s - 1)
+                } else {
+                    false
+                };
+                (mant, g, stk || div_sticky, unbiased_exp)
+            } else {
+                // 左移补齐，M 精确表示（无 guard）
+                let mut m = m_big.clone();
+                bigint_shl(&mut m, (-shift) as u32);
+                let mant = bigint_to_u128(&m) & ((1u128 << 113) - 1);
+                (mant, false, div_sticky, unbiased_exp)
+            }
+        } else {
+            // 次正规数：fraction 112 位，exp 固定 -16382
+            // fraction = M * 2^(e2 + 16494)
+            let p = e2 + 16494;
+            if p >= 0 {
+                let mut m = m_big.clone();
+                bigint_shl(&mut m, p as u32);
+                let frac = bigint_to_u128(&m) & ((1u128 << 112) - 1);
+                (frac, false, div_sticky, -16382)
+            } else {
+                let s = (-p) as u32;
+                let frac = bigint_extract_bits(&m_big, s, 112);
+                let g = bigint_bit(&m_big, (-p - 1) as i64);
+                let stk = if s >= 2 {
+                    bigint_low_nonzero(&m_big, s - 1)
+                } else {
+                    false
+                };
+                (frac, g, stk || div_sticky, -16382)
+            }
+        };
+
+    // 6. 舍入 round-to-nearest-even
+    let mut mant = bits113;
+    let mut exp = final_exp;
+    let was_subnormal = final_exp < -16382;
+    if guard && (sticky || (mant & 1) != 0) {
+        mant += 1;
+    }
+    if was_subnormal {
+        // 次正规舍入后可能进位到最小正规数（mant 达到 2^112）
+        if mant >= (1u128 << 112) {
+            exp = -16382;
+        }
+    } else if mant >= (1u128 << 113) {
+        // 正规数舍入进位
+        mant >>= 1;
+        exp += 1;
+    }
+
+    // 7. 组装 binary128
+    if exp >= 16383 {
+        let bits: u128 = (if sign { 1u128 << 127 } else { 0 }) | (0x7FFFu128 << 112);
+        return Some(bits.to_le_bytes());
+    }
+    if exp >= -16382 {
+        // 正规数
+        let frac = mant & ((1u128 << 112) - 1);
+        let biased = (exp + 16383) as u128;
+        let bits = (if sign { 1u128 << 127 } else { 0 }) | (biased << 112) | frac;
+        return Some(bits.to_le_bytes());
+    }
+    // 次正规数
+    let frac = mant & ((1u128 << 112) - 1);
+    let bits = (if sign { 1u128 << 127 } else { 0 }) | frac;
+    Some(bits.to_le_bytes())
+}
+
+#[cfg(test)]
+mod decimal_f128_tests {
+    use super::*;
+
+    /// 辅助：比较十进制与十六进制解析结果是否位模式相同。
+    fn assert_eq_hex(decimal: &str, hex: &str, label: &str) {
+        let hex_clean = hex.strip_suffix("f128").unwrap_or(hex);
+        let d = parse_decimal_f128(decimal)
+            .unwrap_or_else(|| panic!("parse_decimal_f128({}) returned None", decimal));
+        let h = parse_hex_float_f128(hex_clean)
+            .unwrap_or_else(|| panic!("parse_hex_float_f128({}) returned None", hex_clean));
+        assert_eq!(d, h, "{}: decimal {} != hex {}", label, decimal, hex_clean);
+    }
+
+    #[test]
+    fn f128_decimal_simple() {
+        assert_eq_hex("1.0", "0x1p+0f128", "1.0");
+        assert_eq_hex("2.0", "0x1p+1f128", "2.0");
+        assert_eq_hex("0.5", "0x1p-1f128", "0.5");
+        assert_eq_hex("3.0", "0x1.8p+1f128", "3.0");
+        assert_eq_hex("4.0", "0x1p+2f128", "4.0");
+        assert_eq_hex("0.0", "0x0p+0f128", "0.0");
+    }
+
+    #[test]
+    fn f128_decimal_pi() {
+        // π 的 binary128 精确值，36 位十进制足够正确舍入
+        assert_eq_hex(
+            "3.1415926535897932384626433832795028",
+            "0x1.921fb54442d18469898cc51701b8p+1f128",
+            "pi",
+        );
+    }
+
+    #[test]
+    fn f128_decimal_e() {
+        assert_eq_hex(
+            "2.7182818284590452353602874713526625",
+            "0x1.5bf0a8b1457695355fb8ac404e7ap+1f128",
+            "e",
+        );
+    }
+
+    #[test]
+    fn f128_decimal_ln2() {
+        assert_eq_hex(
+            "0.6931471805599453094172321214581766",
+            "0x1.62e42fefa39ef35793c7673007e6p-1f128",
+            "ln2",
+        );
+    }
+
+    #[test]
+    fn f128_decimal_point_one() {
+        // 0.1 的 binary128 精确表示
+        assert_eq_hex(
+            "0.1",
+            "0x1.999999999999999999999999999ap-4f128",
+            "0.1",
+        );
+    }
+
+    #[test]
+    fn f128_decimal_exp_notation() {
+        assert_eq_hex("1.5e3", "0x1.77p+10f128", "1.5e3");
+        assert_eq_hex("1e0", "0x1p+0f128", "1e0");
+        assert_eq_hex("1.25e0", "0x1.4p+0f128", "1.25e0");
+    }
+
+    #[test]
+    fn f128_decimal_negative() {
+        let pos = parse_decimal_f128("3.14").unwrap();
+        let neg = parse_decimal_f128("-3.14").unwrap();
+        // 符号位差异：bit 127
+        let pos_val = u128::from_le_bytes(pos);
+        let neg_val = u128::from_le_bytes(neg);
+        assert_eq!(pos_val | (1u128 << 127), neg_val, "-3.14 sign bit");
+    }
+
+    #[test]
+    fn f128_decimal_integer() {
+        // 整数值（无小数点）
+        assert_eq_hex("100", "0x1.9p+6f128", "100");
+        assert_eq_hex("1024", "0x1p+10f128", "1024");
     }
 }

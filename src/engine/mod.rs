@@ -45,8 +45,8 @@ use std::sync::Arc;
 // 哨兵常量 — 调度器使用
 // =========================================================================
 
-/// `pending_inputs` 槽位哨兵：标记"永不就绪/外部源"（实际入度必须 < 255）。
-const PENDING_EXTERNAL: u8 = u8::MAX;
+/// `pending_inputs` 槽位哨兵：标记"永不就绪/外部源"（实际入度必须 < 65535）。
+const PENDING_EXTERNAL: u16 = u16::MAX;
 /// splitmix64 黄金比例散列常量（确保各 worker 的 steal 顺序互异）。
 const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 
@@ -64,7 +64,10 @@ pub struct Engine<S: LockStrategy> {
     pub async_join_runtime: S::Mutex<AsyncJoinRuntime>,
     pub event_waiters: S::Mutex<Vec<(crate::ir::Ir::RuntimeEvent, FrameId)>>,
     pub pending_completions:
-        S::Mutex<HashMap<FrameId, (crate::ir::Ir::NodeId, Value, crate::ir::Ir::ControlSignal)>>,
+        S::Mutex<HashMap<FrameId, Vec<(crate::ir::Ir::NodeId, Value, crate::ir::Ir::ControlSignal)>>>,
+    /// 事件投递竞态兜底：事件到达时帧正被 process_frame 处理（不在 HashMap），
+    /// 将事件暂存，process_frame insert 帧后消费（与 pending_completions 对称）
+    pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
     pub result: S::Mutex<Option<Value>>,
     /// 单线程队列（Multi 模式为 None）
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,

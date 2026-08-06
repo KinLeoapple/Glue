@@ -240,6 +240,8 @@ pub(super) fn alloc_const_value(cv: ConstValue) -> Value {
         ConstValue::Usize(v) => Value::usize_val(v),
         ConstValue::F32(v) => Value::f32(v),
         ConstValue::F64(v) => Value::f64(v),
+        ConstValue::F16(bits) => Value::f16(crate::value::F16(bits)),
+        ConstValue::F128(bytes) => Value::f128(crate::value::F128(bytes)),
         ConstValue::Bool(v) => Value::bool_val(v),
         ConstValue::Char(c) => Value::char_val(char_from_u32_or_nul(c)),
         ConstValue::Null => Value::NULL,
@@ -298,7 +300,7 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
                 let in_frame = inputs
                     .iter()
                     .filter(|&&n| (n.0.wrapping_sub(node_start.0) as usize) < node_count)
-                    .count() as u8;
+                    .count() as u16;
                 frame.pending_inputs[i] = in_frame;
             }
         }
@@ -367,8 +369,12 @@ pub fn notify_downstream(
         // 或被 reset_node_ready/reset_node_pending 显式重置（循环体复用场景）。
         let _still_has_consumers = frame.value_table.consume(pidx);
 
-        if frame.pending_inputs[ds_local_id.0 as usize] > 0 {
-            frame.pending_inputs[ds_local_id.0 as usize] -= 1;
+        // 跳过 PENDING_EXTERNAL 哨兵（嵌套子图节点/EventSource 节点）：
+        // 这些节点由子帧或事件驱动，不应被父帧的 notify_downstream 递减。
+        // 若递减会腐蚀哨兵（65535→65534），累计 65535 次后归零，嵌套节点被错误推入父帧执行。
+        let pending = frame.pending_inputs[ds_local_id.0 as usize];
+        if pending > 0 && pending != PENDING_EXTERNAL {
+            frame.pending_inputs[ds_local_id.0 as usize] = pending - 1;
         }
         if frame.pending_inputs[ds_local_id.0 as usize] == 0
             && !frame.value_table.ready[ds_local_id.0 as usize]
@@ -385,7 +391,9 @@ pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Valu
         ControlSignal::Break | ControlSignal::Continue => Value::VOID,
         ControlSignal::None => {
             let sg = &graph.subgraphs[child.subgraph_id.0 as usize];
-            // node_offset = 子图 node_range.0（同函数分支和跨函数调用均如此）
+            // child.node_offset：跨函数调用 = 子图 node_range.0；
+            // 同函数分支帧 = 父函数 node_start（见 Frame.rs prepare_same_function_frame）。
+            // 使用 child.node_offset（实际值）而非 sg.node_range.0，确保两种情况都正确。
             let return_local = NodeId(sg.return_node.0.wrapping_sub(child.node_offset));
             child.get_value(return_local)
         }
@@ -405,6 +413,9 @@ impl<S: LockStrategy> Engine<S> {
         loop {
         iter_guard += 1;
         if iter_guard > 500000 {
+            // 超限：标记 Failed 防止 process_frame 重新入队导致活锁
+            // process_frame 的 Failed 分支会唤醒调用方或返回 NULL
+            frame.state = FrameState::Failed;
             return;
         }
             // 检查控制信号（return/break/continue 已触发）
@@ -619,15 +630,20 @@ impl<S: LockStrategy> Engine<S> {
                             )
                         };
 
-                        // 子帧入队
-                        queue.push(child_fid);
-
                         if pending.is_async {
-                            // async call：当前帧不挂起，call 节点写 AsyncHandle + 通知下游
-                            let async_id = self.async_join_runtime.lock().alloc_id();
+                            // async call：先注册 async 映射，再 push 子帧（消除竞态窗口）
+                            // 若先 push，子帧可能在 register 前被其他 worker 执行完，
+                            // find_by_child 返回 None → 误判为 sync call → 返回值覆盖 async_handle
+                            let async_id = self
+                                .async_join_runtime
+                                .lock()
+                                .alloc_and_register(child_fid);
                             let async_handle = Value::i32(async_id.0 as i32);
-                            self.async_join_runtime.lock().register(async_id, child_fid);
 
+                            // 子帧入队（async 映射已注册，find_by_child 可正确匹配）
+                            queue.push(child_fid);
+
+                            // call 节点写 AsyncHandle + 通知下游
                             let node_start = frame.node_offset;
                             let graph_node_id =
                                 NodeId(pending.call_node_local.0 + node_start);
@@ -647,7 +663,10 @@ impl<S: LockStrategy> Engine<S> {
                             );
                             continue;
                         } else {
-                            // sync call：当前帧挂起等 SubgraphComplete 事件
+                            // sync call：子帧入队 + 当前帧挂起等 SubgraphComplete 事件
+                            // sync call 的竞态由 pending_completions 兜底
+                            // （父帧不在 HashMap 时子帧完成，complete_and_wake_caller 暂存完成信息）
+                            queue.push(child_fid);
                             self.event_waiters.lock().push((
                                 RuntimeEvent::SubgraphComplete(child_fid),
                                 fid,
@@ -669,28 +688,32 @@ impl<S: LockStrategy> Engine<S> {
                     }
 
                     crate::ir::Ir::Pending::Await(pending) => {
-                        let (event, ready_value) = self.resolve_and_check_await(&pending);
+                        // 原子检查就绪 + 注册 waiter（消除 TOCTOU 竞态）
+                        let (event, ready_value, await_node_local) =
+                            self.resolve_check_and_register_await(&pending, fid);
 
                         if let Some(value) = ready_value {
+                            // 事件已就绪：注入值 + 通知下游（waiter 未注册）
                             let node_start = frame.node_offset;
                             let graph_node_id =
-                                NodeId(pending.await_node_local.0 + node_start);
+                                NodeId(await_node_local.0 + node_start);
                             let consumer_count =
                                 graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                            frame.set_value(pending.await_node_local, value, consumer_count);
+                            frame.set_value(await_node_local, value, consumer_count);
                             notify_downstream(
                                 frame,
                                 &graph,
-                                pending.await_node_local,
+                                await_node_local,
                                 graph_node_id,
                                 NodeId(node_start),
                             );
                             continue;
                         } else {
-                            self.event_waiters.lock().push((event, fid));
+                            // 事件未就绪：waiter 已在 resolve_check_and_register_await 内注册
+                            // 只需设帧状态后 return（无需再次 push event_waiters）
                             frame.state = FrameState::Suspended;
                             frame.suspend_state =
-                                SuspendState::WaitingEvent(pending.await_node_local);
+                                SuspendState::WaitingEvent(await_node_local);
                             frame.suspend_event = Some(event);
                             return;
                         }
@@ -915,9 +938,11 @@ impl<S: LockStrategy> Engine<S> {
             FrameState::Suspended => {
                 let event = frame.suspend_event;
                 // 检查 pending_completions（子帧先完成但父帧尚未 insert 的竞态）
-                let pending = self.pending_completions.lock().remove(&fid);
-                if let Some((call_node, return_value, child_signal)) = pending {
-                    // 有 pending completion：直接消费完成事件
+                // 使用 Vec 支持同一 caller 多个子帧并发完成（避免互相覆盖）
+                let completions: Vec<_> =
+                    self.pending_completions.lock().remove(&fid).unwrap_or_default();
+                if !completions.is_empty() {
+                    // 有 pending completion(s)：直接消费完成事件
                     if let Some(e) = event {
                         self.event_waiters
                             .lock()
@@ -927,28 +952,50 @@ impl<S: LockStrategy> Engine<S> {
                             .lock()
                             .retain(|(_, wf)| *wf != fid);
                     }
-                    let _ = child_signal;
                     // 使用 frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
                     let caller_offset = NodeId(frame.node_offset);
-                    let call_graph_id = NodeId(call_node.0 + caller_offset.0);
-                    let consumer_count =
-                        self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
-                    frame.set_value(call_node, return_value, consumer_count);
+                    // 遍历所有 completions，逐个回写返回值 + 信号传播 + 通知下游
+                    for (call_node, return_value, child_signal) in completions {
+                        let call_graph_id = NodeId(call_node.0 + caller_offset.0);
+                        let consumer_count =
+                            self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
+                        frame.set_value(call_node, return_value, consumer_count);
+                        // Gate 分支子图的控制信号传播（与 complete_and_wake_caller 正常路径一致）
+                        let is_gate = self.graph.nodes[call_graph_id.0 as usize].kind
+                            == crate::ir::Ir::NodeKind::Gate;
+                        if is_gate && !matches!(child_signal, ControlSignal::None) {
+                            frame.control_signal = child_signal;
+                        }
+                        notify_downstream(
+                            frame,
+                            &self.graph,
+                            call_node,
+                            call_graph_id,
+                            caller_offset,
+                        );
+                    }
                     frame.state = FrameState::Ready;
                     frame.suspend_state = SuspendState::NotSuspended;
                     frame.suspend_event = None;
-                    notify_downstream(
-                        frame,
-                        &self.graph,
-                        call_node,
-                        call_graph_id,
-                        caller_offset,
-                    );
                     // 放回同一个 Box（地址不变）
                     self.frames.lock().insert(fid, frame_box);
                     queue.push(fid);
                 } else {
-                    self.frames.lock().insert(fid, frame_box);
+                    // 检查 pending_events（事件到达时帧不在 HashMap 的竞态兜底）
+                    let pending_evt = self.pending_events.lock().remove(&fid);
+                    if let Some((_evt, evt_val)) = pending_evt {
+                        // 有 pending event：注入事件值 + 唤醒
+                        // waiter 已在 on_event_arrived 中移除，无需重复清理
+                        if self.apply_event_to_frame(frame, evt_val) {
+                            self.frames.lock().insert(fid, frame_box);
+                            queue.push(fid);
+                        } else {
+                            // 帧非 WaitingEvent（状态不一致）：放回，不入队
+                            self.frames.lock().insert(fid, frame_box);
+                        }
+                    } else {
+                        self.frames.lock().insert(fid, frame_box);
+                    }
                 }
             }
             FrameState::Completed => {
@@ -963,11 +1010,16 @@ impl<S: LockStrategy> Engine<S> {
                             .lock()
                             .set_result(async_id, return_value.clone());
                         // frame_box drop（不放回）
-                        self.on_event_arrived(
+                        let woken = self.on_event_arrived(
                             RuntimeEvent::AsyncJoin(async_id),
                             return_value,
                             queue,
                         );
+                        // waiter 已被唤醒（值已通过事件注入），entry 可安全清理。
+                        // 若 woken == 0（无 waiter），entry 保留供 try_get_result 消费式读取
+                        if woken > 0 {
+                            self.async_join_runtime.lock().remove_entry(async_id);
+                        }
                     } else {
                         // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
                         self.event_waiters.lock().retain(|(e, _)| {

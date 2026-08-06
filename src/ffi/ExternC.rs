@@ -353,7 +353,8 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             // `i128`/`u128`/`f128` returns use `__int128`/`unsigned __int128` (requires GCC/Clang).
             let ret_name = extract_type_name(*return_type, arena);
             let glue_return = ret_name.as_deref().unwrap_or("void").to_string();
-            let is_str_return = glue_return == "str";
+            let is_str_return = crate::value::ValueTag::from_name(&glue_return)
+                .is_some_and(|t| t.family() == crate::types::TypeFamily::Str);
             let c_return = if is_str_return {
                 "void".to_string()
             } else {
@@ -561,7 +562,8 @@ fn generate_rust_ffi(funcs: &[ExternCFunc]) -> Result<String, String> {
 /// are passed directly as `u16`.
 fn generate_wrapper_fn(func: &ExternCFunc) -> String {
     let mut out = String::new();
-    let is_str_return = func.glue_return == "str";
+    let is_str_return = crate::value::ValueTag::from_name(&func.glue_return)
+        .is_some_and(|t| t.family() == crate::types::TypeFamily::Str);
 
     // Doc comment.
     let glue_sig = format!(

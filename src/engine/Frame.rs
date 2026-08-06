@@ -56,6 +56,10 @@ impl<S: LockStrategy> Engine<S> {
         // 使用 loop_frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
         let loop_offset = loop_frame.node_offset;
 
+        // 0. 清空 ready_queue（必须在步骤 1-3 push cond/iter_next/gate 之前）
+        // 若不清空，旧就绪条目残留，会先于 cond/iter_next 执行，引用过时值
+        loop_frame.ready_queue.clear();
+
         // 1. For 循环：额外重置 iter_next_node
         if loop_kind == crate::ir::Ir::LoopKind::For {
             if let Some(next_node) = iter_next_node {
@@ -90,11 +94,39 @@ impl<S: LockStrategy> Engine<S> {
         Self::reset_node_pending(loop_frame, gate_local, 1);
 
         // 4. 重置 body_sg 帧（复用）
+        // body 帧是 same_function 分支帧：node_offset = 父函数 node_start，
+        // value_table 扩展到父函数大小。不能调用 prepare_frame_nodes（它会将
+        // node_offset 重置为 body 子图的 node_range.0，导致值表索引错位，
+        // WriteBack 的 target - node_offset 计算出错误 local，跳过 body 帧）。
         body_frame.value_table.reset_all();
         body_frame.ready_queue.clear();
+        body_frame.select_timers.clear();
+        body_frame.body_frame_id = None;
         body_frame.control_signal = ControlSignal::None;
         body_frame.pending = None;
-        prepare_frame_nodes(body_frame, &self.graph);
+        self.prepare_same_function_frame(body_frame);
+
+        // 从 loop_frame 重新拷贝外层变量值（与 start_subgraph 逻辑一致）。
+        // prepare_same_function_frame 只设置 pending_inputs + 预填充 Const，
+        // 不拷贝外层变量。若不拷贝，分支子图（if/else）从 body 帧拷贝时拿不到
+        // ready 的 sum1/i1 等外层变量，导致计算节点 pending > 0、WriteBack
+        // 永不触发（复现：循环内 if 分支累加只在首轮生效）。
+        let body_sg = &self.graph.subgraphs[body_frame.subgraph_id.0 as usize];
+        let (body_branch_start, body_branch_end) = body_sg.node_range;
+        let copy_count = loop_frame.value_table.len().min(body_frame.value_table.len());
+        for i in 0..copy_count {
+            let gid = (loop_frame.node_offset as usize + i) as u32;
+            let in_body = gid >= body_branch_start.0 && gid < body_branch_end.0;
+            if in_body {
+                continue;
+            }
+            if loop_frame.value_table.ready[i] {
+                body_frame.value_table.values[i] = loop_frame.value_table.values[i].clone();
+                body_frame.value_table.ready[i] = true;
+                body_frame.value_table.refcounts[i] = 0;
+            }
+        }
+
         // body_sg 帧重新绑定 caller
         body_frame.caller =
             Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
@@ -110,6 +142,110 @@ impl<S: LockStrategy> Engine<S> {
         loop_frame.pending = None;
     }
 
+    /// same_function 分支帧重置：保持 node_offset（= 父函数 node_start），
+    /// 设置 pending_inputs + 预填充 Const + 0-input 节点入队。
+    ///
+    /// 与 prepare_frame_nodes 的区别：prepare_frame_nodes 将 node_offset 重置为
+    /// 子图自身的 node_range.0，适用于跨函数调用帧。same_function 分支帧的
+    /// node_offset 是父函数的 node_start（值表扩展到父函数大小），必须保持不变。
+    fn prepare_same_function_frame(&self, frame: &mut Frame) {
+        let parent_start = frame.node_offset;
+        let parent_node_count = frame.value_table.len();
+        let sg_id = frame.subgraph_id;
+        let sg = &self.graph.subgraphs[sg_id.0 as usize];
+        let branch_start = sg.node_range.0 .0;
+        let branch_end = sg.node_range.1 .0;
+        let branch_param_count = sg.param_count as usize;
+
+        // 收集分支内嵌套子图范围
+        let nested_ranges: Vec<(u32, u32)> = self
+            .graph
+            .subgraphs
+            .iter()
+            .filter(|s| {
+                s.id != sg_id
+                    && s.node_range.0 .0 >= branch_start
+                    && s.node_range.1 .0 <= branch_end
+            })
+            .map(|s| (s.node_range.0 .0, s.node_range.1 .0))
+            .collect();
+        let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
+
+        // 1. 设置 pending_inputs
+        for i in 0..parent_node_count {
+            let gid = (parent_start as usize + i) as u32;
+            let in_branch = gid >= branch_start && gid < branch_end;
+            if !in_branch || is_nested(gid) {
+                frame.pending_inputs[i] = PENDING_EXTERNAL;
+                continue;
+            }
+            let node = &self.graph.nodes[gid as usize];
+            if node.kind == NodeKind::EventSource {
+                frame.pending_inputs[i] = PENDING_EXTERNAL;
+            } else if node.kind == NodeKind::Gate
+                && self.graph.select_infos[gid as usize].is_some()
+            {
+                frame.pending_inputs[i] = 0;
+            } else {
+                let inputs =
+                    self.graph
+                        .inputs_pool
+                        .get(node.inputs_offset, node.input_count);
+                let mut pending = 0u16;
+                for &inp in inputs {
+                    let il = inp.0.wrapping_sub(parent_start) as usize;
+                    if il < parent_node_count {
+                        let inp_gid = (parent_start as usize + il) as u32;
+                        let inp_in_branch = inp_gid >= branch_start && inp_gid < branch_end;
+                        // 分支内节点：未就绪则计入 pending
+                        // 外层变量（!in_branch）：通过帧链穿透访问，不计 pending
+                        if inp_in_branch && !frame.value_table.ready[il] {
+                            pending += 1;
+                        }
+                    }
+                    // 帧范围外 → 帧链穿透，不计 pending
+                }
+                frame.pending_inputs[i] = pending;
+            }
+        }
+
+        // 2. 预填充分支内 Const 节点
+        for i in 0..parent_node_count {
+            let gid = (parent_start as usize + i) as u32;
+            let in_branch = gid >= branch_start && gid < branch_end;
+            if !in_branch || is_nested(gid) {
+                continue;
+            }
+            if self.graph.nodes[gid as usize].kind == NodeKind::Const {
+                if let Some(cv) = self.graph.const_values[gid as usize] {
+                    let handle = super::Schedule::alloc_const_value(cv);
+                    let cc = self.graph.downstreams[gid as usize].len() as u16;
+                    frame.set_value(NodeId(i as u32), handle, cc);
+                    frame.push_ready(NodeId(i as u32));
+                }
+            }
+        }
+
+        // 3. 分支内 0-input 非 Const 非 Param 节点入队
+        for i in 0..parent_node_count {
+            let gid = (parent_start as usize + i) as u32;
+            let in_branch = gid >= branch_start && gid < branch_end;
+            if !in_branch || is_nested(gid) {
+                continue;
+            }
+            let local_in_branch = (gid - branch_start) as usize;
+            if local_in_branch < branch_param_count {
+                continue;
+            }
+            if self.graph.nodes[gid as usize].kind == NodeKind::Const {
+                continue;
+            }
+            if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
+                frame.push_ready(NodeId(i as u32));
+            }
+        }
+    }
+
     /// 重置节点为就绪状态（pending=0，清值，不入队）。关联函数。
     pub(super) fn reset_node_ready(frame: &mut Frame, node_local: NodeId) {
         let i = node_local.0 as usize;
@@ -122,7 +258,7 @@ impl<S: LockStrategy> Engine<S> {
     }
 
     /// 重置节点为待定状态（pending=N，清值）。关联函数。
-    pub(super) fn reset_node_pending(frame: &mut Frame, node_local: NodeId, pending: u8) {
+    pub(super) fn reset_node_pending(frame: &mut Frame, node_local: NodeId, pending: u16) {
         let i = node_local.0 as usize;
         if i < frame.pending_inputs.len() {
             frame.pending_inputs[i] = pending;

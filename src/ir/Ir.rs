@@ -395,6 +395,8 @@ compute_fn_ids! {
     // 复合类型语义相等/不等（298-299）：record/adt/newtype/array/closure/throw 等
     298 => CF_EQ_OBJ,
     299 => CF_NE_OBJ,
+    // bool 不等（300）：与 CF_EQ_BOOL(27) 对称，as_i32 对 bool 恒为 0 故不能走 CF_NE_I32
+    300 => CF_NE_BOOL,
 }
 
 // =========================================================================
@@ -678,6 +680,8 @@ pub enum ConstValue {
     Usize(usize),
     F32(f32),
     F64(f64),
+    F16(u16),
+    F128([u8; 16]),
     Bool(bool),
     Char(u32),
     Str(&'static str),
@@ -703,6 +707,8 @@ impl ConstValue {
             ConstValue::Usize(v) => crate::value::Value::usize_val(*v),
             ConstValue::F32(v) => crate::value::Value::f32(*v),
             ConstValue::F64(v) => crate::value::Value::f64(*v),
+            ConstValue::F16(bits) => crate::value::Value::f16(crate::value::F16(*bits)),
+            ConstValue::F128(bytes) => crate::value::Value::f128(crate::value::F128(*bytes)),
             ConstValue::Bool(v) => crate::value::Value::bool_val(*v),
             ConstValue::Char(cp) => crate::value::Value::char_val(
                 char::from_u32(*cp).unwrap_or('\0'),
@@ -740,6 +746,13 @@ impl ConstValue {
                 ValueTag::Usize => Some(ConstValue::Usize(unsafe { sv.usize_val })),
                 ValueTag::F32 => Some(ConstValue::F32(unsafe { sv.f32_val })),
                 ValueTag::F64 => Some(ConstValue::F64(unsafe { sv.f64_val })),
+                ValueTag::F16 => Some(ConstValue::F16(unsafe { sv.f16_val })),
+                ValueTag::F128 => {
+                    let lo = unsafe { sv.f128_val[0] };
+                    let hi = unsafe { sv.f128_val[1] };
+                    let bits: u128 = (lo as u128) | ((hi as u128) << 64);
+                    Some(ConstValue::F128(bits.to_le_bytes()))
+                }
                 ValueTag::Bool => Some(ConstValue::Bool(unsafe { sv.bool_val })),
                 ValueTag::Char => Some(ConstValue::Char(unsafe { sv.u32_val })),
                 _ => None,
@@ -958,7 +971,7 @@ pub struct Frame {
     /// 值表（SoA 布局，按帧内局部 NodeId 索引，从 0 开始）
     pub value_table: ValueTable,
     /// 每节点剩余未就绪输入数
-    pub pending_inputs: Vec<u8>,
+    pub pending_inputs: Vec<u16>,
     /// 就绪待执行节点队列
     pub ready_queue: std::collections::VecDeque<NodeId>,
     /// 帧状态
@@ -1708,6 +1721,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         // 复合类型语义相等/不等（298-299）
         298 => super::Compute::compute_eq_obj,
         299 => super::Compute::compute_ne_obj,
+        // bool 不等（300）
+        300 => super::Compute::compute_ne_bool,
     }
 }
 
@@ -1750,6 +1765,8 @@ pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
     // ── 复合类型语义相等/不等（纯函数，深度比较，可 CSE）──
     s.insert(CF_EQ_OBJ);
     s.insert(CF_NE_OBJ);
+    // ── bool 不等（纯比较，与 CF_EQ_BOOL 对称）──
+    s.insert(CF_NE_BOOL);
     // ── 栈分配构造（无外部可观察副作用）──
     s.insert(CF_RECORD_CONSTRUCT_STACK); // record_construct_stack
     s.insert(CF_ARRAY_CONSTRUCT_STACK); // array_construct_stack

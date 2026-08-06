@@ -59,6 +59,7 @@ impl TimerRuntime {
         }
     }
     pub fn start(&mut self, duration: std::time::Duration) -> crate::ir::Ir::TimerId {
+        assert!(self.next_id < u32::MAX, "TimerId overflow: too many timers");
         let id = crate::ir::Ir::TimerId(self.next_id);
         self.next_id += 1;
         self.heap.push(Reverse(TimerHeapEntry {
@@ -85,14 +86,16 @@ impl TimerRuntime {
         }
         fired
     }
-    pub fn is_fired(&self, id: crate::ir::Ir::TimerId) -> bool {
-        self.fired_set.contains(&id)
+    /// 检查 timer 是否已触发，若是则消费（移除）该条目。
+    /// 消费式读取避免 fired_set 无界增长。
+    pub fn is_fired(&mut self, id: crate::ir::Ir::TimerId) -> bool {
+        self.fired_set.remove(&id)
     }
     /// 返回最近到期 timer 的 deadline（供事件循环计算 park timeout）。
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         self.heap.peek().map(|Reverse(e)| e.deadline)
     }
-    /// 清理已被 is_fired 查询过的 ID，释放内存。
+    /// 清理 fired_set（所有已触发 timer 的事件已通过 check_timers → on_event_arrived 派发）。
     pub fn cleanup(&mut self) {
         self.fired_set.clear();
     }
@@ -147,22 +150,26 @@ impl AsyncJoinRuntime {
     pub fn find_child_by_async_id(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<FrameId> {
         self.entries.iter().find(|e| e.async_id == async_id).map(|e| e.child_fid)
     }
-    pub fn try_get_result(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<Value> {
-        self.entries.iter().find(|e| e.async_id == async_id).and_then(|e| e.result.clone())
+    /// 尝试获取 async 结果。若结果已就绪则消费（移除）该 entry。
+    /// 消费式读取避免 entries 无界增长。
+    pub fn try_get_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<Value> {
+        if let Some(idx) = self.entries.iter().position(|e| e.async_id == async_id) {
+            if self.entries[idx].result.is_some() {
+                return Some(self.entries.swap_remove(idx).result.unwrap());
+            }
+        }
+        None
     }
     pub fn set_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId, value: Value) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.async_id == async_id) {
             e.result = Some(value);
         }
     }
-    /// 清理已完成且 result 已被读取的 entry，释放内存。
-    /// 注意：AsyncHandleId 是 alloc_id 分配的递增值，不是 entries 索引，
-    /// 所以移除 entry 不影响 ID 有效性。
-    pub fn cleanup_consumed(&mut self, consumed_ids: &[crate::ir::Ir::AsyncHandleId]) {
-        self.entries.retain(|e| {
-            // 保留未完成的，或已完成但未被消费的
-            e.result.is_none() || !consumed_ids.contains(&e.async_id)
-        });
+    /// 移除指定 async_id 的 entry（waiter 已被 on_event_arrived 唤醒，值已注入）。
+    pub fn remove_entry(&mut self, async_id: crate::ir::Ir::AsyncHandleId) {
+        if let Some(idx) = self.entries.iter().position(|e| e.async_id == async_id) {
+            self.entries.swap_remove(idx);
+        }
     }
 }
 
@@ -177,18 +184,31 @@ impl Default for AsyncJoinRuntime {
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
-    /// 解析 await 事件源 + 检查就绪。
-    pub(super) fn resolve_and_check_await(
+    /// 解析 await 事件源 + 原子检查就绪并注册 waiter（消除 TOCTOU 竞态）。
+    ///
+    /// 返回 (event, ready_value, await_node_local)：
+    /// - ready_value = Some(v)：事件已就绪，调用方直接注入值继续执行
+    /// - ready_value = None：事件未就绪，waiter 已在锁内注册，调用方只需设帧状态后 return
+    ///
+    /// 关键：检查就绪与注册 waiter 在同一锁临界区，事件源无法在两步之间触发并丢失。
+    pub(super) fn resolve_check_and_register_await(
         &self,
         pending: &crate::ir::Ir::PendingAwait,
-    ) -> (RuntimeEvent, Option<Value>) {
+        fid: FrameId,
+    ) -> (RuntimeEvent, Option<Value>, crate::ir::Ir::NodeId) {
         use crate::ir::Ir::EventSourceKind;
+        let await_node = pending.await_node_local;
         match pending.event_kind {
             EventSourceKind::AsyncJoin => {
                 let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
                 let event = RuntimeEvent::AsyncJoin(async_id);
+                // 持 async_join_runtime 锁：try_get_result + 注册 waiter 原子化
+                // set_result 也在该锁内，无法在两步之间触发 on_event_arrived
                 let val = self.async_join_runtime.lock().try_get_result(async_id);
-                (event, val)
+                if val.is_none() {
+                    self.event_waiters.lock().push((event, fid));
+                }
+                (event, val, await_node)
             }
             EventSourceKind::Channel => {
                 let ch = pending
@@ -198,7 +218,12 @@ impl<S: LockStrategy> Engine<S> {
                     .expect("await on non-channel value");
                 let v = ch.recv().or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
                 let event = RuntimeEvent::ChannelReady(crate::ir::Ir::ChannelId(ch.id()));
-                (event, v)
+                if v.is_none() {
+                    // recv 失败：注册 waiter 后才释放控制权
+                    // ChannelNotify → on_event_arrived 会查 event_waiters，此时 waiter 已在位
+                    self.event_waiters.lock().push((event, fid));
+                }
+                (event, v, await_node)
             }
             EventSourceKind::Timer => {
                 let duration_ns = match pending.event_obj.heap_obj() {
@@ -209,17 +234,18 @@ impl<S: LockStrategy> Engine<S> {
                     }
                     _ => pending.event_obj.as_i64(),
                 };
-                let timer_id = self
-                    .timer_runtime
-                    .lock()
-                    .start(std::time::Duration::from_nanos(duration_ns as u64));
+                // 持 timer_runtime 锁：start + is_fired + 注册 waiter 原子化
+                // check_and_fire 也在该锁内，无法在 start 和 is_fired 之间弹出 timer
+                let mut tr = self.timer_runtime.lock();
+                let timer_id = tr.start(std::time::Duration::from_nanos(duration_ns as u64));
                 let event = RuntimeEvent::TimerFired(timer_id);
-                let fired = self.timer_runtime.lock().is_fired(timer_id);
-                if fired {
-                    (event, Some(Value::VOID))
-                } else {
-                    (event, None)
+                let fired = tr.is_fired(timer_id);
+                drop(tr); // 释放 timer 锁后再注册 waiter（避免与 event_waiters 锁顺序冲突）
+                if !fired {
+                    self.event_waiters.lock().push((event, fid));
                 }
+                let val = if fired { Some(Value::VOID) } else { None };
+                (event, val, await_node)
             }
             EventSourceKind::SubgraphComplete => {
                 panic!("SubgraphComplete should not go through await path");
@@ -227,8 +253,46 @@ impl<S: LockStrategy> Engine<S> {
         }
     }
 
-    /// 事件到达：注入值到等待帧 + 唤醒。
-    pub(super) fn on_event_arrived(&self, event: RuntimeEvent, value: Value, queue: &QueueHandle<'_>) {
+    /// 将事件值注入等待帧并唤醒（设 Ready + 推就绪队列 + 通知下游）。
+    /// select 帧重新 push gate 节点（不注入值），普通 await 帧注入事件值。
+    /// 返回 true 表示成功处理，false 表示帧非 WaitingEvent 状态（已被其他事件唤醒）。
+    /// 被 on_event_arrived 和 process_frame 的 pending_events 消费共用。
+    pub(super) fn apply_event_to_frame(&self, frame: &mut Frame, value: Value) -> bool {
+        let await_node = match frame.suspend_state {
+            SuspendState::WaitingEvent(node) => node,
+            _ => return false,
+        };
+        let node_offset = frame.node_offset;
+        let await_graph_id = NodeId(await_node.0 + node_offset);
+
+        // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
+        let is_select = self.graph.select_infos[await_graph_id.0 as usize].is_some();
+        if is_select {
+            frame.state = FrameState::Ready;
+            frame.suspend_state = SuspendState::NotSuspended;
+            frame.suspend_event = None;
+            frame.push_ready(await_node);
+        } else {
+            // 普通 await 帧：注入事件值到 await 节点
+            let consumer_count =
+                self.graph.downstreams[await_graph_id.0 as usize].len() as u16;
+            frame.set_value(await_node, value, consumer_count);
+            frame.state = FrameState::Ready;
+            frame.suspend_state = SuspendState::NotSuspended;
+            frame.suspend_event = None;
+            notify_downstream(
+                frame,
+                &self.graph,
+                await_node,
+                await_graph_id,
+                NodeId(node_offset),
+            );
+        }
+        true
+    }
+
+    /// 事件到达：注入值到等待帧 + 唤醒。返回被唤醒的 waiter 数量。
+    pub(super) fn on_event_arrived(&self, event: RuntimeEvent, value: Value, queue: &QueueHandle<'_>) -> usize {
         // 找等待该事件的帧（短临界区）
         let waiters: Vec<FrameId> = {
             let mut event_waiters = self.event_waiters.lock();
@@ -237,9 +301,12 @@ impl<S: LockStrategy> Engine<S> {
                 .filter(|(e, _)| *e == event)
                 .map(|(_, fid)| *fid)
                 .collect();
-            event_waiters.retain(|(_, fid)| !waiters.contains(fid));
+            // 用 HashSet 避免 O(n²) retain（Vec::contains 是 O(n)）
+            let waiter_set: std::collections::HashSet<FrameId> = waiters.iter().copied().collect();
+            event_waiters.retain(|(_, fid)| !waiter_set.contains(fid));
             waiters
         };
+        let woken = waiters.len();
 
         for fid in waiters {
             // 取出帧（保持 Box 不 unbox 以维持地址稳定）
@@ -247,51 +314,28 @@ impl<S: LockStrategy> Engine<S> {
                 let mut frames = self.frames.lock();
                 match frames.remove(&fid) {
                     Some(b) => b,
-                    None => continue, // 帧正被其他 worker 处理，跳过
+                    None => {
+                        // 帧正被 process_frame 处理（不在 HashMap）。
+                        // 暂存事件，process_frame insert 帧后消费（竞态兜底）。
+                        // waiter 已在上方从 event_waiters 移除，无需重复清理。
+                        self.pending_events.lock().insert(fid, (event, value.clone()));
+                        continue;
+                    }
                 }
             };
             let frame: &mut Frame = &mut *frame_box;
 
-            let await_node = match frame.suspend_state {
-                SuspendState::WaitingEvent(node) => node,
-                _ => {
-                    // 非事件等待帧：放回 + 跳过
-                    self.frames.lock().insert(fid, frame_box);
-                    continue;
-                }
-            };
-
-            let node_offset = frame.node_offset;
-            let await_graph_id = NodeId(await_node.0 + node_offset);
-
-            // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
-            let is_select = self.graph.select_infos[await_graph_id.0 as usize].is_some();
-            if is_select {
-                frame.state = FrameState::Ready;
-                frame.suspend_state = SuspendState::NotSuspended;
-                frame.suspend_event = None;
-                frame.push_ready(await_node);
-            } else {
-                // 普通 await 帧：注入事件值到 await 节点
-                let consumer_count =
-                    self.graph.downstreams[await_graph_id.0 as usize].len() as u16;
-                frame.set_value(await_node, value.clone(), consumer_count);
-                frame.state = FrameState::Ready;
-                frame.suspend_state = SuspendState::NotSuspended;
-                frame.suspend_event = None;
-                notify_downstream(
-                    frame,
-                    &self.graph,
-                    await_node,
-                    await_graph_id,
-                    NodeId(node_offset),
-                );
+            if !self.apply_event_to_frame(frame, value.clone()) {
+                // 非事件等待帧（已被其他事件唤醒）：放回 + 跳过
+                self.frames.lock().insert(fid, frame_box);
+                continue;
             }
 
             // 放回帧 + 入队（同一个 Box，地址不变）
             self.frames.lock().insert(fid, frame_box);
             queue.push(fid);
         }
+        woken
     }
 
     /// 取消帧：Suspended → Cancelling + 入就绪队列。
@@ -321,6 +365,8 @@ impl<S: LockStrategy> Engine<S> {
                 .lock()
                 .retain(|(_, fid)| *fid != frame_id);
         }
+        // 清理 pending_events（事件到达时帧不在 HashMap 的暂存事件）
+        self.pending_events.lock().remove(&frame_id);
 
         frame.state = FrameState::Cancelling;
         frame.suspend_state = SuspendState::NotSuspended;
@@ -333,8 +379,14 @@ impl<S: LockStrategy> Engine<S> {
     /// 检查 timer 事件
     pub(super) fn check_timers(&self, queue: &QueueHandle<'_>) {
         let fired_timers = self.timer_runtime.lock().check_and_fire();
-        for tid in fired_timers {
-            self.on_event_arrived(RuntimeEvent::TimerFired(tid), Value::VOID, queue);
+        for tid in &fired_timers {
+            self.on_event_arrived(RuntimeEvent::TimerFired(*tid), Value::VOID, queue);
+        }
+        // 所有已触发 timer 的事件已通过 on_event_arrived 派发，
+        // fired_set 中的残余条目（is_fired 未消费的）可安全清理：
+        // is_fired 仅在 start() 同锁内调用（检查新 timer），不会查询旧条目
+        if !fired_timers.is_empty() {
+            self.timer_runtime.lock().cleanup();
         }
     }
 }

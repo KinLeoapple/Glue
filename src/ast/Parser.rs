@@ -1665,13 +1665,46 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     /// Reject parenthesized conditions in conditional statements
+    ///
+    /// 仅当 `(...)` 包裹整个条件时才拒绝（C 风格 `if (cond)`）。
+    /// 若 `(...}` 只是更大表达式的一部分（如 `while (v & 1) == 0`，`)` 后跟二元
+    /// 运算符），则不拒绝——括号是子表达式的合法分组，非冗余条件包裹。
     fn reject_paren_condition(&mut self, kw_name: &str) -> ParseResult<()> {
-        if self.check(TokenKind::LParen) {
+        if self.check(TokenKind::LParen) && self.paren_wraps_full_condition() {
             let msg = format!("parentheses are not allowed around the {} condition", kw_name);
             self.report_error(&msg)?;
             unreachable!()
         }
         Ok(())
+    }
+
+    /// 当前 `(...)` 分组是否包裹了整个条件：扫描到匹配 `)`，检查其后是否为二元运算符。
+    /// 后跟二元运算符 → 括号是子表达式（如 `(v & 1) == 0`）→ 返回 false（不拒绝）。
+    /// 否则 → 括号包裹整个条件 → 返回 true（拒绝）。
+    fn paren_wraps_full_condition(&self) -> bool {
+        let mut i = self.current;
+        if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
+            return false;
+        }
+        let mut depth: usize = 0;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let next = i + 1;
+                        // `)` 后跟二元运算符 → 括号是子表达式，非整个条件
+                        return next >= self.tokens.len()
+                            || lookup_binary_op(self.tokens[next].kind).is_none();
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Error recovery: skip Tokens until a declaration start or a closing brace is encountered

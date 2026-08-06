@@ -88,6 +88,7 @@ impl Engine<Single> {
             async_join_runtime: RefCell::new(AsyncJoinRuntime::new()),
             event_waiters: RefCell::new(Vec::new()),
             pending_completions: RefCell::new(HashMap::new()),
+            pending_events: RefCell::new(HashMap::new()),
             result: RefCell::new(None),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             global_queue: None,
@@ -180,6 +181,7 @@ impl Engine<Multi> {
             async_join_runtime: ParkingMutex::new(AsyncJoinRuntime::new()),
             event_waiters: ParkingMutex::new(Vec::new()),
             pending_completions: ParkingMutex::new(HashMap::new()),
+            pending_events: ParkingMutex::new(HashMap::new()),
             result: ParkingMutex::new(None),
             ready_frames: None,
             global_queue: Some(Injector::new()),
@@ -246,7 +248,7 @@ fn worker_main(
             shared.process_frame(fid, &queue);
             {
                 let _g = shared.wakeup.as_ref().unwrap().0.lock();
-                shared.wakeup.as_ref().unwrap().1.notify_all();
+                shared.wakeup.as_ref().unwrap().1.notify_one();
             }
             continue;
         }
@@ -257,7 +259,7 @@ fn worker_main(
             shared.process_frame(fid, &queue);
             {
                 let _g = shared.wakeup.as_ref().unwrap().0.lock();
-                shared.wakeup.as_ref().unwrap().1.notify_all();
+                shared.wakeup.as_ref().unwrap().1.notify_one();
             }
             continue;
         }
@@ -268,26 +270,14 @@ fn worker_main(
             shared.process_frame(fid, &queue);
             {
                 let _g = shared.wakeup.as_ref().unwrap().0.lock();
-                shared.wakeup.as_ref().unwrap().1.notify_all();
+                shared.wakeup.as_ref().unwrap().1.notify_one();
             }
             continue;
         }
 
-        // 4. 无工作：减少活跃计数，检查是否全部空闲
-        {
-            let mut active = shared.active_count.as_ref().unwrap().lock();
-            *active -= 1;
-            if *active == 0 {
-                drop(active);
-                {
-                    let _g = shared.wakeup.as_ref().unwrap().0.lock();
-                    shared.wakeup.as_ref().unwrap().1.notify_all();
-                }
-                return;
-            }
-        }
-
-        // 5. park（等待唤醒，避免 busy-wait）
+        // 4+5. 无工作：在 wakeup 锁内减少活跃计数 + park
+        // 合并 active_count 减量与 park 到同一 wakeup 锁临界区，消除 lost-wakeup 窗口：
+        // notify_one 必须先获取 wakeup 锁，因此无法在减量与 wait_for 之间插入通知
         {
             let mut guard = shared.wakeup.as_ref().unwrap().0.lock();
             if shared.result.lock().is_some() {
@@ -303,6 +293,30 @@ fn worker_main(
             // park 前检查 timer（可能在 park 准备期间有 timer 到期）
             let queue = QueueHandle::Multi(&local_queue);
             shared.check_timers(&queue);
+            // check_timers 可能将就绪帧推入 local_queue，需重新检查避免无效 park
+            if !local_queue.is_empty() || !shared.global_queue.as_ref().unwrap().is_empty() {
+                let mut active = shared.active_count.as_ref().unwrap().lock();
+                *active += 1;
+                continue;
+            }
+            // 减少活跃计数（在 wakeup 锁内，消除 lost-wakeup 窗口）
+            let should_exit = {
+                let mut active = shared.active_count.as_ref().unwrap().lock();
+                *active -= 1;
+                if *active == 0 {
+                    // 最后一个活跃 worker：检查是否有 pending timer 或 event_waiters
+                    let has_pending_timer = shared.timer_runtime.lock().next_deadline().is_some();
+                    let has_event_waiters = !shared.event_waiters.lock().is_empty();
+                    !has_pending_timer && !has_event_waiters
+                } else {
+                    false
+                }
+            };
+            if should_exit {
+                // 无 pending 工作：唤醒其他 parked worker 后退出
+                shared.wakeup.as_ref().unwrap().1.notify_all();
+                return;
+            }
             // park timeout = 最近 timer deadline（无 timer 则默认 10ms）
             let park_timeout = shared.timer_runtime.lock().next_deadline()
                 .map(|deadline| {

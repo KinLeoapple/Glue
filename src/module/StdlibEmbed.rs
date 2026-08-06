@@ -92,6 +92,12 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/net/TcpStream.glue", include_str!("../stdlib/std/net/TcpStream.glue")),
     ("std/net/TcpListener.glue", include_str!("../stdlib/std/net/TcpListener.glue")),
     ("std/net/UdpSocket.glue", include_str!("../stdlib/std/net/UdpSocket.glue")),
+    // math 模块
+    ("std/math/pack.glue",  include_str!("../stdlib/std/math/pack.glue")),
+    ("std/math/Math.glue",  include_str!("../stdlib/std/math/Math.glue")),
+    ("std/math/Power.glue", include_str!("../stdlib/std/math/Power.glue")),
+    ("std/math/Trig.glue",  include_str!("../stdlib/std/math/Trig.glue")),
+    ("std/math/Round.glue", include_str!("../stdlib/std/math/Round.glue")),
 ];
 
 /// 按路径查找标准库文件
