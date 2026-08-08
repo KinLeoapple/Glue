@@ -501,44 +501,20 @@ pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: 将值包装为 ThrowVal(Err)（throw 语句用）。
 ///
 /// Glue 无 try-catch，throw 产 ThrowVal(Err) + Return 信号，逐层透传至顶层。
-/// - 输入为 Record（错误类型 ADT 构造结果）→ 直接作为 ThrowVal(Err(record))
-/// - 输入为 ThrowVal（已是 throw 值）→ 直接返回
-/// - 其他值 → 包装为单字段 Error record 再作为 ThrowVal(Err)
+/// Err payload 直接持有 thrown 值本身（Bug #27 修复前曾把原始类型包装为
+/// Error(value:v) record，导致需要 Error(Error(v)) 嵌套解构）。
+/// - 输入为 ThrowVal（已是 throw 值）→ 直接返回（幂等）
+/// - 其他值（标量/Str/Record/Adt/Array）→ 直接作为 ThrowVal(Err(v))
 pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
-    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
-    // Record（错误类型）→ 直接作为 Err payload
-    if let Some(HeapObj::Record(record)) = v.heap_obj() {
-        return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(Arc::new(record.clone())),
-        }));
-    }
-    // Adt（错误类型 ADT）→ 转换为 Record 后作为 Err payload
-    if let Some(HeapObj::Adt(a)) = v.heap_obj() {
-        let record = RecordValue {
-            type_name: a.type_name.clone(),
-            fields: a.fields.iter().map(|f| f.value.clone()).collect(),
-            field_names: a.fields.iter().map(|f| f.name.clone()).collect(),
-            field_ref_bits: 0,
-        };
-        return Value::ref_val(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(Arc::new(record)),
-        }));
-    }
-    // 已是 ThrowVal → 直接返回
+    // 已是 ThrowVal → 直接返回（幂等，支持 re-throw）
     if let Some(HeapObj::ThrowVal(_)) = v.heap_obj() {
         return v;
     }
-    // 其他值 → 包装为 Error record
-    let record = Arc::new(RecordValue {
-        type_name: "Error".to_string(),
-        fields: vec![v],
-        field_names: vec![Some("value".to_string())],
-        field_ref_bits: 0,
-    });
-    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    // 任意值直接作为 Err payload（原始类型不再包装为 Error record）
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
 
 /// compute_fn: 将值包装为 ThrowVal(Ok(val))（Ok 构造器用）。
@@ -549,39 +525,16 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
 }
 
-/// compute_fn: 将 Record 包装为 ThrowVal(Err(record))（Err 构造器用）。
+/// compute_fn: 将值包装为 ThrowVal(Err(v))（Err 构造器用）。
 ///
-/// 输入为 record 构造节点的结果（已通过 compute_record_construct 构造为 RecordValue）。
-/// 此函数将其包装为 ThrowVal(Err(record))。
+/// 输入通常为 record_construct 节点的结果（Record/Adt），但 Err 构造器对任意
+/// 值类型一视同仁：直接作为 ThrowVal(Err(v))。与 compute_throw_wrap_err 一致，
+/// 不再对原始类型做 Error(value:v) 包装（Bug #27）。
 pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
-    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
-    // v 应为 Record 或 Adt（由 record_construct 节点产生）
-    if let Some(HeapObj::Record(record)) = v.heap_obj() {
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(Arc::new(record.clone())),
-        }))
-    } else if let Some(HeapObj::Adt(a)) = v.heap_obj() {
-        // Adt → 转换为 Record 后作为 Err payload
-        let record = RecordValue {
-            type_name: a.type_name.clone(),
-            fields: a.fields.iter().map(|f| f.value.clone()).collect(),
-            field_names: a.fields.iter().map(|f| f.name.clone()).collect(),
-            field_ref_bits: 0,
-        };
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(Arc::new(record)) }))
-    } else {
-        // 非 record/adt 值，包装为单字段 Error record
-        let record = Arc::new(RecordValue {
-            type_name: "Error".to_string(),
-            fields: vec![v],
-            field_names: vec![Some("value".to_string())],
-            field_ref_bits: 0,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
-    }
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
 
 /// compute_fn (idx 47): `?` 运算符（Propagate）。
@@ -1464,19 +1417,18 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 统一机制：Record 与 Adt 均通过 `find_field(name)` 按名取值，
 /// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
     use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
     let name = graph.field_set_names[node.0 as usize].as_deref();
     let make_err = |msg: &str| {
-        let record = Arc::new(RecordValue {
+        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
             type_name: "FieldError".to_string(),
             fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+        }));
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
     };
     let Some(h) = record_val.heap_obj() else {
         return make_err("field access on non-record value");
@@ -1520,19 +1472,18 @@ pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: 数组索引（从 ArrayValue 按 i32 索引取元素）
 /// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
     use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let idx = frame.get_value_by_global(inputs[1]).as_i32() as usize;
     let make_err = |msg: &str| {
-        let record = Arc::new(RecordValue {
+        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
             type_name: "IndexError".to_string(),
             fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+        }));
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
     };
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
@@ -1556,7 +1507,6 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
 /// - array：按元素索引切片，返回新 array
 /// 越界时 clamp 到 [0, len]，与 Rust 切片语义一致（不 panic）。
 pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
     use crate::value::{HeapObj, ArrayValue, GlueStr, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
@@ -1567,13 +1517,13 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
         end = end.saturating_add(1);
     }
     let make_err = |msg: &str| {
-        let record = Arc::new(RecordValue {
+        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
             type_name: "SliceError".to_string(),
             fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+        }));
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
     };
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
@@ -1614,19 +1564,18 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// 两输入：lhs, rhs。任一非 str 时返回错误值。
 pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
     use crate::value::{HeapObj, GlueStr, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
     let make_err = |msg: &str| {
-        let record = Arc::new(RecordValue {
+        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
             type_name: "TypeError".to_string(),
             fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+        }));
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
     };
     match (lhs.heap_obj(), rhs.heap_obj()) {
         (Some(HeapObj::Str(a)), Some(HeapObj::Str(b))) => {
@@ -1790,9 +1739,9 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
             if idx == 0 {
                 match &tv.payload {
                     crate::value::ThrowPayload::Ok(v) => v.clone(),
-                    crate::value::ThrowPayload::Err(r) => {
-                        Value::ref_val(crate::value::HeapObj::Record((**r).clone()))
-                    }
+                    // Err 直接持有 thrown 值本身（Bug #27），match 模式 `Error(v)`
+                    // 的 v 直接绑定到 throw 的值，无需 Error(Error(v)) 嵌套解构
+                    crate::value::ThrowPayload::Err(v) => v.clone(),
                 }
             } else {
                 Value::VOID
@@ -2068,6 +2017,44 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     Value::VOID
 }
 
+/// compute_fn (idx 301): 数组索引存储 `arr[i] = x`。
+///
+/// 三输入：arr, index, value。原地修改 Array 堆对象的 elements 向量。
+/// 与 record_field_set 同语义：通过 Arc::as_ptr 直接修改堆数据，
+/// 确保 &self 引用语义（修改对所有持有者可见）。
+///
+/// Safety: 引擎单线程执行，caller 帧在 callee 执行期间 Suspended，无并发访问。
+/// 越界索引扩展数组到 idx+1（补 Void），与动态数组语义一致。
+pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let idx = frame.get_value_by_global(inputs[1]).as_usize();
+    let new_value = frame.get_value_by_global(inputs[2]);
+
+    let arr_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
+    if let Some(val) = frame.value_table.get_value_mut(arr_node_local.0 as usize) {
+        if let Value::Ref(arc) = val {
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
+            unsafe {
+                if let crate::value::HeapObj::Array(arr) = &mut *ptr {
+                    if idx >= arr.elements.len() {
+                        arr.elements.resize(idx + 1, Value::VOID);
+                        // SOA 布局在 resize 后需重建（新增元素填充 Void，SOA 无法简单扩展）
+                        arr.scalar_soa = None;
+                    }
+                    arr.elements[idx] = new_value.clone();
+                    // 同步更新 SOA：若类型匹配则就地写入，否则失效 SOA 缓存
+                    if let Some(ref mut soa) = arr.scalar_soa {
+                        if !soa.try_store(idx, &new_value) {
+                            arr.scalar_soa = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Value::VOID
+}
+
 /// compute_fn: null 检查（检查值是否为 null，返回 bool）
 pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2173,10 +2160,24 @@ pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Range(Range::new(start, end, true)))
 }
 
-/// compute_fn: Elvis 运算（lhs ?: rhs）。lhs 为 null 时返回 rhs，否则返回 lhs。
+/// compute_fn: Elvis 运算（lhs ?: rhs）。
+///
+/// 统一处理 Nullable 与 Throw 两种"可能缺失值"的类型（Bug #28）：
+/// - ThrowVal(Ok(v)) → 返回 v（解包成功值）
+/// - ThrowVal(Err(_)) → 返回 rhs（错误时用默认值）
+/// - null（Nullable）→ 返回 rhs
+/// - 其他非空值 → 返回 lhs
 pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
+    // Throw 类型：Ok 解包，Err 用默认值
+    if let Some(crate::value::HeapObj::ThrowVal(tv)) = lhs.heap_obj() {
+        return match &tv.payload {
+            crate::value::ThrowPayload::Ok(v) => v.clone(),
+            crate::value::ThrowPayload::Err(_) => frame.get_value_by_global(inputs[1]),
+        };
+    }
+    // Nullable 类型：null 用默认值，非空返回 lhs
     if lhs.is_null() {
         frame.get_value_by_global(inputs[1])
     } else {
@@ -2247,6 +2248,19 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
+    if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+        let (ns, ne) = graph.subgraphs[target_sg.0 as usize].node_range;
+        eprintln!("[GATE] node={} cond={} target_sg={} sg_range=[{},{}) params={} branch_inputs={:?} args={}",
+            node.0, cond, target_sg.0, ns.0, ne.0, param_count, branch_inputs, args.len());
+        // dump branch 范围内每个节点的 const_values
+        for gid in ns.0..ne.0 {
+            let n = &graph.nodes[gid as usize];
+            let cv = &graph.const_values[gid as usize];
+            eprintln!("  [GATE-NODE] gid={} kind={:?} cf={} const_values={:?} inputs_count={}",
+                gid, n.kind, n.compute_fn.0, cv.is_some(), n.input_count);
+        }
+    }
+
     let gate_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
     frame.pending = Some(Pending::Call(PendingCall {
@@ -2316,19 +2330,18 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
 /// 发送后设置 pending_channel_notify，run_ready_nodes 消费时触发 ChannelReady 事件
 /// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
 pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
-    use std::sync::Arc;
     use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
     let val = frame.get_value_by_global(inputs[1]);
     let make_err = |msg: &str| {
-        let record = Arc::new(RecordValue {
+        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
             type_name: "ChannelError".to_string(),
             fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
             field_names: vec![Some("message".to_string())],
             field_ref_bits: 1,
-        });
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+        }));
+        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
     };
     let ch = match ch_val.heap_obj().and_then(|h| h.channel()) {
         Some(ch) => ch,
@@ -3118,7 +3131,8 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
     if n.input_count == 0 {
         return Value::VOID;
     }
-    frame.get_value_by_global(inputs[n.input_count as usize - 1])
+    let last_input = inputs[n.input_count as usize - 1];
+    frame.get_value_by_global(last_input)
 }
 
 /// compute_writeback（idx 49）：赋值外层变量，通过 root_frame_ptr 写回函数根帧。
@@ -3142,6 +3156,16 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
     let target = graph.writeback_targets[node.0 as usize]
         .expect("WriteBack node missing target");
     let consumer_count = graph.downstreams[target.0 as usize].len() as u16;
+
+    // 路径 0：写入当前帧（same_function 闭包调用场景）。
+    // same_function 帧的值表扩展到父帧大小，target 可能在当前帧范围内。
+    // 若不写当前帧：a() 修改 log 后 WriteBack 只写父帧链（main 帧），
+    // a 子帧自身的 log 仍为旧值；后续 b() 从 a 子帧（parent_frame）读取
+    // upvalue 时得到陈旧值，导致闭包链共享可变捕获失效（Bug #31）。
+    let cur_local = target.0.wrapping_sub(frame.node_offset);
+    if (cur_local as usize) < frame.value_table.len() {
+        frame.set_value(NodeId(cur_local), val.clone(), consumer_count);
+    }
 
     // 路径 1：遍历 parent_frame_ptr 链，写入所有包含 target 的祖先帧。
     // 不能只写最近父帧就 break：嵌套 same_function 子图（如 if 分支 → 循环体 →

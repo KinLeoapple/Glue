@@ -1,0 +1,40 @@
+fun main(): void {
+    // 单层循环：2*3 是不变量（不依赖循环变量）
+    var sum: i32 = 0
+    var i: i32 = 0
+    while i < 5 {
+        sum = sum + 2 * 3
+        i = i + 1
+    }
+    println("sum = {sum}")  // expect 30
+
+    // 嵌套循环：外层不变量
+    var total: i32 = 0
+    var ri: i32 = 0
+    while ri < 3 {
+        var ci: i32 = 0
+        while ci < 3 {
+            total = total + 10  // 10 是不变量
+            ci = ci + 1
+        }
+        ri = ri + 1
+    }
+    println("total = {total}")  // expect 90
+
+    // 嵌套循环：内层引用外层变量
+    var matrix: i32[][] = []
+    var ri2: i32 = 0
+    while ri2 < 3 {
+        var row: i32[] = []
+        var ci2: i32 = 0
+        while ci2 < 3 {
+            row = row ++ [ri2 * 3 + ci2]
+            ci2 = ci2 + 1
+        }
+        matrix = matrix ++ [row]
+        ri2 = ri2 + 1
+    }
+    println("matrix[0][0] = {matrix[0][0]}")  // expect 0
+    println("matrix[1][2] = {matrix[1][2]}")  // expect 5
+    println("matrix[2][2] = {matrix[2][2]}")  // expect 8
+}

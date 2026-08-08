@@ -397,6 +397,8 @@ compute_fn_ids! {
     299 => CF_NE_OBJ,
     // bool 不等（300）：与 CF_EQ_BOOL(27) 对称，as_i32 对 bool 恒为 0 故不能走 CF_NE_I32
     300 => CF_NE_BOOL,
+    // 数组索引存储（301）：arr[i] = x，原地修改 Array 堆对象
+    301 => CF_ARRAY_STORE,
 }
 
 // =========================================================================
@@ -1723,6 +1725,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         299 => super::Compute::compute_ne_obj,
         // bool 不等（300）
         300 => super::Compute::compute_ne_bool,
+        // 数组索引存储（301）
+        301 => super::Compute::compute_array_store,
     }
 }
 
@@ -1767,9 +1771,9 @@ pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
     s.insert(CF_NE_OBJ);
     // ── bool 不等（纯比较，与 CF_EQ_BOOL 对称）──
     s.insert(CF_NE_BOOL);
-    // ── 栈分配构造（无外部可观察副作用）──
-    s.insert(CF_RECORD_CONSTRUCT_STACK); // record_construct_stack
-    s.insert(CF_ARRAY_CONSTRUCT_STACK); // array_construct_stack
+    // 注意：CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK 不加入 pure_set。
+    // 虽然它们无外部可观察副作用，但每次执行产生独立对象（不同内存地址）。
+    // 若被 LICM 外提或 CSE 消除，循环迭代会共享同一对象，导致状态污染。
     s
 }
 
@@ -1822,6 +1826,7 @@ macro_rules! node_metadata {
             ;
             bool_flag(tail_call_flags, set_tail_call)
             bool_flag(safe_op_flags, set_safe_op)
+            bool_flag(hoisted_node, set_hoisted)
             ;
             bool_val(slice_inclusive, set_slice_inclusive)
         }
@@ -1855,6 +1860,7 @@ macro_rules! node_metadata {
             ;
             bool_flag(tail_call_flags, set_tail_call)
             bool_flag(safe_op_flags, set_safe_op)
+            bool_flag(hoisted_node, set_hoisted)
             ;
             bool_val(slice_inclusive, set_slice_inclusive)
         }
@@ -1958,6 +1964,12 @@ pub struct DataFlowGraph {
     /// 安全操作标记（按 NodeId 索引，true=inputs[0] 为 Null 时短路返回 Null）
     /// 用于 ?.field / ?.method() / cast(x).to(T)?
     pub safe_op_flags: Vec<bool>,
+    /// 外提/展开/内联产生的节点标记（按 NodeId 索引）
+    /// true = 由 pass 层追加的节点，需被所属函数子图的帧初始化
+    pub hoisted_node: Vec<bool>,
+    /// hoisted 节点的归属函数子图（按 NodeId 索引，仅 hoisted_node=true 时有效）
+    /// rebuild 按函数级子图分组重排时，将 hoisted 节点排到 owner 子图范围内
+    pub hoisted_owners: Vec<SubGraphId>,
     /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
     pub batch_infos: Vec<Option<BatchInfo>>,
     /// IR 编译期错误（未实现的特性、找不到函数等），build() 末尾从 IrBuilder.errors 移入
@@ -2012,6 +2024,8 @@ impl DataFlowGraph {
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
             safe_op_flags: Vec::new(),
+            hoisted_node: Vec::new(),
+            hoisted_owners: Vec::new(),
             batch_infos: Vec::new(),
             trait_construct_infos: Vec::new(),
             lazy_construct_infos: Vec::new(),
@@ -2035,11 +2049,182 @@ impl DataFlowGraph {
         self.const_values.push(None);
         // 元数据字段 push（由 node_metadata! 宏统一生成）
         node_metadata!(metadata_push, self);
+        self.hoisted_owners.push(SubGraphId(u32::MAX));
         id
     }
 
     // ---- 节点元数据 setter（由 node_metadata! 宏统一生成）----
     node_metadata!(metadata_setters);
+
+    /// 克隆源节点的所有元数据到目标节点（用于 pass 层节点克隆）。
+    pub fn clone_node_metadata(&mut self, src_idx: usize, dst_idx: usize) {
+        self.const_values[dst_idx] = self.const_values[src_idx].clone();
+        self.call_targets[dst_idx] = self.call_targets[src_idx];
+        self.gate_branches[dst_idx] = self.gate_branches[src_idx].clone();
+        self.control_signal_nodes[dst_idx] = self.control_signal_nodes[src_idx];
+        self.field_access_infos[dst_idx] = self.field_access_infos[src_idx];
+        self.record_lit_infos[dst_idx] = self.record_lit_infos[src_idx].clone();
+        self.ffi_call_names[dst_idx] = self.ffi_call_names[src_idx].clone();
+        self.field_set_names[dst_idx] = self.field_set_names[src_idx].clone();
+        self.vtable_call_methods[dst_idx] = self.vtable_call_methods[src_idx];
+        self.await_event_sources[dst_idx] = self.await_event_sources[src_idx];
+        self.closure_infos[dst_idx] = self.closure_infos[src_idx].clone();
+        self.partial_infos[dst_idx] = self.partial_infos[src_idx].clone();
+        self.closure_call_arg_counts[dst_idx] = self.closure_call_arg_counts[src_idx];
+        self.select_infos[dst_idx] = self.select_infos[src_idx].clone();
+        self.writeback_targets[dst_idx] = self.writeback_targets[src_idx];
+        self.batch_infos[dst_idx] = self.batch_infos[src_idx].clone();
+        self.trait_construct_infos[dst_idx] = self.trait_construct_infos[src_idx].clone();
+        self.lazy_construct_infos[dst_idx] = self.lazy_construct_infos[src_idx].clone();
+        self.record_extend_infos[dst_idx] = self.record_extend_infos[src_idx].clone();
+        self.global_load_slots[dst_idx] = self.global_load_slots[src_idx];
+        self.global_store_slots[dst_idx] = self.global_store_slots[src_idx];
+        self.pattern_ctor_names[dst_idx] = self.pattern_ctor_names[src_idx].clone();
+        self.pattern_field_indices[dst_idx] = self.pattern_field_indices[src_idx];
+        self.cast_target_types[dst_idx] = self.cast_target_types[src_idx].clone();
+        self.tail_call_flags[dst_idx] = self.tail_call_flags[src_idx];
+        self.safe_op_flags[dst_idx] = self.safe_op_flags[src_idx];
+        self.slice_inclusive[dst_idx] = self.slice_inclusive[src_idx];
+        self.hoisted_node[dst_idx] = self.hoisted_node[src_idx];
+        self.hoisted_owners[dst_idx] = self.hoisted_owners[src_idx];
+    }
+
+    /// 直接添加节点（不经过 Builder），用于 pass 层变换。
+    /// 自动同步元数据 push（与 add_node 相同）。
+    pub fn add_node_raw(
+        &mut self,
+        kind: NodeKind,
+        inputs: &[NodeId],
+        compute_fn: ComputeFnId,
+    ) -> NodeId {
+        let inputs_offset = self.inputs_pool.push(inputs);
+        let id = NodeId(self.nodes.len() as u32);
+        self.nodes.push(Node {
+            kind,
+            input_count: inputs.len() as u8,
+            inputs_offset,
+            compute_fn,
+        });
+        self.downstreams.push(Vec::new());
+        self.const_values.push(None);
+        node_metadata!(metadata_push, self);
+        self.hoisted_owners.push(SubGraphId(u32::MAX));
+        id
+    }
+
+    /// 找到包含给定节点的函数子图（最外层，loop_kind=None 且 loop_parent_sg=None）。
+    /// 用于 pass 层确定新追加节点应归属的子图。
+    pub fn find_function_sg_for_node(&self, node: NodeId) -> Option<SubGraphId> {
+        let mut best_sg: Option<SubGraphId> = None;
+        let mut best_range_size = u32::MAX;
+        for (idx, sg) in self.subgraphs.iter().enumerate() {
+            let (start, end) = sg.node_range;
+            if node.0 >= start.0 && node.0 < end.0 {
+                let size = end.0 - start.0;
+                if size < best_range_size {
+                    best_range_size = size;
+                    best_sg = Some(SubGraphId(idx as u32));
+                }
+            }
+        }
+        // 从最内层子图向上找到函数子图
+        if let Some(inner_sg_id) = best_sg {
+            let mut cur = inner_sg_id;
+            loop {
+                let sg = &self.subgraphs[cur.0 as usize];
+                if sg.loop_kind == LoopKind::None && sg.loop_parent_sg.is_none() {
+                    return Some(cur);
+                }
+                // 找包含 cur 的更外层子图
+                let (cs, ce) = sg.node_range;
+                let mut parent: Option<SubGraphId> = None;
+                let mut parent_size = u32::MAX;
+                for (idx, psg) in self.subgraphs.iter().enumerate() {
+                    if idx == cur.0 as usize {
+                        continue;
+                    }
+                    let (ps, pe) = psg.node_range;
+                    if cs.0 >= ps.0 && ce.0 <= pe.0 {
+                        let size = pe.0 - ps.0;
+                        if size < parent_size {
+                            parent_size = size;
+                            parent = Some(SubGraphId(idx as u32));
+                        }
+                    }
+                }
+                match parent {
+                    Some(p) => cur = p,
+                    None => return Some(cur), // 已到最外层
+                }
+            }
+        }
+        None
+    }
+
+    /// 找到包含给定节点的最内层子图。
+    /// 用于 pass 层判断节点是否直接在函数级子图中（而非嵌套在 Gate 分支/循环体内）。
+    pub fn find_innermost_sg_for_node(&self, node: NodeId) -> Option<SubGraphId> {
+        let mut best_sg: Option<SubGraphId> = None;
+        let mut best_range_size = u32::MAX;
+        for (idx, sg) in self.subgraphs.iter().enumerate() {
+            let (start, end) = sg.node_range;
+            if node.0 >= start.0 && node.0 < end.0 {
+                let size = end.0 - start.0;
+                if size < best_range_size {
+                    best_range_size = size;
+                    best_sg = Some(SubGraphId(idx as u32));
+                }
+            }
+        }
+        best_sg
+    }
+
+    /// 找到包含给定子图的最小外层子图（immediate parent）。
+    /// 用于 LICM：不变量应外提到 loop_sg 的 immediate parent，
+    /// 而非总是提到 function sg（嵌套循环时 outer loop 的 body_sg 才是正确目标）。
+    pub fn find_immediate_parent_sg(&self, sg_id: SubGraphId) -> Option<SubGraphId> {
+        let (cs, ce) = self.subgraphs[sg_id.0 as usize].node_range;
+        let mut best: Option<SubGraphId> = None;
+        let mut best_size = u32::MAX;
+        for (idx, psg) in self.subgraphs.iter().enumerate() {
+            if idx == sg_id.0 as usize {
+                continue;
+            }
+            let (ps, pe) = psg.node_range;
+            // 必须严格包含 sg 的范围
+            if ps.0 <= cs.0 && pe.0 >= ce.0 && (ps.0 < cs.0 || pe.0 > ce.0) {
+                let size = pe.0 - ps.0;
+                if size < best_size {
+                    best_size = size;
+                    best = Some(SubGraphId(idx as u32));
+                }
+            }
+        }
+        best
+    }
+
+    /// 扩展子图的 node_range 以包含新追加的节点，并递归扩展所有祖先子图。
+    /// 在 pass 层添加节点后调用，确保 rebuild 时新节点被包含在子图范围内，
+    /// 同时保持子图嵌套结构一致性（祖先范围必须包含后代范围）。
+    pub fn extend_function_sg_range(&mut self, sg_id: SubGraphId, new_node_end: NodeId) {
+        // 扩展目标子图
+        let sg = &mut self.subgraphs[sg_id.0 as usize];
+        if sg.node_range.1 < new_node_end {
+            sg.node_range.1 = new_node_end;
+        }
+        // 递归扩展所有包含目标子图的祖先
+        let (cs, ce) = self.subgraphs[sg_id.0 as usize].node_range;
+        for (idx, psg) in self.subgraphs.iter_mut().enumerate() {
+            if idx == sg_id.0 as usize {
+                continue;
+            }
+            let (ps, pe) = psg.node_range;
+            // 如果祖先包含目标子图的范围，且新节点超出祖先范围，则扩展祖先
+            if ps.0 <= cs.0 && pe.0 >= ce.0 && pe.0 < new_node_end.0 {
+                psg.node_range.1 = new_node_end;
+            }
+        }
+    }
 
     /// 添加子图，返回其 SubGraphId。
     pub fn add_subgraph(&mut self, sg: SubGraph) -> SubGraphId {
@@ -2151,17 +2336,104 @@ impl DataFlowGraph {
             cur
         };
 
-        // ── 1. 顺序遍历计算保留节点的新编号 ──
-        // 必须保持原有节点顺序（0..total），因为子图 node_range 是嵌套的
-        // （父子图范围包含子子图节点），顺序遍历天然保证每个子图节点在新数组中连续。
+        // ── 1. 按函数级子图分组排列存活节点 ──
+        // pass 层（LICM/inline）追加的 hoisted 节点在 graph.nodes 末尾，不在 caller
+        // 子图的 node_range 内。如果按 0..total 顺序压缩，hoisted 节点的 new_id 在末尾，
+        // 不在 caller 的 node_range 内 → caller 帧不执行它们 → 变换无效。
+        //
+        // 改为按函数级子图分组排列：每个函数级子图的原生存活节点 + 属于它的 hoisted
+        // 存活节点，使 hoisted 节点的 new_id 紧跟在 caller 原生节点后面，保证连续。
         let total = self.nodes.len();
         let mut old_to_new: Vec<Option<NodeId>> = vec![None; total];
         let mut new_to_old: Vec<usize> = Vec::with_capacity(total);
         let mut new_nodes: Vec<Node> = Vec::with_capacity(total);
 
+        // 1a. 计算每个节点的归属函数级子图（保存副本供步骤 5 使用，避免被步骤 3b 压缩破坏）
+        let mut node_owner: Vec<u32> = vec![u32::MAX; total];
+        for sg in &self.subgraphs {
+            if sg.loop_kind != LoopKind::None || sg.loop_parent_sg.is_some() {
+                continue;
+            }
+            let start = sg.node_range.0.0 as usize;
+            let end = (sg.node_range.1.0 as usize).min(total);
+            for idx in start..end {
+                node_owner[idx] = sg.id.0;
+            }
+        }
+        // hoisted 节点的归属（不在任何 node_range 内，通过 hoisted_owners 确定）
+        for idx in 0..total {
+            if self.hoisted_node[idx] && node_owner[idx] == u32::MAX {
+                node_owner[idx] = self.hoisted_owners[idx].0;
+            }
+        }
+        // 保存旧索引的 node_owner 副本（步骤 5 在步骤 3b 压缩后仍需按旧索引访问）
+        let node_owner_old = node_owner.clone();
+
+        // 1b. 收集函数级子图列表（按 node_range.0 排序，保持原有顺序）
+        let mut func_sgs: Vec<u32> = self
+            .subgraphs
+            .iter()
+            .filter(|sg| sg.loop_kind == LoopKind::None && sg.loop_parent_sg.is_none())
+            .map(|sg| sg.id.0)
+            .collect();
+        func_sgs.sort_by_key(|&sg_id| self.subgraphs[sg_id as usize].node_range.0);
+
+        // 1c. 按函数级子图顺序分配 new_id
+        for &sg_id in &func_sgs {
+            let sg = &self.subgraphs[sg_id as usize];
+            let start = sg.node_range.0.0 as usize;
+            let end = (sg.node_range.1.0 as usize).min(total);
+
+            // 原生存活节点（含嵌套子图节点，跳过 hoisted）
+            for old_idx in start..end {
+                if self.hoisted_node[old_idx] {
+                    continue;
+                }
+                let old_id = NodeId(old_idx as u32);
+                if dead.contains(&old_id) || redirect.contains_key(&old_id) {
+                    continue;
+                }
+                // 防重复：如果节点已在其他子图循环中被分配（node_range 重叠），跳过
+                if old_to_new[old_idx].is_some() {
+                    continue;
+                }
+                let new_id = NodeId(new_nodes.len() as u32);
+                old_to_new[old_idx] = Some(new_id);
+                new_to_old.push(old_idx);
+                new_nodes.push(self.nodes[old_idx]);
+            }
+
+            // hoisted 存活节点（owner == sg_id）
+            for old_idx in 0..total {
+                if !self.hoisted_node[old_idx] {
+                    continue;
+                }
+                if self.hoisted_owners[old_idx].0 != sg_id {
+                    continue;
+                }
+                let old_id = NodeId(old_idx as u32);
+                if dead.contains(&old_id) || redirect.contains_key(&old_id) {
+                    continue;
+                }
+                if old_to_new[old_idx].is_some() {
+                    continue;
+                }
+                let new_id = NodeId(new_nodes.len() as u32);
+                old_to_new[old_idx] = Some(new_id);
+                new_to_old.push(old_idx);
+                new_nodes.push(self.nodes[old_idx]);
+            }
+        }
+
+        // 1d. 未归属的存活节点（不应存在，安全起见排到最后）
         for old_idx in 0..total {
+            if old_to_new[old_idx].is_some() {
+                continue;
+            }
             let old_id = NodeId(old_idx as u32);
-            if dead.contains(&old_id) || redirect.contains_key(&old_id) { continue; }
+            if dead.contains(&old_id) || redirect.contains_key(&old_id) {
+                continue;
+            }
             let new_id = NodeId(new_nodes.len() as u32);
             old_to_new[old_idx] = Some(new_id);
             new_to_old.push(old_idx);
@@ -2235,7 +2507,17 @@ impl DataFlowGraph {
         }
         compress_bool!(tail_call_flags);
         compress_bool!(safe_op_flags);
+        compress_bool!(hoisted_node);
         compress_bool!(slice_inclusive);
+
+        // 3b2. 压缩 hoisted_owners: Vec<SubGraphId>
+        {
+            let mut v: Vec<SubGraphId> = Vec::with_capacity(new_to_old.len());
+            for &old_idx in &new_to_old {
+                v.push(self.hoisted_owners[old_idx]);
+            }
+            self.hoisted_owners = v;
+        }
 
         // 3c. 压缩含 NodeId 的向量
         // await_event_sources: Vec<Option<NodeId>>
@@ -2306,20 +2588,52 @@ impl DataFlowGraph {
         }
 
         // ── 5. 重映射 subgraphs 内的 NodeId 引用 ──
-        // node_range 通过扫描旧范围内的存活节点重新计算，保证新范围内节点连续。
+        // node_range 通过扫描旧范围内的存活节点 + 属于该子图的 hoisted 节点重新计算。
+        // 步骤 1 已按函数级子图分组排列，hoisted 节点紧跟在原生节点后面，
+        // 因此新 node_range 自然连续（原生存活节点 new_id + hoisted 存活节点 new_id）。
         for sg in self.subgraphs.iter_mut() {
             let old_start = sg.node_range.0.0 as usize;
-            let old_end = sg.node_range.1.0 as usize;
+            let old_end = (sg.node_range.1.0 as usize).min(total);
+            let sg_id = sg.id;
             let mut new_start: Option<u32> = None;
             let mut new_end: u32 = 0;
+
+            // 辅助：更新 new_start/new_end
+            let mut update_range = |nid: NodeId| {
+                if new_start.is_none() {
+                    new_start = Some(nid.0);
+                }
+                if nid.0 + 1 > new_end {
+                    new_end = nid.0 + 1;
+                }
+            };
+
+            // 原生范围内的存活节点
             for old_idx in old_start..old_end {
-                if old_idx >= total { break; }
                 let old_id = NodeId(old_idx as u32);
-                if dead.contains(&old_id) || redirect.contains_key(&old_id) { continue; }
-                let new_id = old_to_new[old_idx].unwrap();
-                if new_start.is_none() { new_start = Some(new_id.0); }
-                new_end = new_id.0 + 1;
+                if dead.contains(&old_id) || redirect.contains_key(&old_id) {
+                    continue;
+                }
+                update_range(old_to_new[old_idx].unwrap());
             }
+
+            // 属于该子图的 hoisted 存活节点（使用 node_owner_old，因为 self.hoisted_owners
+            // 已在步骤 3b2 被压缩为新数组，不能再用旧索引访问）
+            for old_idx in 0..total {
+                if node_owner_old[old_idx] != sg_id.0 {
+                    continue;
+                }
+                // 跳过原生范围内的节点（已在上面处理）
+                if old_idx >= old_start && old_idx < old_end {
+                    continue;
+                }
+                let old_id = NodeId(old_idx as u32);
+                if dead.contains(&old_id) || redirect.contains_key(&old_id) {
+                    continue;
+                }
+                update_range(old_to_new[old_idx].unwrap());
+            }
+
             sg.node_range = match new_start {
                 Some(ns) => (NodeId(ns), NodeId(new_end)),
                 None => (NodeId(0), NodeId(0)), // 全部 dead，范围坍缩
@@ -2339,6 +2653,31 @@ impl DataFlowGraph {
             }
             // upvalue_outer_nodes: 捕获变量外层节点需重映射
             sg.upvalue_outer_nodes = sg.upvalue_outer_nodes.iter().map(|&n| remap_n(n)).collect();
+        }
+
+        // 验证：检查是否有悬空引用
+        if std::env::var("GLUE_VERIFY_GRAPH").is_ok() {
+            let total = self.nodes.len();
+            for (idx, node) in self.nodes.iter().enumerate() {
+                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                for &inp in inputs {
+                    if inp.0 as usize >= total {
+                        eprintln!("[VERIFY] node={} has dangling input {} (total={})", idx, inp.0, total);
+                    }
+                }
+            }
+            for (sg_idx, sg) in self.subgraphs.iter().enumerate() {
+                if sg.entry_node.0 as usize >= total {
+                    eprintln!("[VERIFY] sg={} has dangling entry_node {} (total={})", sg_idx, sg.entry_node.0, total);
+                }
+                if sg.return_node.0 as usize >= total {
+                    eprintln!("[VERIFY] sg={} has dangling return_node {} (total={})", sg_idx, sg.return_node.0, total);
+                }
+                let (s, e) = sg.node_range;
+                if e.0 < s.0 || e.0 as usize > total {
+                    eprintln!("[VERIFY] sg={} has invalid node_range [{},{}) (total={})", sg_idx, s.0, e.0, total);
+                }
+            }
         }
 
         old_to_new
@@ -2373,10 +2712,13 @@ pub fn expr_id_to_key(id: crate::ast::Ast::ExprId) -> u64 {
 /// - `sg`：递归子图 id（continue 跳转目标）
 /// - `iter_node`：For 循环 body_sg 中的迭代器参数节点（continue 需传递给尾递归；
 ///   None = While/Loop，param_count=0 无需传参）
+/// body_node_start: 循环体子图的起始节点 ID，用于判断捕获变量是否定义在循环体内。
+///   循环体内定义的变量在循环体帧销毁后不可访问，捕获此类变量的闭包必须走 Cell 路径。
 #[derive(Debug, Clone, Copy)]
 pub struct LoopContext {
     pub sg: SubGraphId,
     pub iter_node: Option<NodeId>,
+    pub body_node_start: u32,
 }
 
 // =========================================================================

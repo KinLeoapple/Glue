@@ -1,0 +1,237 @@
+// 探测：递归 rangeArr/reverseArr 后 inline (e ++ [1]).len() 是否失效
+fun rangeArr(n: i32): i32[] {
+    if n <= 0 { [] } else { rangeArr(n - 1) ++ [n - 1] }
+}
+fun reverseArr(arr: i32[]): i32[] {
+    var out: i32[] = []
+    var i: i32 = arr.len() - 1
+    while i >= 0 { out = out ++ [arr[i]]; i = i - 1 }
+    out
+}
+fun sumArr(arr: i32[]): i32 {
+    var s: i32 = 0
+    var i: i32 = 0
+    while i < arr.len() { s = s + arr[i]; i = i + 1 }
+    s
+}
+
+// 顶层工厂（用于闭包探测）
+type IntFn = () -> i32
+fun makeCounter(): IntFn {
+    var n: i32 = 0
+    fun() { n = n + 1; n }
+}
+
+// ─── Probe F 顶层函数（绕过 Bug #19 嵌套递归限制）───
+fun powLinear(base: i64, exp: i32): i64 {
+    if exp == 0i32 { 1i64 } else { base * powLinear(base, exp - 1) }
+}
+
+fun powNested(base: i64, exp: i32): i64 {
+    if exp == 0i32 {
+        1i64
+    } else {
+        if exp % 2 == 1i32 {
+            base * powNested(base * base, exp / 2)
+        } else {
+            powNested(base * base, exp / 2)
+        }
+    }
+}
+
+fun powMatch(base: i64, exp: i32): i64 {
+    match exp {
+        0 => 1i64
+        _ => if exp % 2 == 1i32 {
+            base * powMatch(base * base, exp / 2)
+        } else {
+            powMatch(base * base, exp / 2)
+        }
+    }
+}
+
+fun classify(n: i32): i32 {
+    if n == 0i32 {
+        0
+    } else {
+        if n > 0i32 { n } else { 0 - n }
+    }
+}
+
+fun main(): void {
+    println("=== edge_probe ===")
+
+    // ─── Probe A: Bug #39 递归数组后 inline concat 失效 ───
+    println("--- Probe A: Bug #39 recursive-then-empty ---")
+    val r10 = rangeArr(10)
+    println("1. rangeArr(10).len = {r10.len()}")
+    println("2. rangeArr(10)[0] = {r10[0]}")
+    println("3. rangeArr(10)[9] = {r10[9]}")
+    println("4. sumArr(rangeArr(10)) = {sumArr(r10)}")
+    val rev10 = reverseArr(r10)
+    println("5. reverseArr(rangeArr(10))[0] = {rev10[0]}")
+    println("6. reverseArr(rangeArr(10))[9] = {rev10[9]}")
+    val e1: i32[] = []
+    val e2: i32[] = []
+    println("7. e1 == e2: {e1 == e2}")
+    println("8. e1.len(): {e1.len()}")
+    println("9. (e1 ++ [1]).len(): {(e1 ++ [1]).len()}")  // 失效点
+    println("10. (e1 ++ e1).len(): {(e1 ++ e1).len()}")
+    println("11. sumArr(e1): {sumArr(e1)}")
+
+    // ─── Probe B: Bug #40 闭包数组调用 ───
+    println("--- Probe B: Bug #40 closure array call ---")
+    val f1 = fun() { 1 }
+    val f2 = fun() { 2 }
+    val f3 = fun() { 3 }
+    println("12. direct f1(): {f1()}")          // 期望 1
+    println("13. direct f2(): {f2()}")          // 期望 2
+    var fns_arr: IntFn[] = []
+    fns_arr = fns_arr ++ [f1]
+    fns_arr = fns_arr ++ [f2]
+    fns_arr = fns_arr ++ [f3]
+    println("14. fns_arr.len: {fns_arr.len()}")  // 期望 3
+    println("15. fns_arr[0](): {fns_arr[0]()}") // 期望 1，实际 void（Bug #40）
+    println("16. fns_arr[1](): {fns_arr[1]()}") // 期望 2，实际 void（Bug #40）
+    println("17. fns_arr[2](): {fns_arr[2]()}") // 期望 3，实际 void（Bug #40）
+    // 字面量数组中的闭包
+    val lit_arr = [fun() { 10 }, fun() { 20 }]
+    println("18. lit_arr[0](): {lit_arr[0]()}") // 期望 10（Bug #40？）
+    println("19. lit_arr[1](): {lit_arr[1]()}") // 期望 20（Bug #40？）
+
+    // ─── Probe C: 独立计数器交错调用 ───
+    println("--- Probe C: independent counter interleave ---")
+    val ca = makeCounter()
+    val cb = makeCounter()
+    println("20. ca() = {ca()}")  // 期望 1
+    println("21. ca() = {ca()}")  // 期望 2
+    println("22. ca() = {ca()}")  // 期望 3
+    println("23. cb() = {cb()}")  // 期望 1
+    println("24. ca() = {ca()}")  // 期望 4
+    println("25. cb() = {cb()}")  // 期望 2
+    // 对照：单计数器多次调用
+    val cc = makeCounter()
+    var ci: i32 = 0
+    var csum: i32 = 0
+    while ci < 5 {
+        csum = csum + cc()
+        ci = ci + 1
+    }
+    println("26. single counter 5-call sum: {csum}")  // 期望 1+2+3+4+5=15
+
+    // ─── Probe C2: Bug #41 最小复现（重计数器后新建计数器是否共享状态）───
+    println("--- Probe C2: Bug #41 makeCounter state sharing ---")
+    val heavy = makeCounter()
+    var hi: i32 = 0
+    var hsum: i32 = 0
+    while hi < 10 {
+        hsum = hsum + heavy()
+        hi = hi + 1
+    }
+    println("27. heavy 10-call sum (expected 55): {hsum}")
+    val fresh = makeCounter()
+    println("28. fresh() (expected 1, Bug #41 if != 1): {fresh()}")
+    println("29. fresh() (expected 2): {fresh()}")
+
+    // ─── Probe E: Bug #42 f64 match 隔离 ───
+    // 目标：确定 match on f64 失效的根因层级
+    //   E1: match i32（对照，应正常）
+    //   E2: match f64 仅 _ 通配（测试 f64 值能否进入 match 分派）
+    //   E3: match f64 仅 guard（测试 guard 能否在 f64 上求值）
+    //   E4: match f64 字面量 0.0（无类型后缀，测试 f64 字面量模式解析）
+    //   E5: match f64 字面量 0.0f64（有类型后缀）
+    //   E6: match f64 字面量 + guard + _（完整 classify_f64 缩影）
+    println("--- Probe E: Bug #42 f64 match isolation ---")
+    fun mi32(x: i32): str {
+        match x {
+            0 => "zero"
+            _ => "other"
+        }
+    }
+    println("30. mi32(0) = {mi32(0)} (expect 'zero')")
+    println("31. mi32(5) = {mi32(5)} (expect 'other')")
+
+    fun mf64_wild(x: f64): str {
+        match x {
+            _ => "any"
+        }
+    }
+    println("32. mf64_wild(0.0) = {mf64_wild(0.0f64)} (expect 'any')")
+    println("33. mf64_wild(3.14) = {mf64_wild(3.14f64)} (expect 'any')")
+
+    fun mf64_guard(x: f64): str {
+        match x {
+            y if y > 0.0f64 => "pos"
+            y if y < 0.0f64 => "neg"
+        }
+    }
+    println("34. mf64_guard(3.14) = {mf64_guard(3.14f64)} (expect 'pos')")
+    println("35. mf64_guard(-1.5) = {mf64_guard(-1.5f64)} (expect 'neg')")
+    println("36. mf64_guard(0.0) = {mf64_guard(0.0f64)} (expect null if no arm matches)")
+
+    fun mf64_lit_nosuffix(x: f64): str {
+        match x {
+            0.0 => "zero"
+            _ => "other"
+        }
+    }
+    println("37. mf64_lit_nosuffix(0.0) = {mf64_lit_nosuffix(0.0f64)} (expect 'zero')")
+    println("38. mf64_lit_nosuffix(5.0) = {mf64_lit_nosuffix(5.0f64)} (expect 'other')")
+
+    fun mf64_lit_suffix(x: f64): str {
+        match x {
+            0.0f64 => "zero"
+            _ => "other"
+        }
+    }
+    println("39. mf64_lit_suffix(0.0) = {mf64_lit_suffix(0.0f64)} (expect 'zero')")
+    println("40. mf64_lit_suffix(5.0) = {mf64_lit_suffix(5.0f64)} (expect 'other')")
+
+    fun mf64_full(x: f64): str {
+        match x {
+            0.0f64 => "zero"
+            y if y < 0.0f64 => "neg"
+            y if y > 0.0f64 => "pos"
+            _ => "nan"
+        }
+    }
+    println("41. mf64_full(0.0) = {mf64_full(0.0f64)} (expect 'zero')")
+    println("42. mf64_full(3.14) = {mf64_full(3.14f64)} (expect 'pos')")
+    println("43. mf64_full(-1.5) = {mf64_full(-1.5f64)} (expect 'neg')")
+
+    // ─── Probe F: Bug #45 嵌套 if-else 中的直接递归调用返回 null ───
+    // 目标：隔离 powRec 偶数分支返回 null 的根因（函数在顶层，绕过 Bug #19）
+    //   F1: 线性递归 pow (if-else 单层，else 直接递归调用) — 对照
+    //   F2: 嵌套 if-else，内层 else 直接递归调用 — 失效点
+    //   F4: match 替代嵌套 if-else — 探测是否 match 路径正常
+    //   F5: 嵌套 if-else 但 else 分支返回字面量（非递归）— 探测是否仅递归调用失效
+    println("--- Probe F: Bug #45 nested if-else tail recursion ---")
+    println("50. powLinear(2,0) = {powLinear(2i64, 0)} (expect 1)")
+    println("51. powLinear(2,10) = {powLinear(2i64, 10)} (expect 1024)")
+    println("52. powNested(2,1) = {powNested(2i64, 1)} (expect 2, odd branch)")
+    println("53. powNested(2,2) = {powNested(2i64, 2)} (expect 4, even branch - Bug #45)")
+    println("54. powNested(2,3) = {powNested(2i64, 3)} (expect 8, odd branch)")
+    println("55. powNested(2,4) = {powNested(2i64, 4)} (expect 16, even branch - Bug #45)")
+    println("56. powNested(2,10) = {powNested(2i64, 10)} (expect 1024, Bug #45)")
+    println("57. powMatch(2,1) = {powMatch(2i64, 1)} (expect 2)")
+    println("58. powMatch(2,2) = {powMatch(2i64, 2)} (expect 4)")
+    println("59. powMatch(2,10) = {powMatch(2i64, 10)} (expect 1024)")
+    println("60. classify(0) = {classify(0)} (expect 0)")
+    println("61. classify(5) = {classify(5)} (expect 5, nested-if else literal)")
+    println("62. classify(-3) = {classify(-3)} (expect 3, nested-if else literal)")
+
+    // ─── Probe D: 3 层嵌套闭包（panic）───
+    // 注：此 probe 会 panic（compute_closure_call: input is not callable）
+    println("--- Probe D: 3-layer nested closure (expect panic) ---")
+    val mk_mk_add = fun() {
+        val outer: i32 = 1
+        fun() {
+            val mid: i32 = 2
+            fun() { outer + mid + 3 }
+        }
+    }
+    val mid_fn = mk_mk_add()
+    println("44. mid_fn is constructed")
+    println("45. mid_fn(): {mid_fn()}")  // panic here
+    println("46. should not reach")
+}

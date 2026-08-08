@@ -387,6 +387,10 @@ pub struct DispatchInfo {
     pub impl_fn_idx: u16,
     /// 泛型方法调用的单态化实例 ID（非泛型为 0）
     pub instance_id: u32,
+    /// 语言级 intrinsic 标记（await/recv 等由 sema 统一识别，不依赖类型注册）。
+    /// 用户自定义类型（Timer 等）未注册 MethodSigInfo.intrinsic，
+    /// 但 await/recv 是通用语义，由 sema 在 MethodCall 推断时标记此处。
+    pub intrinsic: Option<IntrinsicKind>,
 }
 
 /// reflect 已解析元信息。

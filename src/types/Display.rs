@@ -116,7 +116,8 @@ impl fmt::Display for TypeDisplay<'_> {
             | Ty::Lazy(_)
             | Ty::Atomic(_)
             | Ty::Sender(_)
-            | Ty::Receiver(_) => f.write_str(t.name()),
+            | Ty::Receiver(_)
+            | Ty::Timer(_) => f.write_str(t.name()),
             Ty::ModuleRef(_) => {
                 let (path, _) = self.arena.module_ref_parts(resolved);
                 write!(f, "module::{}", path)

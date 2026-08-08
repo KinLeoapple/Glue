@@ -1,0 +1,242 @@
+// ── 边缘 channel 测试：大胆探测 channel 类型边界 ──
+// 约束：channel.recv() 在 if/else/循环分支内受 Bug #24 影响导致 event loop stuck。
+//       所有 send/recv 必须在函数顶层顺序执行。
+// 目标：探测 channel 支持的类型种类、容量边界、交错收发、复杂值传递。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 顶层类型定义（channel 传递复合类型）
+type Point = Point(x: i32, y: i32)
+type Meters = Meters(f64)
+type Shape = | Circle(f64) | Rect(f64, f64)
+type Cell = Cell(v: i32)
+
+fun main(): void {
+    println("=== Edge Channels ===")
+
+    // ─── 1. 基本收发顺序（FIFO）───
+    println("--- Basic FIFO ---")
+    val ch1 = channel<i32>(3)
+    ch1.send(10)
+    ch1.send(20)
+    ch1.send(30)
+    check(ch1.recv() == 10, "FIFO first")
+    check(ch1.recv() == 20, "FIFO second")
+    check(ch1.recv() == 30, "FIFO third")
+
+    // ─── 2. 交错收发（send/recv 交替）───
+    println("--- Interleaved Send/Recv ---")
+    val ch2 = channel<i32>(2)
+    ch2.send(1)
+    ch2.send(2)
+    check(ch2.recv() == 1, "interleave recv 1")
+    ch2.send(3)  // 此时缓冲区有 [2, 3]
+    check(ch2.recv() == 2, "interleave recv 2")
+    check(ch2.recv() == 3, "interleave recv 3")
+
+    // ─── 3. 容量 1 边界 ───
+    println("--- Capacity 1 ---")
+    val ch3 = channel<i32>(1)
+    ch3.send(100)
+    check(ch3.recv() == 100, "cap1 recv")
+    ch3.send(200)  // 重新填充
+    check(ch3.recv() == 200, "cap1 refill recv")
+
+    // ─── 4. 整数类型全家桶 ───
+    println("--- Integer Type Family ---")
+    val chi8 = channel<i8>(1)
+    chi8.send(127i8)
+    check(chi8.recv() == 127i8, "i8 MAX")
+    val chu8 = channel<u8>(1)
+    chu8.send(255u8)
+    check(chu8.recv() == 255u8, "u8 MAX")
+    val chi16 = channel<i16>(1)
+    chi16.send(-1i16)
+    check(chi16.recv() == -1i16, "i16 neg")
+    val chu16 = channel<u16>(1)
+    chu16.send(65535u16)
+    check(chu16.recv() == 65535u16, "u16 MAX")
+    val chi32 = channel<i32>(1)
+    chi32.send(-2147483648i32)
+    check(chi32.recv() == -2147483648i32, "i32 MIN")
+    val chu32 = channel<u32>(1)
+    chu32.send(4294967295u32)
+    check(chu32.recv() == 4294967295u32, "u32 MAX")
+    val chi64 = channel<i64>(1)
+    chi64.send(9223372036854775807i64)
+    check(chi64.recv() == 9223372036854775807i64, "i64 MAX")
+    val chu64 = channel<u64>(1)
+    chu64.send(18446744073709551615u64)
+    check(chu64.recv() == 18446744073709551615u64, "u64 MAX")
+
+    // ─── 5. 浮点类型 ───
+    println("--- Float Types ---")
+    val chf32 = channel<f32>(1)
+    chf32.send(3.14)
+    val rf32 = chf32.recv()
+    // Bug #51 已修复：cast(f32).to(f64) 现已正常工作，此处直接比较 f32 值
+    check(rf32 == 3.14, "f32 pi recv equals sent")
+    val chf64 = channel<f64>(1)
+    chf64.send(3.141592653589793f64)
+    check(chf64.recv() == 3.141592653589793f64, "f64 pi exact")
+    val chf64neg = channel<f64>(1)
+    chf64neg.send(-1e300)
+    check(chf64neg.recv() == -1e300, "f64 -1e300")
+
+    // ─── 6. bool / str / char ───
+    println("--- Bool/Str/Char ---")
+    val chb = channel<bool>(2)
+    chb.send(true)
+    chb.send(false)
+    check(chb.recv() == true, "bool true")
+    check(chb.recv() == false, "bool false")
+    val chs = channel<str>(3)
+    chs.send("hello")
+    chs.send("")
+    chs.send("世界🌍")
+    check(chs.recv() == "hello", "str hello")
+    check(chs.recv() == "", "str empty")
+    check(chs.recv() == "世界🌍", "str unicode+emoji")
+    val chc = channel<char>(2)
+    chc.send('A')
+    chc.send('你')
+    check(chc.recv() == 'A', "char A")
+    check(chc.recv() == '你', "char CJK")
+
+    // ─── 7. record 类型 ───
+    println("--- Record Type ---")
+    val chp = channel<Point>(2)
+    chp.send(Point(1, 2))
+    chp.send(Point(3, 4))
+    val p1 = chp.recv()
+    check(p1 == Point(1, 2), "Point recv equality")
+    val p2 = chp.recv()
+    check(p2 == Point(3, 4), "Point recv equality 2")
+    check(p1 != p2, "Point inequality")
+
+    // ─── 8. newtype ───
+    println("--- Newtype ---")
+    val chm = channel<Meters>(2)
+    chm.send(Meters(1.5f64))
+    chm.send(Meters(2.5f64))
+    check(chm.recv() == Meters(1.5f64), "Meters recv 1")
+    check(chm.recv() == Meters(2.5f64), "Meters recv 2")
+
+    // ─── 9. ADT 变体 ───
+    println("--- ADT Variant ---")
+    val chsh = channel<Shape>(3)
+    chsh.send(Circle(2.0f64))
+    chsh.send(Rect(3.0f64, 4.0f64))
+    chsh.send(Circle(0.0f64))
+    val s1 = chsh.recv()
+    val s2 = chsh.recv()
+    val s3 = chsh.recv()
+    check(s1 == Circle(2.0f64), "Shape Circle recv")
+    check(s2 == Rect(3.0f64, 4.0f64), "Shape Rect recv")
+    check(s3 == Circle(0.0f64), "Shape Circle zero recv")
+    check(s1 != s2, "Shape Circle != Rect")
+    check(s1 != s3, "Shape Circle r=2 != r=0")
+
+    // ─── 10. 相同值多次发送 ───
+    println("--- Same Value Repeat ---")
+    val chrep = channel<i32>(5)
+    chrep.send(42)
+    chrep.send(42)
+    chrep.send(42)
+    chrep.send(42)
+    chrep.send(42)
+    check(chrep.recv() == 42, "repeat 1")
+    check(chrep.recv() == 42, "repeat 2")
+    check(chrep.recv() == 42, "repeat 3")
+    check(chrep.recv() == 42, "repeat 4")
+    check(chrep.recv() == 42, "repeat 5")
+
+    // ─── 11. record with closure field（探测）───
+    println("--- Record with Closure Field ---")
+    val chcell = channel<Cell>(2)
+    chcell.send(Cell(10))
+    chcell.send(Cell(20))
+    check(chcell.recv() == Cell(10), "Cell recv 10")
+    check(chcell.recv() == Cell(20), "Cell recv 20")
+
+    // ─── 12. 大容量 channel（容量 100，发 5 收 5）───
+    println("--- Large Capacity ---")
+    val chbig = channel<i32>(100)
+    chbig.send(1)
+    chbig.send(2)
+    chbig.send(3)
+    chbig.send(4)
+    chbig.send(5)
+    check(chbig.recv() == 1, "big cap recv 1")
+    check(chbig.recv() == 2, "big cap recv 2")
+    check(chbig.recv() == 3, "big cap recv 3")
+    check(chbig.recv() == 4, "big cap recv 4")
+    check(chbig.recv() == 5, "big cap recv 5")
+
+    // ─── 13. nullable 值通过 channel ───
+    println("--- Nullable via Channel ---")
+    val chn = channel<i32?>(3)
+    chn.send(10)
+    chn.send(null)
+    chn.send(30)
+    val n1 = chn.recv()
+    val n2 = chn.recv()
+    val n3 = chn.recv()
+    check(n1 == 10, "nullable recv 10")
+    check(n2 == null, "nullable recv null")
+    check(n3 == 30, "nullable recv 30")
+    check((n1 ?? 99) == 10, "nullable 10 ?? 99")
+    check((n2 ?? 99) == 99, "null ?? 99")
+
+    // ─── 14. 多 channel 独立 ───
+    println("--- Multiple Independent Channels ---")
+    val chA = channel<i32>(2)
+    val chB = channel<str>(2)
+    chA.send(1)
+    chB.send("a")
+    chA.send(2)
+    chB.send("b")
+    check(chA.recv() == 1, "chA recv 1")
+    check(chB.recv() == "a", "chB recv a")
+    check(chA.recv() == 2, "chA recv 2")
+    check(chB.recv() == "b", "chB recv b")
+
+    // ─── 15. channel 传递的表达式结果 ───
+    println("--- Expression Result via Channel ---")
+    val chexpr = channel<i32>(3)
+    chexpr.send(1 + 2)
+    chexpr.send(3 * 4)
+    chexpr.send(10 - 7)
+    check(chexpr.recv() == 3, "expr 1+2")
+    check(chexpr.recv() == 12, "expr 3*4")
+    check(chexpr.recv() == 3, "expr 10-7")
+
+    // ─── 16. 负数/零/大数 ───
+    println("--- Negative/Zero/Large ---")
+    val chneg = channel<i64>(3)
+    chneg.send(0i64)
+    chneg.send(-1i64)
+    chneg.send(9999999999i64)
+    check(chneg.recv() == 0i64, "i64 zero")
+    check(chneg.recv() == -1i64, "i64 neg")
+    check(chneg.recv() == 9999999999i64, "i64 large")
+
+    summary()
+}

@@ -1,0 +1,28 @@
+fun nestedIfElse(x: i32): i32 {
+    if x == 0i32 {
+        100i32
+    } else {
+        if x == 1i32 {
+            200i32
+        } else {
+            300i32
+        }
+    }
+}
+
+fun flatIfElse(x: i32): i32 {
+    if x == 0i32 {
+        100i32
+    } else {
+        200i32
+    }
+}
+
+fun main(): void {
+    println("=== Bug #45 Isolation ===")
+    println("flatIfElse(0) = {flatIfElse(0)} (expected 100)")
+    println("flatIfElse(1) = {flatIfElse(1)} (expected 200)")
+    println("nestedIfElse(0) = {nestedIfElse(0)} (expected 100)")
+    println("nestedIfElse(1) = {nestedIfElse(1)} (expected 200)")
+    println("nestedIfElse(2) = {nestedIfElse(2)} (expected 300)")
+}

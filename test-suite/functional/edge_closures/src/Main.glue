@@ -1,0 +1,376 @@
+// 大胆闭包边缘测试：高阶/捕获多类型/nullable/record/array 捕获/闭包数组/闭包相等/多层嵌套构造/相互调用
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层（本测试无递归）
+//   Bug #21: i32 超范围字面量静默退出     → 已修复（现报编译错误）
+//   Bug #31: 闭包链共享可变捕获不连贯     → 已记录，本测试主动探测其边界
+//   Bug #34: arr[i] = x 空操作            → 已修复（现支持原地修改）
+//   Bug #37: while 条件调用用户函数 hang   → 不在 while 条件中调用闭包
+//   闭包不支持显式返回类型标注            → 省略返回类型
+//   类型别名与原始函数类型不等价 (#23)    → 直接使用 () -> i32 而非别名
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 类型定义（顶层）───
+type IntFn = () -> i32
+type Pt = Pt(x: i32, y: i32)
+
+// 顶层工厂：返回闭包（逃逸）
+fun makeAdder(n: i32): IntFn {
+    fun() { n + 1 }
+}
+
+// 顶层工厂：闭包返回闭包（高阶）
+fun makeAdderFactory(): () -> IntFn {
+    val base: i32 = 100
+    fun() {
+        // 返回的闭包捕获 base
+        val captured = base
+        fun() { captured + 1 }
+    }
+}
+
+// 顶层工厂：闭包捕获 record 并访问字段
+fun makePointReader(p: Pt): () -> i32 {
+    fun() { p.x + p.y }
+}
+
+// 顶层工厂：闭包捕获数组并索引
+fun makeIndexer(arr: i32[]): () -> i32 {
+    val local = arr
+    fun() { local[0] + local[1] }
+}
+
+fun main(): void {
+    println("=== Edge Closures ===")
+
+    // ─── 1. 零捕获闭包 ───
+    println("--- Zero-capture Closures ---")
+    val z1 = fun() { 42 }
+    val z2 = fun() { 42 }
+    check(z1() == 42, "zero-capture closure 1")
+    check(z2() == 42, "zero-capture closure 2 (independent)")
+    // 两个零捕获闭包应独立（不相等，见 Section 8）
+    val z_arr = [z1, z2]
+    check(z_arr[0]() == 42, "closure array [0]")
+    check(z_arr[1]() == 42, "closure array [1]")
+
+    // ─── 2. 捕获各种类型 val ───
+    println("--- Capture Various Types ---")
+    val ci: i32 = 10
+    val cf: f64 = 2.5f64
+    val cb: bool = true
+    val cc: char = 'Z'
+    val cs: str = "hello"
+    val cfn_i = fun() { ci }
+    val cfn_f = fun() { cf }
+    val cfn_b = fun() { cb }
+    val cfn_c = fun() { cc }
+    val cfn_s = fun() { cs }
+    check(cfn_i() == 10, "capture i32 val")
+    check(cfn_f() == 2.5f64, "capture f64 val")
+    check(cfn_b() == true, "capture bool val")
+    check(cfn_c() == 'Z', "capture char val")
+    check(cfn_s() == "hello", "capture str val")
+    // 运算后返回（'Z' = 90，10 + 90 = 100）
+    val cfn_calc = fun() { ci + cast(cc).to(i32) }
+    check(cfn_calc() == 100, "capture + arithmetic (10 + 'Z'=100)")
+
+    // ─── 3. 捕获 nullable ───
+    println("--- Capture Nullable ---")
+    val opt: i32? = 42i32
+    val opt_null: i32? = null
+    val cfn_opt = fun() { opt }
+    val cfn_opt_null = fun() { opt_null }
+    check(cfn_opt() == 42i32, "capture Some i32?")
+    check(cfn_opt() != null, "capture Some i32? != null")
+    check(cfn_opt_null() == null, "capture null i32?")
+    // 捕获并 ?? 合并
+    val cfn_elvis = fun() { opt ?? 99i32 }
+    check(cfn_elvis() == 42, "capture nullable + ?? when Some")
+    val cfn_elvis_null = fun() { opt_null ?? 99i32 }
+    check(cfn_elvis_null() == 99, "capture nullable + ?? when null")
+
+    // ─── 4. 捕获 record ───
+    println("--- Capture Record ---")
+    val pt = Pt(3, 4)
+    val cfn_pt = fun() { pt.x + pt.y }
+    check(cfn_pt() == 7, "capture record + field access")
+    // 通过工厂
+    val reader = makePointReader(Pt(10, 20))
+    check(reader() == 30, "factory: capture record field sum")
+    // 闭包捕获多个 record
+    val pt2 = Pt(100, 200)
+    val cfn_two_pt = fun() { pt.x + pt2.x }
+    check(cfn_two_pt() == 103, "capture two records")
+
+    // ─── 5. 捕获数组 ───
+    println("--- Capture Array ---")
+    val arr = [10, 20, 30, 40]
+    val cfn_arr = fun() { arr[0] + arr[1] + arr[2] + arr[3] }
+    check(cfn_arr() == 100, "capture array sum via index")
+    val cfn_len = fun() { arr.len() }
+    check(cfn_len() == 4, "capture array len()")
+    // 工厂捕获数组
+    val idx = makeIndexer([5, 6, 7])
+    check(idx() == 11, "factory: capture array index 0+1")
+    // 捕获嵌套数组
+    val nested = [[1, 2], [3, 4]]
+    val cfn_nested = fun() { nested[0][0] + nested[1][1] }
+    check(cfn_nested() == 5, "capture nested array")
+
+    // ─── 6. 闭包数组（first-class functions，Bug #40 已修复）───
+    println("--- Closure Arrays (Bug #40 fixed) ---")
+    // Bug #40 已修复：调用数组中的闭包 `arr[i]()` 正确返回闭包返回值。
+    val fns: IntFn[] = []
+    var fa: i32 = 0
+    // 用 ++ 构建闭包数组（Bug #34 绕过：不原地修改）
+    var fns_arr: IntFn[] = []
+    fns_arr = fns_arr ++ [fun() { 1 }]
+    fns_arr = fns_arr ++ [fun() { 2 }]
+    fns_arr = fns_arr ++ [fun() { 3 }]
+    check(fns_arr.len() == 3, "closure array len 3")
+    // 直接调用（绕过数组索引）正常
+    val direct0 = fun() { 1 }
+    check(direct0() == 1, "direct closure call works")
+    // Bug #40 已修复：arr[i]() 正确返回闭包返回值
+    check(fns_arr[0]() == 1, "Bug #40: closure arr[0]() = 1")
+    check(fns_arr[1]() == 2, "Bug #40: closure arr[1]() = 2")
+    check(fns_arr[2]() == 3, "Bug #40: closure arr[2]() = 3")
+    // 求和：调用数组中所有闭包
+    var fsum: i32 = 0
+    var fi: i32 = 0
+    while fi < fns_arr.len() {
+        fsum = fsum + fns_arr[fi]()
+        fi = fi + 1
+    }
+    check(fsum == 6, "Bug #40: sum of closure array calls = 1+2+3")
+    // 闭包捕获循环变量（每次迭代独立）
+    var cap_fns: IntFn[] = []
+    var ci2: i32 = 0
+    while ci2 < 5 {
+        val captured = ci2 * ci2
+        cap_fns = cap_fns ++ [fun() { captured }]
+        ci2 = ci2 + 1
+    }
+    check(cap_fns.len() == 5, "captured closure array len 5")
+    check(cap_fns[0]() == 0, "Bug #40: captured [0]() = 0^2")
+    check(cap_fns[2]() == 4, "Bug #40: captured [2]() = 2^2")
+    check(cap_fns[4]() == 16, "Bug #40: captured [4]() = 4^2")
+
+    // ─── 7. 高阶闭包（闭包返回闘包）───
+    println("--- Higher-order Closures ---")
+    val factory = makeAdderFactory()
+    val adder = factory()
+    check(adder() == 101, "factory produces adder (100+1)")
+    // 直接构造：闭包返回闭包（2 层）
+    val mk_add = fun() {
+        val n: i32 = 5
+        fun() { n + 10 }
+    }
+    val inner = mk_add()
+    check(inner() == 15, "2-layer nested closure factory (5+10)")
+    // 注：3 层嵌套闭包（闭包返回闭包返回闭包）会 panic，见 edge_probe/src/Main.glue
+
+    // ─── 8. 闭包相等性（探测）───
+    println("--- Closure Equality Probe ---")
+    // 闭包是引用类型，两个不同闭包字面量不应相等
+    val eq_a = fun() { 1 }
+    val eq_b = fun() { 1 }
+    val eq_a2 = eq_a
+    // 闭包相等性可能不支持，记录行为：
+    //   - eq_a == eq_a2（同一引用）应为 true
+    //   - eq_a == eq_b（不同闭包）行为未知
+    check(eq_a == eq_a2, "closure self-equality (same ref)")
+    // 不同闭包比较：记录实际行为（可能是 false 或不支持）
+    val neq = eq_a != eq_b
+    println("  INFO: eq_a == eq_b (different closures): {eq_a == eq_b}")
+    println("  INFO: eq_a != eq_b: {neq}")
+
+    // ─── 9. 闭包参数 + 返回闭包 ───
+    println("--- Closure as Param & Return ---")
+    fun apply_fn(f: IntFn): i32 { f() }
+    check(apply_fn(fun() { 99 }) == 99, "apply closure as param")
+    fun compose_add(base: i32): IntFn {
+        val b = base
+        fun() { b + 1 }
+    }
+    val composed = compose_add(50)
+    check(composed() == 51, "closure factory returns capture")
+    check(apply_fn(composed) == 51, "apply factory closure")
+    // 闭包作为参数组合
+    val c1 = fun() { 10 }
+    val c2 = fun() { 20 }
+    check(apply_fn(c1) + apply_fn(c2) == 30, "apply two closures sum")
+
+    // ─── 10. 闭包修改 var 多次（状态机）───
+    println("--- Stateful Closure (counter) ---")
+    fun makeCounter(): IntFn {
+        var n: i32 = 0
+        fun() { n = n + 1; n }
+    }
+    val cnt = makeCounter()
+    var sum_cnt: i32 = 0
+    var i: i32 = 0
+    while i < 10 {
+        sum_cnt = sum_cnt + cnt()
+        i = i + 1
+    }
+    check(sum_cnt == 55, "counter sum 1+2+...+10 = 55")
+    // Bug #41：闭包返回闭包（Section 7 的 mk_add/makeAdderFactory）会污染闭包 Cell 状态，
+    //   导致后续 makeCounter() 创建的计数器共享 var n（c_a 从 11 开始而非 1）。
+    //   对照：edge_probe 中无前置闭包工厂时，fresh() 正确返回 1。
+    val c_a = makeCounter()
+    val c_b = makeCounter()
+    println("  INFO: c_a() = {c_a()} (expected 1, Bug #41 if >1)")
+    println("  INFO: c_a() = {c_a()} (expected 2)")
+    println("  INFO: c_a() = {c_a()} (expected 3)")
+    println("  INFO: c_b() = {c_b()} (expected 1)")
+    check(c_a() == 4, "Bug #41: independent counter a 4th call (context-corrupted)")
+    check(c_b() == 2, "Bug #41: independent counter b 2nd call (context-corrupted)")
+
+    // ─── 11. 闭包捕获并修改多个 var ───
+    println("--- Multi-var Capture ---")
+    var x1: i32 = 0
+    var x2: i32 = 0
+    var x3: i32 = 0
+    val tickler = fun() {
+        x1 = x1 + 1
+        x2 = x2 + 2
+        x3 = x3 + 3
+    }
+    tickler()
+    tickler()
+    tickler()
+    check(x1 == 3, "multi-var x1 after 3 ticks")
+    check(x2 == 6, "multi-var x2 after 3 ticks")
+    check(x3 == 9, "multi-var x3 after 3 ticks")
+
+    // ─── 12. 闭包链（Bug #31 已修复）───
+    println("--- Closure Chain (Bug #31 fixed) ---")
+    // Bug #31 已修复：多闭包共享可变 var 并相互调用时，前序修改正确保留
+    var chain_log: str = ""
+    val innermost = fun() { chain_log = chain_log + "C" }
+    val middle = fun() { chain_log = chain_log + "B"; innermost() }
+    val outer_call = fun() { chain_log = chain_log + "A"; middle() }
+    outer_call()
+    check(chain_log == "ABC", "Bug #31: chain preserves all writers = ABC")
+    println("  INFO: chain_log = '{chain_log}'")
+
+    // 对照：单闭包链（无相互调用，顺序调用各自修改 var）
+    var seq_log: str = ""
+    val sa = fun() { seq_log = seq_log + "A" }
+    val sb = fun() { seq_log = seq_log + "B" }
+    val sc = fun() { seq_log = seq_log + "C" }
+    sa(); sb(); sc()
+    check(seq_log == "ABC", "sequential closures (no mutual call) = ABC")
+
+    // ─── 13. 闭包捕获 bool 并逻辑运算 ───
+    println("--- Capture bool & Logic ---")
+    val flag: bool = true
+    val cfn_flag = fun() { flag }
+    check(cfn_flag() == true, "capture bool true")
+    // Bug #38：&&/|| 不短路，但结果值应正确
+    val cfn_and = fun() { flag && false }
+    check(cfn_and() == false, "capture bool + && false")
+    val cfn_or = fun() { flag || false }
+    check(cfn_or() == true, "capture bool + || false")
+
+    // ─── 14. 闭包捕获 char 并 cast ───
+    println("--- Capture char & cast ---")
+    val ch: char = 'A'
+    val cfn_ch = fun() { cast(ch).to(i32) }
+    check(cfn_ch() == 65, "capture char + cast to i32")
+    val cfn_ch_inc = fun() { cast(ch).to(i32) + 1 }
+    check(cfn_ch_inc() == 66, "capture char + cast + inc")
+
+    // ─── 15. 闭包捕获 f64 并数学运算 ───
+    println("--- Capture f64 & Math ---")
+    val pi: f64 = 3.141592653589793f64
+    val cfn_area = fun() { pi * 2.0f64 * 2.0f64 }
+    check(cfn_area() == 12.566370614359172f64, "capture pi + area r=2")
+    val cfn_dbl = fun() { pi * 2.0f64 }
+    check(cfn_dbl() == 6.283185307179586f64, "capture pi * 2")
+
+    // ─── 16. 闭包参数 + 捕获混合 ───
+    println("--- Closure with Param + Capture ---")
+    val base10: i32 = 100
+    val adder_cap = fun(n: i32) { base10 + n }
+    check(adder_cap(5) == 105, "closure param + capture")
+    check(adder_cap(50) == 150, "closure param + capture (different arg)")
+    // 闭包接受多参数
+    val combine = fun(a: i32, b: i32) { base10 + a * 2 + b }
+    check(combine(3, 4) == 110, "closure 2 params + capture (100+6+4)")
+    check(combine(10, 0) == 120, "closure 2 params + capture (100+20)")
+
+    // ─── 17. 闭包在 while 循环中构建 ───
+    println("--- Closures Built in Loop ---")
+    var built: IntFn[] = []
+    var bi: i32 = 0
+    while bi < 5 {
+        val cap = bi * 10
+        built = built ++ [fun() { cap }]
+        bi = bi + 1
+    }
+    check(built.len() == 5, "5 closures built in loop")
+    var bsum: i32 = 0
+    var bsi: i32 = 0
+    while bsi < built.len() {
+        bsum = bsum + built[bsi]()
+        bsi = bsi + 1
+    }
+    check(bsum == 100, "sum of 5 loop-built closures (0+10+20+30+40)")
+
+    // ─── 18. 闭包捕获后外部修改 var，闭包可见 ───
+    println("--- External Mutation Visible in Closure ---")
+    var ext: i32 = 0
+    val ext_reader = fun() { ext }
+    check(ext_reader() == 0, "closure sees initial 0")
+    ext = 10
+    check(ext_reader() == 10, "closure sees external mutation to 10")
+    ext = 20
+    check(ext_reader() == 20, "closure sees external mutation to 20")
+
+    // ─── 19. 闭包调用其他闭包（存储在 var）───
+    println("--- Closure Calling Another Closure ---")
+    val base42: i32 = 42
+    val getter = fun() { base42 }
+    val user = fun() { getter() + 1 }
+    check(user() == 43, "closure calls stored closure")
+    // 链式：a 调 b 调 c
+    val c_val: i32 = 1
+    val cc = fun() { c_val }
+    val bb = fun() { cc() + 10 }
+    val aa = fun() { bb() + 100 }
+    check(aa() == 111, "chained closure calls (1+10+100)")
+
+    // ─── 20. 大胆：闭包捕获数组后通过 ?? 提供默认 ───
+    println("--- Capture Array + ?? ---")
+    // Limit-B: 显式类型 `i32?[]`（nullable 元素数组）导致 parse error: expected '='。
+    //   绕过：省略类型注解，让推断处理
+    val opt_arr = [1i32, null, 3i32]
+    val cfn_first = fun() { opt_arr[0] ?? 99i32 }
+    check(cfn_first() == 1, "capture nullable array [0] ?? 99 = 1")
+    val cfn_mid = fun() { opt_arr[1] ?? 99i32 }
+    check(cfn_mid() == 99, "capture nullable array [1] (null) ?? 99 = 99")
+
+    summary()
+}

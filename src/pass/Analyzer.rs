@@ -242,8 +242,17 @@ impl PurityTable {
 pub enum EscapeInfo {
     /// 不逃逸：仅在函数内使用，分配可消除（若未使用）
     NoEscape,
-    /// 逃逸：被返回/存入字段/传入非纯函数/进入 channel
-    Escapes,
+    /// 逃逸：带种类标记
+    Escapes(EscapeKind),
+}
+
+/// 逃逸种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeKind {
+    /// 堆分配逃逸（ArrayLit/RecordLit/RecordExtend）→ stack_alloc 优化
+    Alloc,
+    /// Lambda 逃逸（尾位置返回 / 循环体捕获）→ 独立 function_id 走 Cell 路径
+    Lambda { loop_body_capture: bool },
 }
 
 /// 逃逸表：ExprId(分配点) -> EscapeInfo。
@@ -1370,11 +1379,13 @@ pub fn analyze_escape(
             scan_escapes(*body, arena, func, name, cg, purity, &mut escaping);
             for e in escaping {
                 if table.lookup(e).is_some() {
-                    table.put(e, EscapeInfo::Escapes);
+                    table.put(e, EscapeInfo::Escapes(EscapeKind::Alloc));
                 }
             }
         }
     }
+    // Lambda 逃逸分析（Bug #41 尾位置逃逸 + Bug #40 循环体捕获）
+    analyze_lambda_escape(module, arena, &mut table);
     table
 }
 
@@ -1544,6 +1555,743 @@ fn walk_children_stmt<F: FnMut(ExprId)>(stmt_id: StmtId, arena: &AstArena, mut f
         Stmt::While { condition, body } => { f(*condition); f(*body); }
         Stmt::Loop { body } => f(*body),
         Stmt::LocalDecl { .. } | Stmt::Break | Stmt::Continue => {}
+    }
+}
+
+// =========================================================================
+// LambdaEscape — Lambda 逃逸分析（Bug #41 尾位置逃逸 + Bug #40 循环体捕获）
+// =========================================================================
+
+/// Lambda 逃逸分析统一入口。
+///
+/// 对每个 FunDecl 的 body 做两遍分析：
+/// 1. 尾位置逃逸：调用 find_escaping_lambdas，标记为
+///    `EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: false })`
+/// 2. 循环体捕获逃逸：扫描 body 中的 Lambda，检查是否捕获了循环体局部变量，
+///    标记为 `EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: true })`
+fn analyze_lambda_escape(
+    module: &Module,
+    arena: &AstArena,
+    table: &mut EscapeTable,
+) {
+    for decl in &module.declarations {
+        if let Decl::FunDecl { body, .. } = &decl.node {
+            // 递归分析函数 body 和所有嵌套 lambda body 的逃逸
+            analyze_lambda_escape_recursive(*body, arena, table);
+        }
+    }
+}
+
+/// 对当前 body 做尾位置逃逸分析，然后递归进入所有嵌套 Lambda body。
+///
+/// IR 的 escape_context_stack 是栈式的：编译每个 lambda 时扫描其 body
+/// 找出逃逸的嵌套 lambda。analyzer 需要对每个 lambda body 递归做同样分析。
+fn analyze_lambda_escape_recursive(
+    expr_id: ExprId,
+    arena: &AstArena,
+    table: &mut EscapeTable,
+) {
+    // Pass 1: 尾位置逃逸（当前 body 的尾位置 lambda）
+    let tail_escaping = find_escaping_lambdas(expr_id, arena);
+    for lambda_id in tail_escaping {
+        table.put(
+            lambda_id,
+            EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: false }),
+        );
+    }
+    // 递归进入所有嵌套 Lambda body，对其做同样的尾位置逃逸分析
+    walk_lambdas_in_expr(expr_id, arena, &mut |lambda_body| {
+        analyze_lambda_escape_recursive(lambda_body, arena, table);
+    });
+    // Pass 2: 循环体捕获逃逸
+    let mut loop_body_vars_stack: Vec<FxHashSet<String>> = Vec::new();
+    scan_lambda_escapes_in_expr(expr_id, arena, &mut loop_body_vars_stack, table);
+}
+
+/// 遍历表达式中的所有 Lambda，对每个 Lambda 的 body 调用回调。
+fn walk_lambdas_in_expr(
+    expr_id: ExprId,
+    arena: &AstArena,
+    f: &mut impl FnMut(ExprId),
+) {
+    use crate::ast::Ast::LambdaBody;
+    let node = &arena.expr(expr_id).node;
+    match node {
+        Expr::Lambda { body, .. } => {
+            let body_expr = match body {
+                LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
+            };
+            f(body_expr);
+            // 继续递归进入 lambda body 内部（可能有更深嵌套）
+            walk_lambdas_in_expr(body_expr, arena, f);
+        }
+        Expr::Block { stmts, trailing } => {
+            for &s in stmts {
+                walk_lambdas_in_stmt(s, arena, f);
+            }
+            if let Some(t) = trailing {
+                walk_lambdas_in_expr(*t, arena, f);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            walk_lambdas_in_expr(*cond, arena, f);
+            walk_lambdas_in_expr(*then_branch, arena, f);
+            if let Some(e) = else_branch {
+                walk_lambdas_in_expr(*e, arena, f);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            walk_lambdas_in_expr(*scrutinee, arena, f);
+            for arm in arms {
+                if let Some(g) = arm.guard {
+                    walk_lambdas_in_expr(g, arena, f);
+                }
+                walk_lambdas_in_expr(arm.body, arena, f);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_lambdas_in_expr(*lhs, arena, f);
+            walk_lambdas_in_expr(*rhs, arena, f);
+        }
+        Expr::Assign { target, value } => {
+            walk_lambdas_in_expr(*target, arena, f);
+            walk_lambdas_in_expr(*value, arena, f);
+        }
+        Expr::Call { callee, args, .. } => {
+            walk_lambdas_in_expr(*callee, arena, f);
+            for &a in args {
+                walk_lambdas_in_expr(a, arena, f);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            walk_lambdas_in_expr(*recv, arena, f);
+            for &a in args {
+                walk_lambdas_in_expr(a, arena, f);
+            }
+        }
+        Expr::ArrayLit { elements, fill } => {
+            for &e in elements {
+                walk_lambdas_in_expr(e, arena, f);
+            }
+            if let Some((v, c)) = fill {
+                walk_lambdas_in_expr(*v, arena, f);
+                walk_lambdas_in_expr(*c, arena, f);
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for field in fields {
+                walk_lambdas_in_expr(field.value, arena, f);
+            }
+        }
+        Expr::Elvis { lhs, rhs } => {
+            walk_lambdas_in_expr(*lhs, arena, f);
+            walk_lambdas_in_expr(*rhs, arena, f);
+        }
+        _ => {}
+    }
+}
+
+/// walk_lambdas_in_expr 的 stmt 版本。
+fn walk_lambdas_in_stmt(
+    stmt_id: StmtId,
+    arena: &AstArena,
+    f: &mut impl FnMut(ExprId),
+) {
+    match &arena.stmt(stmt_id).node {
+        Stmt::ValDecl { value, .. } | Stmt::VarDecl { value, .. } => {
+            walk_lambdas_in_expr(*value, arena, f);
+        }
+        Stmt::Assignment { value, .. } => {
+            walk_lambdas_in_expr(*value, arena, f);
+        }
+        Stmt::Expression { expr } => {
+            walk_lambdas_in_expr(*expr, arena, f);
+        }
+        Stmt::Return { value } => {
+            if let Some(v) = value {
+                walk_lambdas_in_expr(*v, arena, f);
+            }
+        }
+        Stmt::For { iterable, body, .. } => {
+            walk_lambdas_in_expr(*iterable, arena, f);
+            walk_lambdas_in_expr(*body, arena, f);
+        }
+        Stmt::Defer { expr } => {
+            walk_lambdas_in_expr(*expr, arena, f);
+        }
+        Stmt::Throw { expr } => {
+            walk_lambdas_in_expr(*expr, arena, f);
+        }
+        Stmt::CompoundAssignment { value, .. } => {
+            walk_lambdas_in_expr(*value, arena, f);
+        }
+        Stmt::FieldAssignment { value, .. } => {
+            walk_lambdas_in_expr(*value, arena, f);
+        }
+        Stmt::While { condition, body } => {
+            walk_lambdas_in_expr(*condition, arena, f);
+            walk_lambdas_in_expr(*body, arena, f);
+        }
+        Stmt::Loop { body } => {
+            walk_lambdas_in_expr(*body, arena, f);
+        }
+        Stmt::LocalDecl { decl } => {
+            // 局部函数声明：递归进入函数 body 做逃逸分析
+            if let Decl::FunDecl { body, .. } = &**decl {
+                f(*body);
+                walk_lambdas_in_expr(*body, arena, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集 ValDecl/VarDecl 中持有 Lambda 的变量名 → ExprId。
+fn collect_lambda_vars(
+    expr_id: ExprId,
+    arena: &AstArena,
+    out: &mut FxHashMap<String, ExprId>,
+) {
+    let node = &arena.expr(expr_id).node;
+    match node {
+        Expr::Lambda { body, .. } => {
+            let body_expr = match body {
+                LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
+            };
+            collect_lambda_vars(body_expr, arena, out);
+        }
+        Expr::Block { stmts, trailing } => {
+            for &stmt_id in stmts {
+                collect_lambda_vars_stmt(stmt_id, arena, out);
+            }
+            if let Some(t) = trailing {
+                collect_lambda_vars(*t, arena, out);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_lambda_vars(*cond, arena, out);
+            collect_lambda_vars(*then_branch, arena, out);
+            if let Some(e) = else_branch {
+                collect_lambda_vars(*e, arena, out);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_lambda_vars(*scrutinee, arena, out);
+            for arm in arms {
+                if let Some(g) = arm.guard {
+                    collect_lambda_vars(g, arena, out);
+                }
+                collect_lambda_vars(arm.body, arena, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_lambda_vars(*lhs, arena, out);
+            collect_lambda_vars(*rhs, arena, out);
+        }
+        Expr::Assign { target, value } => {
+            collect_lambda_vars(*target, arena, out);
+            collect_lambda_vars(*value, arena, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_lambda_vars(*callee, arena, out);
+            for a in args {
+                collect_lambda_vars(*a, arena, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_lambda_vars(*recv, arena, out);
+            for a in args {
+                collect_lambda_vars(*a, arena, out);
+            }
+        }
+        Expr::ArrayLit { elements, fill } => {
+            for e in elements {
+                collect_lambda_vars(*e, arena, out);
+            }
+            if let Some((v, c)) = fill {
+                collect_lambda_vars(*v, arena, out);
+                collect_lambda_vars(*c, arena, out);
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for f in fields {
+                collect_lambda_vars(f.value, arena, out);
+            }
+        }
+        Expr::Elvis { lhs, rhs } => {
+            collect_lambda_vars(*lhs, arena, out);
+            collect_lambda_vars(*rhs, arena, out);
+        }
+        _ => {}
+    }
+}
+
+/// 辅助：从 Stmt 中收集 lambda 变量。
+fn collect_lambda_vars_stmt(
+    stmt_id: StmtId,
+    arena: &AstArena,
+    out: &mut FxHashMap<String, ExprId>,
+) {
+    match &arena.stmt(stmt_id).node {
+        Stmt::ValDecl { name, value, .. } | Stmt::VarDecl { name, value, .. } => {
+            if let Expr::Lambda { .. } = &arena.expr(*value).node {
+                out.insert(name.to_string(), *value);
+            }
+            // 递归扫描 value（lambda body 内可能也有 lambda 变量）
+            collect_lambda_vars(*value, arena, out);
+        }
+        Stmt::Assignment { value, .. } => {
+            collect_lambda_vars(*value, arena, out);
+        }
+        Stmt::Expression { expr } => {
+            collect_lambda_vars(*expr, arena, out);
+        }
+        Stmt::Return { value } => {
+            if let Some(v) = value {
+                collect_lambda_vars(*v, arena, out);
+            }
+        }
+        Stmt::For { iterable, body, .. } => {
+            collect_lambda_vars(*iterable, arena, out);
+            collect_lambda_vars(*body, arena, out);
+        }
+        Stmt::Defer { expr } => {
+            collect_lambda_vars(*expr, arena, out);
+        }
+        Stmt::Throw { expr } => {
+            collect_lambda_vars(*expr, arena, out);
+        }
+        Stmt::CompoundAssignment { value, .. } => {
+            collect_lambda_vars(*value, arena, out);
+        }
+        Stmt::FieldAssignment { value, .. } => {
+            collect_lambda_vars(*value, arena, out);
+        }
+        Stmt::While { condition, body } => {
+            collect_lambda_vars(*condition, arena, out);
+            collect_lambda_vars(*body, arena, out);
+        }
+        Stmt::Loop { body } => {
+            collect_lambda_vars(*body, arena, out);
+        }
+        // Break/Continue/LocalDecl 不含 lambda 变量
+        _ => {}
+    }
+}
+
+/// 递归收集尾位置的 Lambda ExprId（包括持有 Lambda 的 Ident）。
+///
+/// 尾位置 = 表达式的值会被作为 enclosing lambda 的返回值。
+/// - body 本身在尾位置
+/// - Block trailing 在尾位置
+/// - Return 语句值在尾位置
+/// - If 分支在尾位置（当 If 本身在尾位置时）
+/// - Match arm body 在尾位置（当 Match 本身在尾位置时）
+/// - Elvis rhs 在尾位置（当 Elvis 本身在尾位置时）
+fn collect_tail_lambdas(
+    expr_id: ExprId,
+    arena: &AstArena,
+    lambda_vars: &FxHashMap<String, ExprId>,
+    out: &mut FxHashSet<ExprId>,
+) {
+    let node = &arena.expr(expr_id).node;
+    match node {
+        Expr::Lambda { .. } => {
+            // Lambda 在尾位置 → 逃逸
+            out.insert(expr_id);
+        }
+        Expr::Ident(name) => {
+            // Ident 在尾位置，若持有 Lambda → 该 Lambda 逃逸
+            if let Some(&lambda_id) = lambda_vars.get(*name) {
+                out.insert(lambda_id);
+            }
+        }
+        Expr::Block { stmts, trailing } => {
+            // Return 语句值在尾位置
+            for &stmt_id in stmts {
+                if let Stmt::Return { value: Some(ret_expr) } = &arena.stmt(stmt_id).node {
+                    collect_tail_lambdas(*ret_expr, arena, lambda_vars, out);
+                }
+            }
+            // trailing 在尾位置
+            if let Some(t) = trailing {
+                collect_tail_lambdas(*t, arena, lambda_vars, out);
+            }
+        }
+        Expr::If { then_branch, else_branch, .. } => {
+            collect_tail_lambdas(*then_branch, arena, lambda_vars, out);
+            if let Some(e) = else_branch {
+                collect_tail_lambdas(*e, arena, lambda_vars, out);
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                collect_tail_lambdas(arm.body, arena, lambda_vars, out);
+            }
+        }
+        Expr::Elvis { rhs, .. } => {
+            // Elvis rhs 在尾位置（当 lhs 为 null 时 rhs 是返回值）
+            collect_tail_lambdas(*rhs, arena, lambda_vars, out);
+        }
+        _ => {
+            // 其他表达式不在尾位置，其子表达式也不在尾位置
+        }
+    }
+}
+
+/// 两遍扫描入口：收集尾位置逃逸的 Lambda。
+///
+/// Pass 1: 收集所有 ValDecl/VarDecl 中持有 Lambda 的变量 (name → lambda ExprId)
+/// Pass 2: 递归收集尾位置的 Lambda（包括持有 Lambda 的 Ident）
+fn find_escaping_lambdas(body: ExprId, arena: &AstArena) -> FxHashSet<ExprId> {
+    let mut escaping: FxHashSet<ExprId> = FxHashSet::default();
+    let mut lambda_vars: FxHashMap<String, ExprId> = FxHashMap::default();
+    collect_lambda_vars(body, arena, &mut lambda_vars);
+    collect_tail_lambdas(body, arena, &lambda_vars, &mut escaping);
+    escaping
+}
+
+/// 递归收集表达式中的所有 Ident 名称（去重，保留首次出现顺序）。
+///
+/// 简化版自由变量分析：遍历常见 Expr 变体收集标识符引用，
+/// 由调用方排除 lambda 参数并检查外层作用域绑定。
+fn collect_free_idents_expr(expr_id: ExprId, arena: &AstArena, names: &mut Vec<String>) {
+    let spanned = arena.expr(expr_id);
+    match &spanned.node {
+        Expr::Ident(name) => {
+            if !names.iter().any(|n| n == name) {
+                names.push((*name).to_string());
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_free_idents_expr(*lhs, arena, names);
+            collect_free_idents_expr(*rhs, arena, names);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_free_idents_expr(*operand, arena, names);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_free_idents_expr(*callee, arena, names);
+            for &a in args {
+                collect_free_idents_expr(a, arena, names);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_free_idents_expr(*recv, arena, names);
+            for &a in args {
+                collect_free_idents_expr(a, arena, names);
+            }
+        }
+        Expr::FieldAccess { recv, .. } | Expr::SafeAccess { recv, .. } => {
+            collect_free_idents_expr(*recv, arena, names);
+        }
+        Expr::Index { recv, index } => {
+            collect_free_idents_expr(*recv, arena, names);
+            collect_free_idents_expr(*index, arena, names);
+        }
+        Expr::Assign { target, value } => {
+            collect_free_idents_expr(*target, arena, names);
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Expr::CompoundAssign { target, value, .. } => {
+            collect_free_idents_expr(*target, arena, names);
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Expr::RecordLit(fields) => {
+            for f in fields {
+                collect_free_idents_expr(f.value, arena, names);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_free_idents_expr(*cond, arena, names);
+            collect_free_idents_expr(*then_branch, arena, names);
+            if let Some(e) = else_branch {
+                collect_free_idents_expr(*e, arena, names);
+            }
+        }
+        Expr::Block { stmts, trailing } => {
+            for &s in stmts {
+                collect_free_idents_stmt(s, arena, names);
+            }
+            if let Some(t) = trailing {
+                collect_free_idents_expr(*t, arena, names);
+            }
+        }
+        Expr::Lambda { body, .. } => {
+            let inner = match body {
+                LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
+            };
+            collect_free_idents_expr(inner, arena, names);
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_free_idents_expr(*scrutinee, arena, names);
+            for arm in arms {
+                if let Some(g) = arm.guard {
+                    collect_free_idents_expr(g, arena, names);
+                }
+                collect_free_idents_expr(arm.body, arena, names);
+            }
+        }
+        // 单 operand 表达式：RefOf/Deref/Propagate/NonNullAssert/Atomic/Lazy
+        Expr::RefOf(inner)
+        | Expr::Deref(inner)
+        | Expr::Propagate(inner)
+        | Expr::NonNullAssert(inner)
+        | Expr::Atomic(inner)
+        | Expr::Lazy(inner) => {
+            collect_free_idents_expr(*inner, arena, names);
+        }
+        Expr::Elvis { lhs, rhs } => {
+            collect_free_idents_expr(*lhs, arena, names);
+            collect_free_idents_expr(*rhs, arena, names);
+        }
+        Expr::Slice { recv, start, end, .. } => {
+            collect_free_idents_expr(*recv, arena, names);
+            collect_free_idents_expr(*start, arena, names);
+            collect_free_idents_expr(*end, arena, names);
+        }
+        Expr::SafeMethodCall { recv, args, .. } => {
+            collect_free_idents_expr(*recv, arena, names);
+            for &a in args {
+                collect_free_idents_expr(a, arena, names);
+            }
+        }
+        Expr::RecordExtend { base, updates } => {
+            collect_free_idents_expr(*base, arena, names);
+            for f in updates {
+                collect_free_idents_expr(f.value, arena, names);
+            }
+        }
+        Expr::ArrayLit { elements, fill } => {
+            for &e in elements {
+                collect_free_idents_expr(e, arena, names);
+            }
+            if let Some((v, c)) = fill {
+                collect_free_idents_expr(*v, arena, names);
+                collect_free_idents_expr(*c, arena, names);
+            }
+        }
+        Expr::StrInterp(parts) => {
+            for part in parts {
+                if let InterpolationPart::Expression(e) = part {
+                    collect_free_idents_expr(*e, arena, names);
+                }
+            }
+        }
+        Expr::Select(arms) => {
+            for arm in arms {
+                match arm {
+                    SelectArm::Receive { channel_expr, body, .. } => {
+                        collect_free_idents_expr(*channel_expr, arena, names);
+                        collect_free_idents_expr(*body, arena, names);
+                    }
+                    SelectArm::Timeout { duration, body } => {
+                        collect_free_idents_expr(*duration, arena, names);
+                        collect_free_idents_expr(*body, arena, names);
+                    }
+                }
+            }
+        }
+        Expr::InlineTrait(methods) => {
+            for m in methods {
+                if let Some(body_expr) = m.body {
+                    collect_free_idents_expr(body_expr, arena, names);
+                }
+            }
+        }
+        // 常量/无子表达式变体：IntLit/FloatLit/BoolLit/CharLit/StrLit/NullLit/VoidLit
+        _ => {}
+    }
+}
+
+/// 递归收集语句中的 Ident 名称（collect_free_idents_expr 的语句版本）。
+fn collect_free_idents_stmt(stmt_id: StmtId, arena: &AstArena, names: &mut Vec<String>) {
+    match &arena.stmt(stmt_id).node {
+        Stmt::ValDecl { value, .. } | Stmt::VarDecl { value, .. } => {
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Stmt::Expression { expr } => {
+            collect_free_idents_expr(*expr, arena, names);
+        }
+        Stmt::Assignment { target, value } => {
+            collect_free_idents_expr(*target, arena, names);
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Stmt::FieldAssignment { object, value, .. } => {
+            collect_free_idents_expr(*object, arena, names);
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Stmt::CompoundAssignment { target, value, .. } => {
+            collect_free_idents_expr(*target, arena, names);
+            collect_free_idents_expr(*value, arena, names);
+        }
+        Stmt::Return { value } => {
+            if let Some(v) = value {
+                collect_free_idents_expr(*v, arena, names);
+            }
+        }
+        Stmt::Throw { expr } => {
+            collect_free_idents_expr(*expr, arena, names);
+        }
+        Stmt::For { iterable, body, .. } => {
+            collect_free_idents_expr(*iterable, arena, names);
+            collect_free_idents_expr(*body, arena, names);
+        }
+        Stmt::While { condition, body } => {
+            collect_free_idents_expr(*condition, arena, names);
+            collect_free_idents_expr(*body, arena, names);
+        }
+        Stmt::Loop { body } => {
+            collect_free_idents_expr(*body, arena, names);
+        }
+        Stmt::Defer { expr } => {
+            collect_free_idents_expr(*expr, arena, names);
+        }
+        Stmt::Break | Stmt::Continue => {}
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            Decl::FunDecl { body, .. } => {
+                collect_free_idents_expr(*body, arena, names);
+            }
+            _ => {}
+        },
+    }
+}
+
+/// 扫描表达式中的 Lambda，检测循环体捕获逃逸。
+///
+/// 维护 `loop_body_vars_stack`（循环体局部变量名栈），遇到 Lambda 时：
+/// 1. 收集 lambda 参数名（排除自身参数）
+/// 2. 用 collect_free_idents_expr 收集 lambda body 中的所有标识符
+/// 3. 排除 lambda 自身参数名后，剩下的就是自由变量
+/// 4. 检查自由变量是否有在 loop_body_vars_stack 的任一层中 → 循环体捕获逃逸
+fn scan_lambda_escapes_in_expr(
+    expr_id: ExprId,
+    arena: &AstArena,
+    loop_body_vars_stack: &mut Vec<FxHashSet<String>>,
+    table: &mut EscapeTable,
+) {
+    let expr = &arena.expr(expr_id).node;
+    match expr {
+        Expr::Lambda { params, body, .. } => {
+            // a. 收集 lambda 参数名（排除自身参数）
+            let param_names: FxHashSet<String> = params.iter().map(|p| p.name.to_string()).collect();
+            // b. 收集 lambda body 中的所有标识符
+            let body_expr = match body {
+                LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
+            };
+            let mut idents = Vec::new();
+            collect_free_idents_expr(body_expr, arena, &mut idents);
+            // c. 排除 lambda 自身参数名 → 自由变量
+            // d. 检查自由变量是否在循环体局部变量栈中
+            let captures_loop_var = idents.iter().any(|n| {
+                !param_names.contains(n) && loop_body_vars_stack.iter().any(|layer| layer.contains(n))
+            });
+            if captures_loop_var {
+                table.put(
+                    expr_id,
+                    EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: true }),
+                );
+            }
+            // 继续递归扫描 lambda body 内部的嵌套 lambda / 循环
+            scan_lambda_escapes_in_expr(body_expr, arena, loop_body_vars_stack, table);
+        }
+        Expr::Block { stmts, trailing } => {
+            for &s in stmts {
+                scan_lambda_escapes_in_stmt(s, arena, loop_body_vars_stack, table);
+            }
+            if let Some(t) = trailing {
+                scan_lambda_escapes_in_expr(*t, arena, loop_body_vars_stack, table);
+            }
+        }
+        _ => {
+            walk_children_expr(expr_id, arena, |c| {
+                scan_lambda_escapes_in_expr(c, arena, loop_body_vars_stack, table);
+            });
+            walk_children_stmts_of_expr(expr_id, arena, |s| {
+                scan_lambda_escapes_in_stmt(s, arena, loop_body_vars_stack, table);
+            });
+        }
+    }
+}
+
+/// 扫描语句中的 Lambda，检测循环体捕获逃逸。
+///
+/// 进入 For/While/Loop body 时，收集 body 内所有 ValDecl/VarDecl 定义的变量名，
+/// push 到循环体局部变量栈；退出时 pop。
+fn scan_lambda_escapes_in_stmt(
+    stmt_id: StmtId,
+    arena: &AstArena,
+    loop_body_vars_stack: &mut Vec<FxHashSet<String>>,
+    table: &mut EscapeTable,
+) {
+    let stmt = &arena.stmt(stmt_id).node;
+    match stmt {
+        Stmt::For { iterable, body, .. } => {
+            // 先扫描 iterable（不在循环体内）
+            scan_lambda_escapes_in_expr(*iterable, arena, loop_body_vars_stack, table);
+            // 收集循环体局部变量，push 到栈
+            let mut body_vars = FxHashSet::default();
+            collect_loop_body_vars_expr(*body, arena, &mut body_vars);
+            loop_body_vars_stack.push(body_vars);
+            scan_lambda_escapes_in_expr(*body, arena, loop_body_vars_stack, table);
+            loop_body_vars_stack.pop();
+        }
+        Stmt::While { condition, body } => {
+            scan_lambda_escapes_in_expr(*condition, arena, loop_body_vars_stack, table);
+            let mut body_vars = FxHashSet::default();
+            collect_loop_body_vars_expr(*body, arena, &mut body_vars);
+            loop_body_vars_stack.push(body_vars);
+            scan_lambda_escapes_in_expr(*body, arena, loop_body_vars_stack, table);
+            loop_body_vars_stack.pop();
+        }
+        Stmt::Loop { body } => {
+            let mut body_vars = FxHashSet::default();
+            collect_loop_body_vars_expr(*body, arena, &mut body_vars);
+            loop_body_vars_stack.push(body_vars);
+            scan_lambda_escapes_in_expr(*body, arena, loop_body_vars_stack, table);
+            loop_body_vars_stack.pop();
+        }
+        Stmt::LocalDecl { decl } => {
+            // 局部函数声明：独立作用域，用全新的 loop_body_vars_stack 扫描
+            if let Decl::FunDecl { body, .. } = &**decl {
+                let mut fresh_stack: Vec<FxHashSet<String>> = Vec::new();
+                scan_lambda_escapes_in_expr(*body, arena, &mut fresh_stack, table);
+            }
+        }
+        _ => {
+            walk_children_stmt(stmt_id, arena, |e| {
+                scan_lambda_escapes_in_expr(e, arena, loop_body_vars_stack, table);
+            });
+        }
+    }
+}
+
+/// 收集循环体内所有 ValDecl/VarDecl 定义的变量名（不进入嵌套 lambda/函数作用域）。
+fn collect_loop_body_vars_expr(expr_id: ExprId, arena: &AstArena, vars: &mut FxHashSet<String>) {
+    let expr = &arena.expr(expr_id).node;
+    match expr {
+        // 不进入嵌套 lambda 的内部作用域（lambda 有自己的参数和局部变量）
+        Expr::Lambda { .. } => {}
+        _ => {
+            walk_children_expr(expr_id, arena, |c| collect_loop_body_vars_expr(c, arena, vars));
+            walk_children_stmts_of_expr(expr_id, arena, |s| collect_loop_body_vars_stmt(s, arena, vars));
+        }
+    }
+}
+
+/// collect_loop_body_vars_expr 的语句版本。
+fn collect_loop_body_vars_stmt(stmt_id: StmtId, arena: &AstArena, vars: &mut FxHashSet<String>) {
+    let stmt = &arena.stmt(stmt_id).node;
+    match stmt {
+        Stmt::ValDecl { name, value, .. } | Stmt::VarDecl { name, value, .. } => {
+            vars.insert(name.to_string());
+            collect_loop_body_vars_expr(*value, arena, vars);
+        }
+        // 不进入嵌套函数的内部作用域
+        Stmt::LocalDecl { .. } => {}
+        _ => {
+            walk_children_stmt(stmt_id, arena, |e| collect_loop_body_vars_expr(e, arena, vars));
+        }
     }
 }
 
@@ -2418,6 +3166,19 @@ pub fn inline_pass(
             if has_propagate(*body, arena) {
                 continue;
             }
+            // 包含 return 语句的函数不内联：
+            // return 通过 ControlSignal::Return 实现函数级提前返回，
+            // 内联后 return 信号被设在调用方子图节点上，导致调用方帧提前退出
+            // （Bug #18）。defer body 中的 return 不计入（defer body 编译为独立子图）。
+            if has_return(*body, arena) {
+                continue;
+            }
+            // 包含 defer 语句的函数不内联：
+            // defer 注册到函数子图的 defer_table，内联后函数帧不创建，
+            // defer_table 永远不被检查，defer 不执行（Bug #47）。
+            if has_defer(*body, arena) {
+                continue;
+            }
             let size = count_expr_nodes(*body, arena);
             if size <= INLINE_SIZE_THRESHOLD {
                 report.candidates.push((func, size));
@@ -2497,13 +3258,97 @@ fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
 }
 
 fn has_propagate_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
+    let stmt = &arena.stmt(stmt_id).node;
+    match stmt {
+        // defer body 编译为独立子图，? 传播不影响外层函数
+        Stmt::Defer { .. } => false,
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = has_propagate(e, arena);
+                }
+            });
+            found
+        }
+    }
+}
+
+/// 检测表达式中是否包含 defer 语句。
+/// 含 defer 的函数不可内联：defer 注册到函数子图的 defer_table，
+/// 内联后函数帧不创建，defer_table 永远不被检查（Bug #47）。
+/// Lambda body 中的 defer 不计入（has_nested_function 已排除含 lambda 的函数）。
+fn has_defer(expr_id: ExprId, arena: &AstArena) -> bool {
     let mut found = false;
-    walk_children_stmt(stmt_id, arena, |e| {
+    walk_children_stmts_of_expr(expr_id, arena, |s| {
         if !found {
-            found = has_propagate(e, arena);
+            found = has_defer_stmt(s, arena);
         }
     });
+    if !found {
+        walk_children_expr(expr_id, arena, |c| {
+            if !found {
+                found = has_defer(c, arena);
+            }
+        });
+    }
     found
+}
+
+fn has_defer_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
+    let stmt = &arena.stmt(stmt_id).node;
+    match stmt {
+        Stmt::Defer { .. } => true,
+        // Lambda body 中的 defer 不计入（lambda 有独立帧）
+        // has_nested_function 已排除含 lambda 的函数
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = has_defer(e, arena);
+                }
+            });
+            found
+        }
+    }
+}
+
+/// 检测表达式中是否包含 return 语句（函数级作用域）。
+/// Lambda body 中的 return 不计入（scoped to lambda）。
+/// Defer body 中的 return 不计入（defer body 编译为独立子图）。
+fn has_return(expr_id: ExprId, arena: &AstArena) -> bool {
+    let mut found = false;
+    walk_children_stmts_of_expr(expr_id, arena, |s| {
+        if !found {
+            found = has_return_stmt(s, arena);
+        }
+    });
+    if !found {
+        walk_children_expr(expr_id, arena, |c| {
+            if !found {
+                found = has_return(c, arena);
+            }
+        });
+    }
+    found
+}
+
+fn has_return_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
+    let stmt = &arena.stmt(stmt_id).node;
+    match stmt {
+        Stmt::Return { .. } => true,
+        // defer body 编译为独立子图，return 不影响外层函数
+        Stmt::Defer { .. } => false,
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = has_return(e, arena);
+                }
+            });
+            found
+        }
+    }
 }
 
 /// 递归统计表达式子树的 AST 节点数。
@@ -2697,6 +3542,34 @@ fn collect_pattern_ctors(
 // AnalysisReport — 汇总报告 + rayon 三层并行入口
 // =========================================================================
 
+/// 循环分析报告（IR 构建后由 LoopAnalysis.rs 填充）。
+#[derive(Debug, Default)]
+pub struct LoopAnalysisReport {
+    /// 每个循环 body_sg 的不变量节点列表。
+    /// key = body_sg 的 SubGraphId, value = body_sg 内不变量节点的 NodeId 列表。
+    pub invariants: FxHashMap<crate::ir::Ir::SubGraphId, Vec<crate::ir::Ir::NodeId>>,
+    /// 可展开的循环。
+    /// key = 循环 sg 的 SubGraphId, value = 展开信息。
+    pub unrollable: FxHashMap<crate::ir::Ir::SubGraphId, UnrollInfo>,
+}
+
+/// 循环展开信息。
+#[derive(Debug, Clone)]
+pub struct UnrollInfo {
+    /// 编译期已知的 trip count
+    pub trip_count: u32,
+    /// 循环变量在 body_sg 中的绑定节点
+    pub loop_var_node: crate::ir::Ir::NodeId,
+    /// 循环起始值
+    pub start_value: i128,
+    /// 循环步进
+    pub step: i128,
+    /// body_sg 的 SubGraphId
+    pub body_sg: crate::ir::Ir::SubGraphId,
+    /// Range start 的原始 ConstValue（用于保持类型一致）
+    pub start_const: crate::ir::Ir::ConstValue,
+}
+
 /// 静态分析汇总报告。
 #[derive(Debug)]
 pub struct AnalysisReport {
@@ -2712,6 +3585,7 @@ pub struct AnalysisReport {
     pub inline: InlineReport,
     pub stack_alloc: StackAllocReport,
     pub match_report: MatchReport,
+    pub loop_analysis: LoopAnalysisReport,
 }
 
 /// 运行完整三层管线分析。
@@ -2767,5 +3641,295 @@ pub fn analyze(module: &Module, arena: &AstArena, sema: &SemaResult) -> Analysis
         inline,
         stack_alloc,
         match_report,
+        loop_analysis: LoopAnalysisReport::default(), // 由本文件 analyze_loops 在 IR 构建后填充
+    }
+}
+
+// =========================================================================
+// 循环分析 pass（从 LoopAnalysis.rs 合并）
+//
+// 产出 LoopAnalysisReport：
+// - 不变量识别：body_sg 中纯计算且输入来自循环外的节点
+// - trip count 估计：For 循环迭代器为常量 Range 时的编译期 trip count
+// =========================================================================
+
+use crate::ir::Ir::{
+    ComputeFnId, ConstValue, DataFlowGraph, LoopKind, NodeId, NodeKind, SubGraphId,
+    CF_CALL_LAUNCH, CF_RANGE, CF_RANGE_INCLUSIVE, pure_compute_fn_set,
+};
+
+/// 最大展开 body 节点数
+const MAX_UNROLL_BODY_NODES: usize = 32;
+/// 最大展开 trip count
+const MAX_UNROLL: u32 = 8;
+
+/// 运行循环分析，填充 LoopAnalysisReport。
+///
+/// 此函数在 IR 构建后运行，直接分析 DataFlowGraph。
+/// Analyzer.rs 的 analyze() 在 IR 构建前运行（消费 AST + SemaResult），
+/// 因此 loop_analysis 需要在 IR 构建后由 main.rs 调用此函数填充。
+pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
+    let mut report = LoopAnalysisReport::default();
+    let pure_set = pure_compute_fn_set();
+
+    // 收集所有循环子图（loop_kind != None 且 != LoopBody）
+    let loop_sgs: Vec<SubGraphId> = graph
+        .subgraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, sg)| sg.loop_kind != LoopKind::None && sg.loop_kind != LoopKind::LoopBody)
+        .map(|(i, _)| SubGraphId(i as u32))
+        .collect();
+
+    for loop_sg_id in &loop_sgs {
+        let loop_sg = &graph.subgraphs[loop_sg_id.0 as usize];
+
+        // 找到对应的 body_sg（loop_kind == LoopBody 且 loop_parent_sg == loop_sg_id）
+        let body_sg_id = graph
+            .subgraphs
+            .iter()
+            .enumerate()
+            .find(|(_, sg)| {
+                sg.loop_kind == LoopKind::LoopBody && sg.loop_parent_sg == Some(*loop_sg_id)
+            })
+            .map(|(i, _)| SubGraphId(i as u32));
+
+        let Some(body_sg_id) = body_sg_id else { continue };
+
+        // ── 不变量识别 ──
+        let invariants = find_invariants(graph, *loop_sg_id, body_sg_id, &pure_set);
+        if !invariants.is_empty() {
+            report.invariants.insert(body_sg_id, invariants);
+        }
+
+        // ── 循环展开分析（仅 For 循环）──
+        if loop_sg.loop_kind == LoopKind::For {
+            if let Some(unroll_info) = analyze_unroll(graph, *loop_sg_id, body_sg_id) {
+                report.unrollable.insert(*loop_sg_id, unroll_info);
+            }
+        }
+    }
+
+    report
+}
+
+/// 识别 body_sg 中的循环不变量节点。
+fn find_invariants(
+    graph: &DataFlowGraph,
+    loop_sg_id: SubGraphId,
+    body_sg_id: SubGraphId,
+    pure_set: &FxHashSet<ComputeFnId>,
+) -> Vec<NodeId> {
+    let loop_sg = &graph.subgraphs[loop_sg_id.0 as usize];
+    let body_sg = &graph.subgraphs[body_sg_id.0 as usize];
+    let (body_start, body_end) = body_sg.node_range;
+
+    // 循环变量依赖节点（cond_node, iter_next_node）
+    let mut loop_deps: FxHashSet<NodeId> = FxHashSet::default();
+    if let Some(c) = loop_sg.cond_node {
+        loop_deps.insert(c);
+    }
+    if let Some(n) = loop_sg.iter_next_node {
+        loop_deps.insert(n);
+    }
+
+    // 修改集：body_sg 内有副作用节点写回的目标
+    let mut modified: FxHashSet<NodeId> = FxHashSet::default();
+    for idx in (body_start.0 as usize)..(body_end.0 as usize) {
+        if let Some(Some(wt)) = graph.writeback_targets.get(idx) {
+            modified.insert(*wt);
+        }
+    }
+
+    // 预计算所有循环子图范围（loop_kind != None），用于判断节点是否在函数级。
+    // 外提目标为函数级子图，只有所有 inputs 都在函数级（不在任何循环子图内）
+    // 或已判定为不变量的节点才能安全外提——依赖循环变量的节点不会被外提，
+    // 因为外提到函数级后值不会随循环变化。
+    let loop_ranges: Vec<(u32, u32)> = graph
+        .subgraphs
+        .iter()
+        .filter(|sg| sg.loop_kind != LoopKind::None)
+        .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
+        .collect();
+    let is_func_level = |nid: NodeId| -> bool {
+        !loop_ranges.iter().any(|&(s, e)| nid.0 >= s && nid.0 < e)
+    };
+
+    // 迭代判定不变量（多轮扫描直到收敛）
+    let mut invariants: Vec<NodeId> = Vec::new();
+    let mut invariant_set: FxHashSet<NodeId> = FxHashSet::default();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for idx in (body_start.0 as usize)..(body_end.0 as usize) {
+            let nid = NodeId(idx as u32);
+            if invariant_set.contains(&nid) {
+                continue;
+            }
+
+            let node = graph.nodes[idx];
+
+            // 不能是控制流/调用/事件节点
+            if matches!(
+                node.kind,
+                NodeKind::Gate | NodeKind::Call | NodeKind::Await | NodeKind::EventSource
+            ) {
+                continue;
+            }
+
+            // 必须是纯计算
+            if !pure_set.contains(&node.compute_fn) {
+                continue;
+            }
+
+            // 所有 inputs 必须在函数级或已判定的不变量
+            let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
+            let mut all_invariant = true;
+            for &input in inputs {
+                if loop_deps.contains(&input) || modified.contains(&input) {
+                    all_invariant = false;
+                    break;
+                }
+                if !is_func_level(input) && !invariant_set.contains(&input) {
+                    all_invariant = false;
+                    break;
+                }
+            }
+
+            if all_invariant {
+                invariant_set.insert(nid);
+                invariants.push(nid);
+                changed = true;
+            }
+        }
+    }
+
+    invariants
+}
+
+/// 分析 For 循环是否可展开。
+fn analyze_unroll(
+    graph: &DataFlowGraph,
+    loop_sg_id: SubGraphId,
+    body_sg_id: SubGraphId,
+) -> Option<UnrollInfo> {
+    let loop_sg = &graph.subgraphs[loop_sg_id.0 as usize];
+    let body_sg = &graph.subgraphs[body_sg_id.0 as usize];
+
+    // body 节点数限制
+    let body_size = (body_sg.node_range.1.0 - body_sg.node_range.0.0) as usize;
+    if body_size > MAX_UNROLL_BODY_NODES {
+        return None;
+    }
+
+    // body 内不能有 break/continue
+    for idx in (body_sg.node_range.0.0 as usize)..(body_sg.node_range.1.0 as usize) {
+        if graph
+            .control_signal_nodes
+            .get(idx)
+            .and_then(|o| o.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+    }
+
+    // 在 loop_sg 内查找 CF_RANGE / CF_RANGE_INCLUSIVE 构造节点
+    let (loop_start, loop_end) = loop_sg.node_range;
+    let mut range_node: Option<NodeId> = None;
+    let mut range_inclusive = false;
+    for idx in (loop_start.0 as usize)..(loop_end.0 as usize) {
+        let node = &graph.nodes[idx];
+        if node.compute_fn == CF_RANGE {
+            range_node = Some(NodeId(idx as u32));
+            range_inclusive = false;
+            break;
+        }
+        if node.compute_fn == CF_RANGE_INCLUSIVE {
+            range_node = Some(NodeId(idx as u32));
+            range_inclusive = true;
+            break;
+        }
+    }
+    let range_node = range_node?;
+
+    // Range 的 inputs = [start, end]
+    let range_node_struct = graph.nodes[range_node.0 as usize];
+    let range_inputs = graph.inputs_pool.get(
+        range_node_struct.inputs_offset,
+        range_node_struct.input_count,
+    );
+    if range_inputs.len() < 2 {
+        return None;
+    }
+
+    let start_cv = graph
+        .const_values
+        .get(range_inputs[0].0 as usize)
+        .and_then(|o| o.as_ref())?;
+    let end_cv = graph
+        .const_values
+        .get(range_inputs[1].0 as usize)
+        .and_then(|o| o.as_ref())?;
+
+    let start_val = const_to_i128(start_cv)?;
+    let end_val = const_to_i128(end_cv)?;
+
+    let step: i128 = 1;
+    let trip_count = if range_inclusive {
+        if end_val < start_val {
+            return None;
+        }
+        ((end_val - start_val) / step + 1) as u32
+    } else {
+        if end_val <= start_val {
+            return None;
+        }
+        ((end_val - start_val) / step) as u32
+    };
+
+    if trip_count == 0 || trip_count > MAX_UNROLL {
+        return None;
+    }
+
+    // iter_next_node 必须存在且是 Call 节点（Range next 调用）
+    let iter_next = loop_sg.iter_next_node?;
+    let iter_node = &graph.nodes[iter_next.0 as usize];
+    if iter_node.compute_fn != CF_CALL_LAUNCH {
+        return None;
+    }
+
+    // body_sg 结构：param_0 = 迭代器, param_1 = 当前值（循环变量）
+    // loop_var_node = body_sg 的第二个参数节点（param_1 = 当前值）
+    let loop_var_node = NodeId(body_sg.node_range.0.0 + 1);
+
+    Some(UnrollInfo {
+        trip_count,
+        loop_var_node,
+        start_value: start_val,
+        step,
+        body_sg: body_sg_id,
+        start_const: *start_cv,
+    })
+}
+
+/// 从 ConstValue 提取 i128。
+fn const_to_i128(cv: &ConstValue) -> Option<i128> {
+    use crate::ir::Ir::ConstValue::*;
+    match cv {
+        I8(v) => Some(*v as i128),
+        I16(v) => Some(*v as i128),
+        I32(v) => Some(*v as i128),
+        I64(v) => Some(*v as i128),
+        I128(v) => Some(*v),
+        U8(v) => Some(*v as i128),
+        U16(v) => Some(*v as i128),
+        U32(v) => Some(*v as i128),
+        U64(v) => Some(*v as i128),
+        U128(v) => Some(*v as i128),
+        Isize(v) => Some(*v as i128),
+        Usize(v) => Some(*v as i128),
+        _ => None,
     }
 }

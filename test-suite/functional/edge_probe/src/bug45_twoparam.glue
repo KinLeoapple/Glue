@@ -1,0 +1,34 @@
+fun twoParam(a: i64, b: i32): i64 {
+    if b == 0i32 {
+        a
+    } else {
+        if b == 1i32 {
+            a + 1i64
+        } else {
+            twoParam(a * 2i64, b - 1)
+        }
+    }
+}
+
+fun twoParamArith(a: i64, b: i32): i64 {
+    if b == 0i32 {
+        a
+    } else {
+        if b == 1i32 {
+            a + 1i64
+        } else {
+            1i64 + twoParamArith(a * 2i64, b - 1)
+        }
+    }
+}
+
+fun main(): void {
+    println("=== Two Param Test ===")
+    println("twoParam(1,0) = {twoParam(1,0)} (expected 1)")
+    println("twoParam(1,1) = {twoParam(1,1)} (expected 2)")
+    println("twoParam(1,2) = {twoParam(1,2)} (expected 5, Bug #45 if null)")
+    println("twoParam(1,3) = {twoParam(1,3)} (expected 11, Bug #45 if null)")
+    println("---")
+    println("twoParamArith(1,2) = {twoParamArith(1,2)} (expected 4, Bug #45 if null)")
+    println("twoParamArith(1,3) = {twoParamArith(1,3)} (expected 6, Bug #45 if null)")
+}

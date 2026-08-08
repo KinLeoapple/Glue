@@ -1,0 +1,396 @@
+// 边缘测试：Throw 错误处理（throw/catch/?传播/不同错误类型/defer/match/链式传播）
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层（本测试无递归）
+//   Bug #21: i32 超范围字面量静默退出     → 所有字面量加显式类型后缀
+//   Bug #24: 分支内 await 卡住            → 本测试无 await
+//   闭包不支持显式返回类型标注            → 省略 : i32
+//
+// 新发现限制（见文件末尾注释 + 报告）：
+//   Limit-A (已修复，Bug #27): throw 原始类型(i32/str)不再包装为 Error(value: v)，
+//                              match 模式 Error(v) 的 v 直接绑定到 throw 的值本身
+//   Limit-B (已修复，Bug #28): ?? (Elvis) 支持 Throw 类型，Ok 解包返回值，Err 返回默认值
+//   Limit-C (Bug #29 已修复): 嵌套模式提取的 i32 值现已保留类型信息
+
+var failures: i32 = 0
+var deferLog: str = ""
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 错误子类型定义 ───
+type NotFound: Err = NotFound(msg: str)
+type Timeout: Err = Timeout(msg: str)
+type Rec = Rec(v: i32)
+
+// ─── 1. 基本 throw + catch ───
+fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
+    if b == 0 { throw Error("division by zero") }
+    Ok(a / b)
+}
+
+// ─── 2. throw 不同类型（i32 / str / record 作为错误值）───
+fun throwI32(b: bool): Throw<i32, i32> {
+    if b { throw 42i32 }
+    Ok(0i32)
+}
+
+fun throwStr(b: bool): Throw<i32, str> {
+    if b { throw "boom" }
+    Ok(0i32)
+}
+
+fun throwRec(b: bool): Throw<i32, Rec> {
+    if b { throw Rec(7i32) }
+    Ok(0i32)
+}
+
+// ─── 3. 嵌套 throw：A 调 B，B throw，A catch 或传播 ───
+fun innerThrow(b: bool): Throw<i32, Error> {
+    if b { throw Error("inner") }
+    Ok(1i32)
+}
+
+fun outerPropagate(b: bool): Throw<i32, Error> {
+    val r = innerThrow(b)?
+    Ok(r + 100i32)
+}
+
+// ─── 4. 表达式位置的 throw：?? 提供默认值 ───
+fun mightFail(b: bool): Throw<i32, Error> {
+    if b { throw Error("fail") }
+    Ok(5i32)
+}
+
+// ─── 5. ? 传播 ───
+fun risky(b: bool): Throw<i32, Error> {
+    if b { throw Error("risky") }
+    Ok(99i32)
+}
+
+fun useRisky(b: bool): Throw<i32, Error> {
+    val y = risky(b)?
+    Ok(y + 1i32)
+}
+
+// ─── 6. 多 catch 模式（不同错误子类型）───
+fun lookup(id: i32): Throw<str, Error> {
+    if id < 0 { throw NotFound("negative id") }
+    if id == 0 { throw Timeout("timed out") }
+    Ok("user-" + cast(id).to(str))
+}
+
+// ─── 7. throw + defer 交互：throw 时 defer 仍应执行 ───
+fun throwWithDefer(b: bool): Throw<i32, Error> {
+    defer deferLog = deferLog + "cleanup"
+    if b { throw Error("defer-test") }
+    deferLog = deferLog + "body|"
+    Ok(1i32)
+}
+
+// ─── 9. match arm 内 throw ───
+fun throwInMatch(n: i32): Throw<i32, Error> {
+    match n {
+        0 => throw Error("zero case")
+        _ => Ok(n)
+    }
+}
+
+// ─── 10. 链式错误传播 ───
+fun step1(a: i32): Throw<i32, Error> {
+    if a < 0 { throw Error("negative") }
+    Ok(a + 1i32)
+}
+
+fun step2(b: i32): Throw<i32, Error> {
+    if b > 100i32 { throw Error("too big") }
+    Ok(b * 2i32)
+}
+
+fun step3(c: i32): Throw<i32, Error> {
+    if c == 2i32 { throw Error("two") }
+    Ok(c - 1i32)
+}
+
+fun chained(a: i32): Throw<i32, Error> {
+    val r1 = step1(a)?
+    val r2 = step2(r1)?
+    val r3 = step3(r2)?
+    Ok(r3)
+}
+
+// ─── 11. while 循环内 throw（顶层函数，隔离 Bug #33）───
+fun loopThrow(n: i32): Throw<i32, Error> {
+    var i: i32 = 0
+    while i < 10 {
+        if i == n { throw Error("hit " + cast(i).to(str)) }
+        i = i + 1
+    }
+    Ok(i)
+}
+
+fun main(): void {
+    println("=== Edge Throw ===")
+
+    // ─── 1. 基本 throw + catch ───
+    println("--- 1. Basic throw + catch ---")
+    match safeDiv(10i32, 2i32) {
+        Ok(v) => check(v == 5i32, "safeDiv 10/2 = 5")
+        Error(_) => check(false, "safeDiv 10/2 should succeed")
+    }
+    match safeDiv(10i32, 0i32) {
+        Ok(_) => check(false, "safeDiv 10/0 should fail")
+        Error(_) => check(true, "safeDiv 10/0 throws")
+    }
+
+    // ─── 2. throw 不同类型 ───
+    println("--- 2. Throw different types ---")
+    match throwI32(true) {
+        Ok(_) => check(false, "throwI32(true) should throw")
+        Error(v) => check(v == 42i32, "throw i32 value 42 (Bug #27)")
+    }
+    match throwI32(false) {
+        Ok(v) => check(v == 0i32, "throwI32(false) = 0")
+        Error(_) => check(false, "throwI32(false) should succeed")
+    }
+    match throwStr(true) {
+        Ok(_) => check(false, "throwStr(true) should throw")
+        Error(v) => check(v == "boom", "throw str value boom (Bug #27)")
+    }
+    match throwRec(true) {
+        Ok(_) => check(false, "throwRec(true) should throw")
+        Error(r) => check(r.v == 7i32, "throw record value v=7")
+    }
+
+    // ─── 3. 嵌套 throw ───
+    println("--- 3. Nested throw ---")
+    match innerThrow(false) {
+        Ok(v) => check(v == 1i32, "innerThrow(false) = 1")
+        Error(_) => check(false, "innerThrow(false) should succeed")
+    }
+    match outerPropagate(false) {
+        Ok(v) => check(v == 101i32, "outerPropagate(false) = 101")
+        Error(_) => check(false, "outerPropagate(false) should succeed")
+    }
+    match outerPropagate(true) {
+        Ok(_) => check(false, "outerPropagate(true) should propagate")
+        Error(_) => check(true, "outerPropagate(true) propagates inner throw")
+    }
+
+    // ─── 4. 表达式位置的 throw（?? 提供默认值）───
+    println("--- 4. Throw in expression position ---")
+    match mightFail(false) {
+        Ok(v) => check(v == 5i32, "mightFail(false) = 5")
+        Error(_) => check(false, "mightFail(false) should succeed")
+    }
+    // Bug #28 已修复：?? (Elvis) 支持 Throw 类型——Ok 解包返回值，Err 返回默认值
+    // 注：?? 优先级低于 ==（与 C#/Swift/Kotlin 一致），需括号明确意图
+    check((mightFail(false) ?? 999i32) == 5i32, "mightFail(false) ?? 999 = 5 (Bug #28)")
+    check((mightFail(true) ?? 999i32) == 999i32, "mightFail(true) ?? 999 = 999 (Bug #28)")
+    // Throw 的 ?? 与 Nullable 的 ?? 对称
+    val n: i32? = null
+    check((n ?? 7i32) == 7i32, "nullable null ?? 7 = 7")
+    val m: i32? = 3i32
+    check((m ?? 7i32) == 3i32, "nullable non-null ?? 7 = 3")
+
+    // ─── 5. ? 传播 ───
+    println("--- 5. Error propagation with ? ---")
+    match useRisky(false) {
+        Ok(v) => check(v == 100i32, "useRisky(false) = 100")
+        Error(_) => check(false, "useRisky(false) should succeed")
+    }
+    match useRisky(true) {
+        Ok(_) => check(false, "useRisky(true) should propagate")
+        Error(_) => check(true, "useRisky(true) propagates")
+    }
+
+    // ─── 6. 多 catch 模式 ───
+    println("--- 6. Multiple catch patterns ---")
+    match lookup(-1i32) {
+        Ok(_) => check(false, "lookup(-1) should fail")
+        Error(NotFound(m)) => check(m == "negative id", "lookup(-1) catches NotFound")
+        Error(Timeout(_)) => check(false, "lookup(-1) should be NotFound not Timeout")
+        Error(_) => check(false, "lookup(-1) should match NotFound")
+    }
+    match lookup(0i32) {
+        Ok(_) => check(false, "lookup(0) should fail")
+        Error(NotFound(_)) => check(false, "lookup(0) should be Timeout not NotFound")
+        Error(Timeout(m)) => check(m == "timed out", "lookup(0) catches Timeout")
+        Error(_) => check(false, "lookup(0) should match Timeout")
+    }
+    match lookup(42i32) {
+        Ok(v) => check(v == "user-42", "lookup(42) success")
+        Error(_) => check(false, "lookup(42) should succeed")
+    }
+
+    // ─── 7. throw + defer 交互 ───
+    println("--- 7. Throw + defer interaction ---")
+    deferLog = ""
+    match throwWithDefer(false) {
+        Ok(v) => check(v == 1i32, "throwWithDefer(false) = 1")
+        Error(_) => check(false, "throwWithDefer(false) should succeed")
+    }
+    check(deferLog == "body|cleanup", "defer runs after normal body")
+
+    deferLog = ""
+    match throwWithDefer(true) {
+        Ok(_) => check(false, "throwWithDefer(true) should throw")
+        Error(_) => check(true, "throwWithDefer(true) throws")
+    }
+    check(deferLog == "cleanup", "defer runs even when throw occurs")
+
+    // ─── 8. 错误值相等 ───
+    println("--- 8. Error value equality ---")
+    val ok1 = Ok(5i32)
+    val ok2 = Ok(5i32)
+    check(ok1 == ok2, "Ok value equality")
+
+    val ok3 = Ok(6i32)
+    check(ok1 != ok3, "Ok value inequality")
+
+    val err1 = Error("msg")
+    val err2 = Error("msg")
+    check(err1 == err2, "Error value equality")
+
+    val err3 = Error("other")
+    check(err1 != err3, "Error value inequality")
+
+    // ─── 9. match arm 内 throw ───
+    println("--- 9. Throw from within a match arm ---")
+    match throwInMatch(0i32) {
+        Ok(_) => check(false, "throwInMatch(0) should throw")
+        Error(e) => check(e.msg == "zero case", "throwInMatch(0) throws zero case (Bug #27)")
+    }
+    match throwInMatch(5i32) {
+        Ok(v) => check(v == 5i32, "throwInMatch(5) = 5")
+        Error(_) => check(false, "throwInMatch(5) should succeed")
+    }
+
+    // ─── 10. 链式错误传播 ───
+    println("--- 10. Chained error propagation ---")
+    match chained(5i32) {
+        Ok(v) => check(v == 11i32, "chained(5) = 11")
+        Error(_) => check(false, "chained(5) should succeed")
+    }
+    match chained(-1i32) {
+        Ok(_) => check(false, "chained(-1) should fail at step1")
+        Error(_) => check(true, "chained(-1) propagates step1 error")
+    }
+    match chained(100i32) {
+        Ok(_) => check(false, "chained(100) should fail at step2")
+        Error(_) => check(true, "chained(100) propagates step2 error")
+    }
+    match chained(0i32) {
+        Ok(_) => check(false, "chained(0) should fail at step3")
+        Error(_) => check(true, "chained(0) propagates step3 error (c==2)")
+    }
+
+    // ─── 11. while 循环内 throw 传播（Bug #33 已修复）───
+    println("--- 11. throw inside while loop (Bug #33) ---")
+    // Bug #33 已修复：while 循环体内的 throw 正确传播，函数返回 Error
+    match loopThrow(3i32) {
+        Ok(_) => check(false, "Bug #33: loopThrow(3) should throw, not Ok")
+        Error(_) => check(true, "Bug #33: loopThrow(3) throws Error (fixed)")
+    }
+    match loopThrow(100i32) {
+        Ok(v) => check(v == 10, "loopThrow(100) completes loop, i=10")
+        Error(_) => check(false, "loopThrow(100) should succeed")
+    }
+
+    // ─── 12. 嵌套 Ok(Ok(v)) / Throw 嵌套 ───
+    println("--- 12. Nested Ok/Error values ---")
+    // Ok 内部可以装任意值，包括另一个 Throw
+    val nested: Throw<Throw<i32, Error>, Error> = Ok(Ok(42i32))
+    match nested {
+        Ok(Ok(v)) => check(v == 42i32, "nested Ok(Ok(42)) unwraps to 42")
+        Ok(Error(_)) => check(false, "nested inner should be Ok")
+        Error(_) => check(false, "nested outer should be Ok")
+    }
+    val nested_err: Throw<Throw<i32, i32>, Error> = Ok(throwI32(true))
+    match nested_err {
+        Ok(Ok(v)) => check(false, "nested_err inner should be Error")
+        Ok(Error(v)) => check(v == 42i32, "nested Ok(throw 42) -> inner Error 42 (Bug #27)")
+        Ok(Error(_)) => check(false, "nested_err inner Error wrapping")
+        Error(_) => check(false, "nested_err outer should be Ok")
+    }
+
+    // ─── 13. 首次 throw 胜出（短路）───
+    println("--- 13. First throw wins (short-circuit) ---")
+    fun firstThrow(): Throw<i32, Error> {
+        val a = throwI32(true)?
+        val b = throwI32(true)?
+        Ok(a + b)
+    }
+    match firstThrow() {
+        Ok(_) => check(false, "firstThrow should short-circuit at first ?")
+        Error(v) => check(v == 42i32, "first ? propagates first throw 42 (Bug #27)")
+        Error(_) => check(false, "firstThrow Error wrapping")
+    }
+
+    // ─── 14. defer 清理顺序（throw + 多 defer + 嵌套调用）───
+    println("--- 14. defer cleanup order with nested calls ---")
+    deferLog = ""
+    fun innerWithDefer(): Throw<i32, Error> {
+        defer deferLog = deferLog + "inner-cleanup|"
+        throw Error("inner-throw")
+    }
+    fun outerWithDefer(): Throw<i32, Error> {
+        defer deferLog = deferLog + "outer-cleanup|"
+        val r = innerWithDefer()?
+        Ok(r + 1)
+    }
+    match outerWithDefer() {
+        Ok(_) => check(false, "outerWithDefer should propagate inner throw")
+        Error(_) => check(true, "outerWithDefer propagates inner throw")
+    }
+    check(deferLog == "inner-cleanup|outer-cleanup|", "defer LIFO: inner-cleanup then outer-cleanup")
+
+    // ─── 15. or-pattern 错误捕获 ───
+    println("--- 15. or-pattern error catch ---")
+    fun classifyErr(e: Error): str {
+        match e {
+            NotFound(_) => "not-found"
+            Timeout(_) => "timeout"
+            Error("division by zero") => "div-zero"
+            Error(_) => "other"
+        }
+    }
+    check(classifyErr(NotFound("x")) == "not-found", "classify NotFound")
+    check(classifyErr(Timeout("y")) == "timeout", "classify Timeout")
+    check(classifyErr(Error("division by zero")) == "div-zero", "classify div-zero by value")
+    check(classifyErr(Error("something")) == "other", "classify other")
+
+    summary()
+}
+
+// ─── 新发现限制汇总 ───
+//
+// Limit-A (已修复，Bug #27): throw 原始类型不再包装为 Error(value: v)
+//   修复: ThrowPayload::Err 从 Arc<RecordValue> 改为 Value，throw 任意值直接作为 Err payload。
+//         match 模式 `Error(v)` 的 v 直接绑定到 throw 的值本身，无需 `Error(Error(v))` 嵌套解构。
+//         record 类型 `Error(r)` 行为不变（r 仍是 record 本身）。
+//
+// Limit-B (已修复，Bug #28): ?? (Elvis) 支持 Throw 类型
+//   修复: compute_elvis 统一处理 Nullable 与 Throw——ThrowVal(Ok(v)) 返回 v，
+//         ThrowVal(Err) 返回 rhs。Inference.rs 的 Elvis 类型推断对 Throw 返回 value_type。
+//         `throwExpr ?? default` 与 `nullableExpr ?? default` 语义对称。
+//
+// Limit-C (Bug #29 已修复): 嵌套模式提取的 i32 值类型信息
+//   Bug #29 修复后模式变量获得正确的运行时类型。Bug #27 修复后不再需要嵌套模式，
+//   `Error(v)` 直接绑定到 throw 的值，类型信息由 throw 表达式的静态类型决定。

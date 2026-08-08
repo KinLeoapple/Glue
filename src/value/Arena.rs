@@ -458,8 +458,8 @@ impl ValueArena {
     pub fn alloc_throw_ok(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
     }
-    pub fn alloc_throw_err(&mut self, record: Arc<RecordValue>) -> ValueHandle {
-        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record) }))
+    pub fn alloc_throw_err(&mut self, err_val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(err_val) }))
     }
     pub fn alloc_atomic(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
@@ -569,6 +569,19 @@ impl ValueArena {
             ValueTag::Char => ScalarSoA::Char(arr.elements.iter().map(|h| h.as_char() as u32).collect()),
             ValueTag::F32 => ScalarSoA::F32(arr.elements.iter().map(|h| h.as_f32()).collect()),
             ValueTag::F64 => ScalarSoA::F64(arr.elements.iter().map(|h| h.as_f64()).collect()),
+            ValueTag::I128 => ScalarSoA::I128(arr.elements.iter().map(|h| h.as_i128()).collect()),
+            ValueTag::U128 => ScalarSoA::U128(arr.elements.iter().map(|h| h.as_u128()).collect()),
+            ValueTag::Isize => ScalarSoA::Isize(arr.elements.iter().map(|h| h.as_isize()).collect()),
+            ValueTag::Usize => ScalarSoA::Usize(arr.elements.iter().map(|h| h.as_usize()).collect()),
+            // F16/F128 直接读 union bit pattern，不走 f64 中转（保持 NaN bit 精确性）
+            ValueTag::F16 => ScalarSoA::F16(arr.elements.iter().map(|h| {
+                let Value::Scalar(sv, _) = h else { unreachable!("tag checked above") };
+                unsafe { sv.f16_val }
+            }).collect()),
+            ValueTag::F128 => ScalarSoA::F128(arr.elements.iter().map(|h| {
+                let Value::Scalar(sv, _) = h else { unreachable!("tag checked above") };
+                unsafe { F128(std::mem::transmute(sv.f128_val)) }
+            }).collect()),
             _ => return,
         });
     }
@@ -1258,6 +1271,13 @@ fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
         (ScalarSoA::U64(va), ScalarSoA::U64(vb)) => Some(va == vb),
         (ScalarSoA::Bool(va), ScalarSoA::Bool(vb)) => Some(va == vb),
         (ScalarSoA::Char(va), ScalarSoA::Char(vb)) => Some(va == vb),
+        (ScalarSoA::I128(va), ScalarSoA::I128(vb)) => Some(va == vb),
+        (ScalarSoA::U128(va), ScalarSoA::U128(vb)) => Some(va == vb),
+        (ScalarSoA::Isize(va), ScalarSoA::Isize(vb)) => Some(va == vb),
+        (ScalarSoA::Usize(va), ScalarSoA::Usize(vb)) => Some(va == vb),
+        // F16/F128 按 bit pattern 比较（与 F32/F64 的 to_bits() 语义一致，NaN == NaN 为 true）
+        (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va == vb),
+        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(va == vb),
         _ => None, // 类型不匹配，回退
     }
 }
@@ -1462,6 +1482,12 @@ pub fn simd_hash_soa<H: Hasher>(soa: &ScalarSoA, state: &mut H) {
         ScalarSoA::U64(v) => v.iter().for_each(|x| x.hash(state)),
         ScalarSoA::Bool(v) => v.iter().for_each(|x| x.hash(state)),
         ScalarSoA::Char(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::I128(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U128(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Isize(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Usize(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::F16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::F128(v) => v.iter().for_each(|x| x.hash(state)),
     }
 }
 
@@ -1556,6 +1582,12 @@ fn simd_soa_deep_clone(soa: &ScalarSoA) -> Vec<Value> {
         ScalarSoA::U64(v) => v.iter().map(|&x| Value::u64(x)).collect(),
         ScalarSoA::Bool(v) => v.iter().map(|&x| Value::bool_val(x)).collect(),
         ScalarSoA::Char(v) => v.iter().map(|&x| Value::char_val(char::from_u32(x).unwrap_or('\0'))).collect(),
+        ScalarSoA::I128(v) => v.iter().map(|&x| Value::i128(x)).collect(),
+        ScalarSoA::U128(v) => v.iter().map(|&x| Value::u128(x)).collect(),
+        ScalarSoA::Isize(v) => v.iter().map(|&x| Value::isize_val(x)).collect(),
+        ScalarSoA::Usize(v) => v.iter().map(|&x| Value::usize_val(x)).collect(),
+        ScalarSoA::F16(v) => v.iter().map(|&x| Value::f16(F16(x))).collect(),
+        ScalarSoA::F128(v) => v.iter().map(|&x| Value::f128(x)).collect(),
     }
 }
 
@@ -1612,7 +1644,7 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         }
         (HeapObj::ThrowVal(x), HeapObj::ThrowVal(y)) => match (&x.payload, &y.payload) {
             (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => value_equals_with_arena(a, b, arena),
-            (ThrowPayload::Err(a), ThrowPayload::Err(b)) => Arc::ptr_eq(a, b),
+            (ThrowPayload::Err(a), ThrowPayload::Err(b)) => value_equals_with_arena(a, b, arena),
             _ => false,
         },
         (HeapObj::Closure(x), HeapObj::Closure(y)) => {
@@ -1628,7 +1660,56 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::Builtin(x), HeapObj::Builtin(y)) => {
             (x.fn_ptr as usize) == (y.fn_ptr as usize) && x.name == y.name
         }
-        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+        (HeapObj::Partial(x), HeapObj::Partial(y)) => {
+            x.func_id == y.func_id
+                && x.remaining_arity == y.remaining_arity
+                && x.upvalues.len() == y.upvalues.len()
+                && x.bound_args.len() == y.bound_args.len()
+                && x.upvalues.iter().zip(&y.upvalues).all(|(p, q)| value_equals_with_arena(p, q, arena))
+                && x.bound_args.iter().zip(&y.bound_args).all(|(p, q)| value_equals_with_arena(p, q, arena))
+        }
+        (HeapObj::TraitVal(x), HeapObj::TraitVal(y)) => {
+            x.trait_name == y.trait_name
+                && x.method_names == y.method_names
+                && x.method_values.len() == y.method_values.len()
+                && x.method_values.iter().zip(&y.method_values).all(|(p, q)| value_equals_with_arena(p, q, arena))
+                && match (&x.data, &y.data) {
+                    (Some(a), Some(b)) => value_equals_with_arena(a, b, arena),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (HeapObj::LazyVal(x), HeapObj::LazyVal(y)) => {
+            // 已 force 的惰性值比较缓存结果；未 force 的按 thunk 闭包比较
+            let xf = x.forced.load(std::sync::atomic::Ordering::Relaxed);
+            let yf = y.forced.load(std::sync::atomic::Ordering::Relaxed);
+            if xf && yf {
+                let xc = x.cached.lock().unwrap_or_else(|e| e.into_inner());
+                let yc = y.cached.lock().unwrap_or_else(|e| e.into_inner());
+                match (&*xc, &*yc) {
+                    (Some(a), Some(b)) => value_equals_with_arena(a, b, arena),
+                    (None, None) => true,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        (HeapObj::AtomicVal(x), HeapObj::AtomicVal(y)) => {
+            let xv = x.load();
+            let yv = y.load();
+            value_equals_with_arena(&xv, &yv, arena)
+        }
+        // AsyncVal：每个 AsyncHandle 代表独立的异步操作，两个不同实例永不相等
+        // （同一实例的相等性由上层 Arc::ptr_eq 保证）
+        (HeapObj::AsyncVal(_), HeapObj::AsyncVal(_)) => false,
+        // Arc 包装的共享资源：按指针身份比较（语义正确——同一通道才相等）
+        (HeapObj::ChannelVal(x), HeapObj::ChannelVal(y)) => std::sync::Arc::ptr_eq(x, y),
+        (HeapObj::SenderVal(x), HeapObj::SenderVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
+        (HeapObj::ReceiverVal(x), HeapObj::ReceiverVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
+        (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
+        // 不同 HeapObj 变体之间永不相等
+        _ => false,
     }
 }
 
@@ -1855,12 +1936,12 @@ fn deep_clone_heap(
             })
         }
         HeapObj::ThrowVal(t) => match &t.payload {
-            // ThrowPayload::Ok 已迁移为 Value
+            // ThrowPayload::Ok/Err 均持有 Value，递归深拷贝
             ThrowPayload::Ok(v) => HeapObj::ThrowVal(ThrowValue {
                 payload: ThrowPayload::Ok(deep_clone_value(v, arena, cache)),
             }),
-            ThrowPayload::Err(r) => HeapObj::ThrowVal(ThrowValue {
-                payload: ThrowPayload::Err(r.clone()),
+            ThrowPayload::Err(v) => HeapObj::ThrowVal(ThrowValue {
+                payload: ThrowPayload::Err(deep_clone_value(v, arena, cache)),
             }),
         },
         HeapObj::Builtin(b) => HeapObj::Builtin(b.clone()),
@@ -2066,9 +2147,9 @@ impl ValueArena {
             payload: ThrowPayload::Ok(val),
         }))
     }
-    pub fn throw_err(&mut self, record: Arc<RecordValue>) -> ValueHandle {
+    pub fn throw_err(&mut self, err_val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
-            payload: ThrowPayload::Err(record),
+            payload: ThrowPayload::Err(err_val),
         }))
     }
     pub fn atomic(&mut self, val: Value) -> ValueHandle {

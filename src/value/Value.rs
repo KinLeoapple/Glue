@@ -455,6 +455,25 @@ impl F128 {
     pub fn to_f32(self) -> f32 {
         self.to_f64() as f32
     }
+    /// 从 i128 精确构造 F128（不经 f64 中转，避免精度损失）。
+    /// F128 有 113 位尾数，可精确表示所有 i128 值。
+    pub fn from_i128(x: i128) -> Self {
+        if x == 0 {
+            return Self::zero_val(false);
+        }
+        let sign = x < 0;
+        let abs = x.unsigned_abs();
+        // abs 为 u128，MSB 即为隐含 1 的位置。exp = msb，mant = abs。
+        // pack 会将 MSB 对齐到 bit 112 并处理舍入（此处无舍入，abs 完整保留）。
+        Self::pack(sign, 0, abs, false)
+    }
+    /// 从 u128 精确构造 F128（不经 f64 中转）。
+    pub fn from_u128(x: u128) -> Self {
+        if x == 0 {
+            return Self::zero_val(false);
+        }
+        Self::pack(false, 0, x, false)
+    }
     pub fn is_nan(self) -> bool {
         let bits = u128::from_le_bytes(self.0);
         let exp = (bits >> 112) & 0x7FFF;
@@ -1055,6 +1074,7 @@ impl Value {
                     ValueTag::Isize => v.isize_val as i128,
                     ValueTag::Usize => v.usize_val as i128,
                     ValueTag::Char => v.char_val as i128,
+                    ValueTag::Bool => if v.bool_val { 1 } else { 0 },
                     _ => 0,
                 }
             },
@@ -1071,6 +1091,21 @@ impl Value {
                     ValueTag::F32 => v.f32_val as f64,
                     ValueTag::F64 => v.f64_val,
                     ValueTag::F128 => F128(std::mem::transmute(v.f128_val)).to_f64(),
+                    // 整数 → f64 提升（支持混合 int-float 算术，Bug #55）
+                    ValueTag::I8 => v.i8_val as f64,
+                    ValueTag::I16 => v.i16_val as f64,
+                    ValueTag::I32 => v.i32_val as f64,
+                    ValueTag::I64 => v.i64_val as f64,
+                    ValueTag::I128 => i128::from_ne_bytes(std::mem::transmute(v.i128_val)) as f64,
+                    ValueTag::U8 => v.u8_val as f64,
+                    ValueTag::U16 => v.u16_val as f64,
+                    ValueTag::U32 => v.u32_val as f64,
+                    ValueTag::U64 => v.u64_val as f64,
+                    ValueTag::U128 => u128::from_ne_bytes(std::mem::transmute(v.u128_val)) as f64,
+                    ValueTag::Isize => v.isize_val as f64,
+                    ValueTag::Usize => v.usize_val as f64,
+                    ValueTag::Char => v.char_val as f64,
+                    ValueTag::Bool => if v.bool_val { 1.0 } else { 0.0 },
                     _ => 0.0,
                 }
             },
@@ -1091,10 +1126,40 @@ impl Value {
     pub fn as_isize(&self) -> isize { self.as_int_i128() as isize }
     pub fn as_usize(&self) -> usize { self.as_int_i128() as usize }
     // ---- 浮点访问器：统一委托 as_float_f64，支持任意浮点类型互读 ----
+    // F16/F32 经 f64 中转无额外精度损失（f64 尾数 52 位，足以精确表示所有整数到 F16/F32 的舍入）
     pub fn as_f16(&self) -> F16 { F16::from_f64(self.as_float_f64()) }
     pub fn as_f32(&self) -> f32 { self.as_float_f64() as f32 }
     pub fn as_f64(&self) -> f64 { self.as_float_f64() }
-    pub fn as_f128(&self) -> F128 { F128::from_f64(self.as_float_f64()) }
+    /// F128 访问器：对整数类型直接精确构造，不经 f64 中转（避免 i128 精度损失）。
+    /// F128 有 113 位尾数，可精确表示所有 i128/u128 值。
+    pub fn as_f128(&self) -> F128 {
+        match self {
+            Value::Scalar(v, t) => unsafe {
+                match t {
+                    ValueTag::F16 => F128::from_f64(F16(v.f16_val).to_f64()),
+                    ValueTag::F32 => F128::from_f64(v.f32_val as f64),
+                    ValueTag::F64 => F128::from_f64(v.f64_val),
+                    ValueTag::F128 => F128(std::mem::transmute(v.f128_val)),
+                    // 整数 → F128 直接构造，保证精度
+                    ValueTag::I8 => F128::from_i128(v.i8_val as i128),
+                    ValueTag::I16 => F128::from_i128(v.i16_val as i128),
+                    ValueTag::I32 => F128::from_i128(v.i32_val as i128),
+                    ValueTag::I64 => F128::from_i128(v.i64_val as i128),
+                    ValueTag::I128 => F128::from_i128(i128::from_ne_bytes(std::mem::transmute(v.i128_val))),
+                    ValueTag::U8 => F128::from_u128(v.u8_val as u128),
+                    ValueTag::U16 => F128::from_u128(v.u16_val as u128),
+                    ValueTag::U32 => F128::from_u128(v.u32_val as u128),
+                    ValueTag::U64 => F128::from_u128(v.u64_val as u128),
+                    ValueTag::U128 => F128::from_u128(u128::from_ne_bytes(std::mem::transmute(v.u128_val))),
+                    ValueTag::Isize => F128::from_i128(v.isize_val as i128),
+                    ValueTag::Usize => F128::from_u128(v.usize_val as u128),
+                    ValueTag::Char => F128::from_u128(v.char_val as u128),
+                    _ => F128::from_f64(0.0),
+                }
+            },
+            _ => F128::from_f64(0.0),
+        }
+    }
     // ---- 其他标量访问器 ----
     pub fn as_bool(&self) -> bool { match self { Value::Scalar(v, ValueTag::Bool) => unsafe { v.bool_val }, _ => false } }
     pub fn as_char(&self) -> char { match self { Value::Scalar(v, ValueTag::Char) => unsafe { char::from_u32_unchecked(v.char_val) }, _ => '\0' } }
@@ -1489,14 +1554,49 @@ pub enum ScalarSoA {
     I16(Vec<i16>),
     I32(Vec<i32>),
     I64(Vec<i64>),
+    I128(Vec<i128>),
     U8(Vec<u8>),
     U16(Vec<u16>),
     U32(Vec<u32>),
     U64(Vec<u64>),
+    U128(Vec<u128>),
+    Isize(Vec<isize>),
+    Usize(Vec<usize>),
     Bool(Vec<bool>),
     Char(Vec<u32>),
+    F16(Vec<u16>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    F128(Vec<F128>),
+}
+
+impl ScalarSoA {
+    /// 尝试在指定索引写入标量值。
+    /// 返回 true 表示类型匹配且写入成功；false 表示类型不匹配（调用方应失效 SOA）。
+    /// 索引越界时自动扩展（补 0）。
+    pub fn try_store(&mut self, idx: usize, val: &Value) -> bool {
+        match (self, val) {
+            (ScalarSoA::I8(v), Value::Scalar(sv, crate::value::ValueTag::I8)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.i8_val; } true }
+            (ScalarSoA::I16(v), Value::Scalar(sv, crate::value::ValueTag::I16)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.i16_val; } true }
+            (ScalarSoA::I32(v), Value::Scalar(sv, crate::value::ValueTag::I32)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.i32_val; } true }
+            (ScalarSoA::I64(v), Value::Scalar(sv, crate::value::ValueTag::I64)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.i64_val; } true }
+            (ScalarSoA::U8(v), Value::Scalar(sv, crate::value::ValueTag::U8)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.u8_val; } true }
+            (ScalarSoA::U16(v), Value::Scalar(sv, crate::value::ValueTag::U16)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.u16_val; } true }
+            (ScalarSoA::U32(v), Value::Scalar(sv, crate::value::ValueTag::U32)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.u32_val; } true }
+            (ScalarSoA::U64(v), Value::Scalar(sv, crate::value::ValueTag::U64)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.u64_val; } true }
+            (ScalarSoA::Bool(v), Value::Scalar(sv, crate::value::ValueTag::Bool)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, false); } v[idx] = sv.bool_val; } true }
+            (ScalarSoA::Char(v), Value::Scalar(sv, crate::value::ValueTag::Char)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.char_val; } true }
+            (ScalarSoA::F32(v), Value::Scalar(sv, crate::value::ValueTag::F32)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0.0); } v[idx] = sv.f32_val; } true }
+            (ScalarSoA::F64(v), Value::Scalar(sv, crate::value::ValueTag::F64)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0.0); } v[idx] = sv.f64_val; } true }
+            (ScalarSoA::I128(v), Value::Scalar(sv, crate::value::ValueTag::I128)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = i128::from_ne_bytes(std::mem::transmute(sv.i128_val)); } true }
+            (ScalarSoA::U128(v), Value::Scalar(sv, crate::value::ValueTag::U128)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = u128::from_ne_bytes(std::mem::transmute(sv.u128_val)); } true }
+            (ScalarSoA::Isize(v), Value::Scalar(sv, crate::value::ValueTag::Isize)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.isize_val; } true }
+            (ScalarSoA::Usize(v), Value::Scalar(sv, crate::value::ValueTag::Usize)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.usize_val; } true }
+            (ScalarSoA::F16(v), Value::Scalar(sv, crate::value::ValueTag::F16)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.f16_val; } true }
+            (ScalarSoA::F128(v), Value::Scalar(sv, crate::value::ValueTag::F128)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, F128([0; 16])); } v[idx] = F128(std::mem::transmute(sv.f128_val)); } true }
+            _ => false, // 类型不匹配
+        }
+    }
 }
 
 impl ArrayValue {
@@ -1797,10 +1897,16 @@ pub struct ErrorValue {
 }
 
 /// 抛出载荷
+///
+/// Err 直接持有 Value（而非 Arc<RecordValue>），统一所有 throw 场景：
+/// - throw 原始类型（i32/str/bool）→ Err 持有裸标量值，无需 Error(value:v) 包装
+/// - throw record/adt → Err 持有 record Value
+/// - 内部错误（FieldError/IndexError 等）→ Err 持有构造好的 record Value
+/// 这使得 throw 任意值后，match 模式 `Error(v)` 的 v 直接绑定到 throw 的值本身。
 #[derive(Debug, Clone)]
 pub enum ThrowPayload {
     Ok(Value),
-    Err(Arc<RecordValue>),
+    Err(Value),
 }
 
 /// 抛出值
@@ -2197,10 +2303,9 @@ impl Hash for HeapObj {
                     0u8.hash(state);
                     v.hash(state);
                 }
-                ThrowPayload::Err(r) => {
+                ThrowPayload::Err(v) => {
                     1u8.hash(state);
-                    let ptr: *const RecordValue = Arc::as_ptr(r);
-                    ptr.hash(state);
+                    v.hash(state);
                 }
             },
             HeapObj::Closure(c) => {

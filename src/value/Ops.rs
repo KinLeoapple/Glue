@@ -1745,8 +1745,8 @@ macro_rules! impl_arith_int {
             #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
             #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
             #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
-            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { a / b }
-            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { a % b }
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_div(b) } }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_rem(b) } }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }

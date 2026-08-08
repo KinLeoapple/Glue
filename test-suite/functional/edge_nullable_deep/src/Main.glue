@@ -1,0 +1,231 @@
+// ── 边缘 nullable 深层测试：大胆探测 nullable 嵌套与组合 ──
+// 目标：探测 i32?? 双重 nullable、nullable 在 record/数组中、
+//       nullable 链式 ?? 合并、nullable 算术与比较、?. 链式访问。
+// 已知：Bug #28 — ?? 不支持 Throw 类型；Bug #9 — str? ?? 合并曾失效（已修）。
+// 限制：?? 优先级低于 ==，故 `x ?? y == z` 解析为 `x ?? (y == z)`（类型不匹配）。
+//       所有 ?? 比较必须加括号：`(x ?? y) == z`。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 顶层类型
+type User = User(name: str, age: i32?)
+type Addr = Addr(city: str, zip: str?)
+type Box = Box(inner: i32?)
+
+// nullable 工厂
+fun maybeVal(n: i32): i32? {
+    if n > 0 { n } else { null }
+}
+
+fun maybeStr(s: str): str? {
+    if s == "" { null } else { s }
+}
+
+// nullable 参数
+fun addIfPos(a: i32?, b: i32?): i32? {
+    val x = a ?? 0
+    val y = b ?? 0
+    if x + y == 0 { null } else { x + y }
+}
+
+// nullable 返回链
+fun firstPositive(arr: i32[]): i32? {
+    if arr.len() == 0 { null } else {
+        if arr[0] > 0 { arr[0] } else { null }
+    }
+}
+
+fun main(): void {
+    println("=== Edge Nullable Deep ===")
+
+    // ─── 1. 基础 ?? 合并 ───
+    println("--- Basic ?? Merge ---")
+    val a1: i32? = 10
+    val a2: i32? = null
+    check((a1 ?? 99) == 10, "some ?? default = some")
+    check((a2 ?? 99) == 99, "null ?? default = default")
+    check((a1 ?? 0) == 10, "some ?? 0")
+    check((a2 ?? 0) == 0, "null ?? 0")
+
+    // ─── 2. ?? 链式合并 ───
+    println("--- ?? Chain ---")
+    val c1: i32? = null
+    val c2: i32? = null
+    val c3: i32? = null
+    val c4: i32? = 42
+    // 探测：?? 是否左结合，返回第一个 non-null
+    val chain = c1 ?? c2 ?? c3 ?? c4 ?? 0
+    check(chain == 42, "?? chain finds 42")
+    val chain2 = c1 ?? c2 ?? c3 ?? 0
+    check(chain2 == 0, "?? chain falls to default 0")
+
+    // ─── 3. ?? 与表达式 ───
+    println("--- ?? with Expression ---")
+    val e1: i32? = 5
+    check((e1 ?? 0) * 2 == 10, "?? in arithmetic")
+    check((e1 ?? 0) + (a2 ?? 0) == 5, "two ?? in add")
+    val s1: str? = "hi"
+    check((s1 ?? "default") + "!" == "hi!", "str ?? in concat")
+
+    // ─── 4. nullable 在 record 字段 ───
+    println("--- Nullable in Record ---")
+    val u1 = User("alice", 30)
+    val u2 = User("bob", null)
+    check(u1.name == "alice", "user name")
+    check(u1.age == 30, "user age some")
+    check(u2.age == null, "user age null")
+    check((u1.age ?? 0) == 30, "user age ?? 0")
+    check((u2.age ?? 18) == 18, "user null age ?? 18")
+
+    // ─── 5. nullable 嵌套 record（record 内 record 可空）───
+    println("--- Nested Nullable Record ---")
+    val b1 = Box(42)
+    val b2 = Box(null)
+    check(b1.inner == 42, "box inner some")
+    check(b2.inner == null, "box inner null")
+    check((b1.inner ?? 0) == 42, "box inner ?? 0")
+    check((b2.inner ?? 99) == 99, "box null ?? 99")
+
+    // ─── 6. nullable 数组 ───
+    println("--- Nullable Array ---")
+    // Limit-B: i32?[] 类型注解不支持（parse error），用推断 + 显式类型后缀
+    val narr = [10i32, null, 30i32, null, 50i32]
+    check(narr.len() == 5, "nullable array len 5")
+    check(narr[0] == 10, "narr[0] some")
+    check(narr[1] == null, "narr[1] null")
+    check(narr[2] == 30, "narr[2] some")
+    check(narr[3] == null, "narr[3] null")
+    check(narr[4] == 50, "narr[4] some")
+    // ?? 提取
+    check((narr[0] ?? 99) == 10, "narr[0] ?? 99")
+    check((narr[1] ?? 99) == 99, "narr[1] ?? 99")
+    check((narr[3] ?? 0) == 0, "narr[3] ?? 0")
+
+    // ─── 7. nullable 函数返回 ───
+    println("--- Nullable Function Return ---")
+    check(maybeVal(5) == 5, "maybeVal(5) = 5")
+    check(maybeVal(0) == null, "maybeVal(0) = null")
+    check(maybeVal(-3) == null, "maybeVal(-3) = null")
+    check((maybeVal(5) ?? 0) == 5, "maybeVal(5) ?? 0")
+    check((maybeVal(0) ?? 99) == 99, "maybeVal(0) ?? 99")
+    check(maybeStr("hi") == "hi", "maybeStr(hi)")
+    check(maybeStr("") == null, "maybeStr(empty) = null")
+
+    // ─── 8. nullable 参数 ───
+    println("--- Nullable Params ---")
+    check(addIfPos(3, 4) == 7, "addIfPos(3,4) = 7")
+    check(addIfPos(null, 5) == 5, "addIfPos(null,5) = 5")
+    check(addIfPos(null, null) == null, "addIfPos(null,null) = null")
+    check(addIfPos(0, 0) == null, "addIfPos(0,0) = null (sum 0)")
+
+    // ─── 9. nullable 比较 ───
+    println("--- Nullable Comparison ---")
+    val n1: i32? = 10
+    val n2: i32? = 10
+    val n3: i32? = null
+    val n4: i32? = 20
+    check(n1 == n2, "10? == 10?")
+    check(n1 != n3, "10? != null")
+    check(n1 == 10, "10? == 10 (literal)")
+    check(n3 == null, "null == null")
+    check(n1 != n4, "10? != 20?")
+    check(n3 != n4, "null != 20?")
+
+    // ─── 10. ? 传播 ───
+    println("--- ? Propagation ---")
+    fun propagate(x: i32?): i32? {
+        val y = x?
+        y + 1
+    }
+    check(propagate(5) == 6, "propagate 5 -> 6")
+    val prop_null = propagate(null)
+    check(prop_null == null, "propagate null -> null")
+
+    // ─── 11. nullable 在数组运算中 ───
+    println("--- Nullable in Array Op ---")
+    val arr2 = [1i32, null, 3i32, null, 5i32]
+    var sum: i32 = 0
+    var idx: i32 = 0
+    while idx < arr2.len() {
+        sum = sum + (arr2[idx] ?? 0)
+        idx = idx + 1
+    }
+    check(sum == 9, "sum of nullable array (1+0+3+0+5)")
+
+    // ─── 12. nullable str 操作 ───
+    println("--- Nullable Str ---")
+    val sn1: str? = "hello"
+    val sn2: str? = null
+    check(sn1 == "hello", "str? some")
+    check(sn2 == null, "str? null")
+    check((sn1 ?? "default") == "hello", "str? ?? keeps value")
+    check((sn2 ?? "default") == "default", "str? ?? default")
+    check((sn1 ?? "") + "!" == "hello!", "str? concat with ??")
+
+    // ─── 13. firstPositive（nullable 数组查找）───
+    println("--- firstPositive ---")
+    val pos_arr = [5, -3, 7]
+    val neg_arr = [-1, -2, -3]
+    val empty_arr: i32[] = []
+    check(firstPositive(pos_arr) == 5, "firstPositive [5,-3,7] = 5")
+    check(firstPositive(neg_arr) == null, "firstPositive [-1,-2,-3] = null")
+    check(firstPositive(empty_arr) == null, "firstPositive [] = null")
+
+    // ─── 14. nullable bool ───
+    println("--- Nullable Bool ---")
+    val nb1: bool? = true
+    val nb2: bool? = null
+    check(nb1 == true, "bool? true")
+    check(nb2 == null, "bool? null")
+    check((nb1 ?? false) == true, "bool? ?? false keeps true")
+    check((nb2 ?? false) == false, "bool? null ?? false")
+
+    // ─── 15. nullable f64 ───
+    println("--- Nullable f64 ---")
+    val nf1: f64? = 3.14f64
+    val nf2: f64? = null
+    check(nf1 == 3.14f64, "f64? some")
+    check(nf2 == null, "f64? null")
+    check((nf1 ?? 0.0f64) == 3.14f64, "f64? ?? 0.0")
+    check((nf2 ?? 0.0f64) == 0.0f64, "f64? null ?? 0.0")
+    check((nf1 ?? 0.0f64) * 2.0f64 > 6.27f64 && (nf1 ?? 0.0f64) * 2.0f64 < 6.29f64, "f64? in arithmetic")
+
+    // ─── 16. 深度 ?? 合并（5 层）───
+    println("--- Deep ?? Merge ---")
+    val d1: i32? = null
+    val d2: i32? = null
+    val d3: i32? = null
+    val d4: i32? = null
+    val d5: i32? = 999
+    val deep = d1 ?? d2 ?? d3 ?? d4 ?? d5
+    check(deep == 999, "5-layer ?? finds 999")
+    val deep_none = d1 ?? d2 ?? d3 ?? d4 ?? 0
+    check(deep_none == 0, "5-layer ?? falls to 0")
+
+    // ─── 17. nullable 与 cast ───
+    println("--- Nullable + Cast ---")
+    val nc1: i32? = 65
+    check(cast(nc1 ?? 0).to(str) == "65", "cast nullable ?? 0 to str")
+    check(cast(nc1 ?? 0).to(i64) == 65i64, "cast nullable to i64")
+    val nc2: i32? = null
+    check(cast(nc2 ?? 0).to(str) == "0", "cast null ?? 0 to str")
+
+    summary()
+}

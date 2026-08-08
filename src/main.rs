@@ -614,7 +614,7 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
 
     // 4. 静态分析（Sema 后、IR 前）：死代码/死变量/死函数 + 记忆化策略
     //    对 entry 模块运行分析；debug 模式下打印报告摘要。
-    let analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
+    let mut analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
     if debug {
         eprintln!("  Analyzer: dead_code={} dead_var={} dead_func={} memo_candidates={} dead_param={} inline={} stack_alloc={} non_exhaustive={} unreachable_arms={}",
             analysis_report.dead_code.dead_stmts.len(),
@@ -665,9 +665,17 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
             graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());
     }
 
-    // IR 后优化：ConstFold/CSE/CopyProp/DCE 固定点迭代
+    // 循环分析（IR 后）：识别不变量 + 可展开循环，填充 analysis_report.loop_analysis
+    analysis_report.loop_analysis = glue::pass::Analyzer::analyze_loops(&graph);
+    if debug {
+        eprintln!("  LoopAnalysis: invariants={} unrollable={}",
+            analysis_report.loop_analysis.invariants.len(),
+            analysis_report.loop_analysis.unrollable.len());
+    }
+
+    // IR 后优化：LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE 固定点迭代
     if std::env::var("GLUE_NO_OPT").is_err() {
-        glue::pass::Optimizer::optimize(&mut graph);
+        glue::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report));
     }
 
     if debug {

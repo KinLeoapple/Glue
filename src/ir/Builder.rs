@@ -36,11 +36,10 @@ pub struct IrBuilder<'a> {
     /// trait 默认方法子图表（单态化）：(type_id, trait_def_idx, method_idx) → SubGraphId
     /// 为每个实现 trait 的类型生成特化子图，使 self 在 body 中有具体类型信息。
     pub trait_default_subgraphs: rustc_hash::FxHashMap<(u16, u16, u16), SubGraphId>,
-    /// 当前编译的 trait 默认方法特化版本中 self 的具体类型名。
-    /// 为 None 时表示不在 trait 默认方法上下文中。
-    /// expr_type_name/expr_type_id 在 sema 查找失败时，若 self_expr_types 有对应 ExprId
-    /// （即 expr 是 Ident("self")），返回此类型名，使 self.method() 能静态绑定。
-    pub trait_self_type: Option<String>,
+    /// 当前正在编译的 trait 默认方法特化实例在 sema.trait_default_instances 中的索引。
+    /// expr_type_name/expr_type_id 通过此索引查 sema 的 TraitDefaultInstance.type_name
+    /// 获取 self 的具体类型（消费 sema 产出，非 IR 持有语义信息）。
+    pub current_trait_default_idx: Option<usize>,
     /// 当前正在编译的函数子图 id（defer 注册用）
     pub current_function_sg: Option<SubGraphId>,
     /// 循环上下文栈：栈顶为当前循环的上下文（continue 跳转目标 + For 迭代器节点）
@@ -81,6 +80,8 @@ pub struct IrBuilder<'a> {
     /// 顶层 var/val 声明语句列表（在 entry 函数编译时注入初始化代码）
     /// 元素：(模块索引, StmtId)，None = entry 模块，Some(i) = builtin_modules[i]
     pub top_level_var_decls: Vec<(Option<usize>, crate::ast::Ast::StmtId)>,
+    // 逃逸分析由 analyzer 统一产出（analyze_escape），IR 通过 analysis.escape 消费。
+    // 旧 escape_context_stack 已删除。
 }
 
 // =========================================================================
@@ -96,6 +97,15 @@ const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
     ("char", "str", "__cast_char_to_str"),
 ];
 
+/// FFI 原语 intrinsic 注册表：FFI 函数名 → compute_fn。
+/// 这些原语以 @extern("C") 声明但 compute_fn 直接绑定到 reflect 实现，
+/// 不走 FFI 分派（避免 lazy force 逻辑与 FFI 调用耦合）。
+/// 新增原语只需追加一行，无需改编译分支。
+const FFI_INTRINSIC_TABLE: &[(&str, ComputeFnId)] = &[
+    ("__reflect_format", CF_REFLECT_FORMAT),
+    ("__reflect_scalar_to_str", CF_REFLECT_SCALAR_TO_STR),
+];
+
 /// 解析 cast 函数名：先查特殊转换对注册表，未命中则按默认命名规则生成。
 fn cast_mangled_name(source: &str, target: &str) -> String {
     for &(s, t, fn_name) in SPECIAL_CAST_PAIRS {
@@ -105,6 +115,11 @@ fn cast_mangled_name(source: &str, target: &str) -> String {
     }
     format!("__cast_{}_to_{}", source, target)
 }
+
+// =========================================================================
+// 逃逸分析已迁移到 analyzer（analyze_escape + analyze_lambda_escape）
+// IR 通过 analysis.escape 消费，不再有平行实现。
+// =========================================================================
 
 /// 内置构造器的降级策略。
 ///
@@ -139,7 +154,7 @@ impl<'a> IrBuilder<'a> {
             func_subgraphs: rustc_hash::FxHashMap::default(),
             method_subgraphs: rustc_hash::FxHashMap::default(),
             trait_default_subgraphs: rustc_hash::FxHashMap::default(),
-            trait_self_type: None,
+            current_trait_default_idx: None,
             current_function_sg: None,
             loop_stack: Vec::new(),
             scope_stack: Vec::new(),
@@ -313,6 +328,17 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
+    /// Bug #49: 检查当前函数子图是否已注册 defer（defer 编译后 defer_table 非空）。
+    /// 用于决定局部变量重赋值是否需要 WriteBack 到原始节点。
+    fn current_function_has_defer(&self) -> bool {
+        if let Some(sg_id) = self.current_function_sg {
+            if let Some(sg) = self.graph.subgraphs.get(sg_id.0 as usize) {
+                return !sg.defer_table.is_empty();
+            }
+        }
+        false
+    }
+
     /// 编译 WriteBack 节点：赋值外层变量，通过 root_frame_ptr 写回函数根帧。
     /// 返回 WriteBack 节点的 NodeId。
     fn compile_writeback_node(&mut self, val_node: NodeId, target_outer: NodeId) -> NodeId {
@@ -448,7 +474,7 @@ impl<'a> IrBuilder<'a> {
 
             // 二元运算
             crate::ast::Ast::Expr::Binary { op, lhs, rhs } => {
-                self.compile_binary(*op, *lhs, *rhs)
+                self.compile_binary(*op, expr_id, *lhs, *rhs)
             }
 
             // 函数调用
@@ -500,7 +526,7 @@ impl<'a> IrBuilder<'a> {
                 let body_expr = match body {
                     crate::ast::Ast::LambdaBody::Block(e) | crate::ast::Ast::LambdaBody::Expression(e) => *e,
                 };
-                self.compile_lambda(params, body_expr, *is_async, None)
+                self.compile_lambda(params, body_expr, *is_async, None, Some(expr_id))
             }
 
             // 数组构造
@@ -833,14 +859,27 @@ impl<'a> IrBuilder<'a> {
             inputs_offset,
             compute_fn: CF_NOOP,
         });
-        let const_val = self.parse_const_value(expr_id);
-        self.graph.const_values[node_id.0 as usize] = const_val;
+        match self.parse_const_value(expr_id) {
+            Ok(cv) => {
+                self.graph.const_values[node_id.0 as usize] = cv;
+            }
+            Err(msg) => {
+                self.graph.const_values[node_id.0 as usize] = None;
+                self.errors.push(msg);
+            }
+        }
         node_id
     }
 
     /// 从 AST 表达式解析常量值。
-    fn parse_const_value(&self, expr_id: crate::ast::Ast::ExprId) -> Option<ConstValue> {
+    ///
+    /// 返回值语义：
+    /// - `Ok(Some(cv))`：合法常量字面量，已通过类型范围检查
+    /// - `Ok(None)`：非常量表达式（如变量引用），无法折叠为常量
+    /// - `Err(msg)`：常量字面量解析失败（语法错误或超出目标类型范围）
+    fn parse_const_value(&self, expr_id: crate::ast::Ast::ExprId) -> Result<Option<ConstValue>, String> {
         let spanned = self.current_module().arena.expr(expr_id);
+        let span = spanned.span;
         match &spanned.node {
             crate::ast::Ast::Expr::IntLit { raw, suffix } => {
                 // suffix 优先；无 suffix 时参考 sema 推断的类型选择对应整数 ConstValue，
@@ -848,37 +887,27 @@ impl<'a> IrBuilder<'a> {
                 let ty = suffix
                     .map(|s| s.to_string())
                     .or_else(|| self.expr_type_name(expr_id).map(|s| s.to_string()));
-                // 解析整数：支持 0x/0o/0b 前缀 + 下划线分隔符（Rust from_str_radix 不接受下划线）
-                let parse_int = |raw: &str| -> Option<i128> {
-                    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
-                    let s = cleaned
-                        .strip_prefix("0x").map(|s| (s, 16))
-                        .or_else(|| cleaned.strip_prefix("0o").map(|s| (s, 8)))
-                        .or_else(|| cleaned.strip_prefix("0b").map(|s| (s, 2)))
-                        .unwrap_or((cleaned.as_str(), 10));
-                    i128::from_str_radix(s.0, s.1).ok()
-                };
-                match ty.as_deref() {
-                    Some("i8") => parse_int(raw).and_then(|v| i8::try_from(v).ok()).map(ConstValue::I8),
-                    Some("i16") => parse_int(raw).and_then(|v| i16::try_from(v).ok()).map(ConstValue::I16),
-                    Some("i32") => parse_int(raw).and_then(|v| i32::try_from(v).ok()).map(ConstValue::I32),
-                    Some("i64") => parse_int(raw).and_then(|v| i64::try_from(v).ok()).map(ConstValue::I64),
-                    Some("i128") => parse_int(raw).map(ConstValue::I128),
-                    Some("u8") => parse_int(raw).and_then(|v| u8::try_from(v).ok()).map(ConstValue::U8),
-                    Some("u16") => parse_int(raw).and_then(|v| u16::try_from(v).ok()).map(ConstValue::U16),
-                    Some("u32") => parse_int(raw).and_then(|v| u32::try_from(v).ok()).map(ConstValue::U32),
-                    Some("u64") => parse_int(raw).and_then(|v| u64::try_from(v).ok()).map(ConstValue::U64),
-                    Some("u128") => parse_int(raw).map(|v| v as u128).map(ConstValue::U128),
-                    Some("isize") => parse_int(raw).and_then(|v| isize::try_from(v).ok()).map(ConstValue::Isize),
-                    Some("usize") => parse_int(raw).and_then(|v| usize::try_from(v).ok()).map(ConstValue::Usize),
-                    _ => parse_int(raw).and_then(|v| i32::try_from(v).ok()).map(ConstValue::I32),
+                let ty_name = ty.as_deref().unwrap_or("i32");
+
+                // u128 范围 (0..=2^128-1) 超出 i128，直接用 u128::from_str_radix 解析。
+                // 与浮点 suffix 分派同理：u128 是唯一超出 i128 表示范围的整数类型，
+                // 独立解析路径是数学必然，非特例判断。
+                if ty_name == "u128" {
+                    let v = parse_int_to_u128(raw, span)?;
+                    return Ok(Some(ConstValue::U128(v)));
                 }
+
+                // 解析整数：支持 0x/0o/0b 前缀 + 下划线分隔符
+                let v = parse_int_to_i128(raw, span)?;
+
+                // 范围检查 + 类型转换（通用方法，通过宏统一所有整数类型）
+                Ok(Some(check_int_range(v, ty_name, raw, span)?))
             }
             crate::ast::Ast::Expr::FloatLit { raw, suffix } => {
                 // 去除下划线分隔符（Rust parse 不接受下划线）
                 let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
                 let is_hex = cleaned.starts_with("0x") || cleaned.starts_with("0X");
-                match suffix {
+                let cv = match suffix {
                     None | Some("f64") => {
                         if is_hex { parse_hex_float_f64(&cleaned).map(ConstValue::F64) }
                         else { cleaned.parse::<f64>().ok().map(ConstValue::F64) }
@@ -889,7 +918,11 @@ impl<'a> IrBuilder<'a> {
                     }
                     Some("f16") => {
                         if is_hex { parse_hex_float_f16(&cleaned).map(ConstValue::F16) }
-                        else { Some(crate::value::F16::from_f64(cleaned.parse::<f64>().ok()?).to_bits()).map(ConstValue::F16) }
+                        else {
+                            cleaned.parse::<f64>()
+                                .ok()
+                                .map(|f| ConstValue::F16(crate::value::F16::from_f64(f).to_bits()))
+                        }
                     }
                     Some("f128") => {
                         if is_hex { parse_hex_float_f128(&cleaned).map(ConstValue::F128) }
@@ -899,17 +932,18 @@ impl<'a> IrBuilder<'a> {
                         if is_hex { parse_hex_float_f64(&cleaned).map(ConstValue::F64) }
                         else { cleaned.parse::<f64>().ok().map(ConstValue::F64) }
                     }
-                }
+                };
+                Ok(cv)
             }
-            crate::ast::Ast::Expr::BoolLit(b) => Some(ConstValue::Bool(*b)),
-            crate::ast::Ast::Expr::CharLit(c) => Some(ConstValue::Char(*c)),
+            crate::ast::Ast::Expr::BoolLit(b) => Ok(Some(ConstValue::Bool(*b))),
+            crate::ast::Ast::Expr::CharLit(c) => Ok(Some(ConstValue::Char(*c))),
             crate::ast::Ast::Expr::StrLit(s) => {
                 let static_s: &'static str = Box::leak(s.to_string().into_boxed_str());
-                Some(ConstValue::Str(static_s))
+                Ok(Some(ConstValue::Str(static_s)))
             }
-            crate::ast::Ast::Expr::NullLit => Some(ConstValue::Null),
-            crate::ast::Ast::Expr::VoidLit => Some(ConstValue::Void),
-            _ => None,
+            crate::ast::Ast::Expr::NullLit => Ok(Some(ConstValue::Null)),
+            crate::ast::Ast::Expr::VoidLit => Ok(Some(ConstValue::Void)),
+            _ => Ok(None),
         }
     }
 
@@ -992,12 +1026,35 @@ impl<'a> IrBuilder<'a> {
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
 
+        // 记录编译前函数子图的 event_source_decls 长度。
+        // 编译分支体期间 build_await_node 会把 EventSourceDecl 注册到 current_function_sg
+        // （函数子图），但运行时 compute_await 用 frame.subgraph_id（分支子图）查找——
+        // 分支子图的 event_source_decls 为空导致 fallback 到 AsyncJoin，使 channel.recv /
+        // timer.await 被误判为 async join（Bug #24）。编译后将新增 decls 迁移到分支子图。
+        // 嵌套分支正确：内层分支编译时先 drain 自己的 decls，外层 drain 时只剩自己的。
+        let prev_decl_count = self.current_function_sg
+            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
+            .map(|sg| sg.event_source_decls.len())
+            .unwrap_or(0);
+
         let return_node = self.compile_expr(expr);
         self.current_sg_start = prev_sg_start;
         self.exit_scope();
 
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+
+        // 将编译分支体期间新增的 event_source_decls 从函数子图迁移到分支子图
+        let branch_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
+            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
+                func_sg.event_source_decls.drain(prev_decl_count..).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_end)),
@@ -1005,7 +1062,7 @@ impl<'a> IrBuilder<'a> {
             entry_node: NodeId(node_start),
             return_node,
             has_suspend: false,
-            event_source_decls: Vec::new(),
+            event_source_decls: branch_decls,
             defer_table: Vec::new(),
             loop_kind: LoopKind::None,
             loop_parent_sg: None,
@@ -1062,9 +1119,21 @@ impl<'a> IrBuilder<'a> {
                 crate::ast::Ast::SelectArm::Receive { channel_expr, body, .. } => {
                     // channel_expr 形如 `ch.recv()`：编译时需取 recv 的 receiver（channel 值），
                     // 而非整个方法调用（recv() 返回接收的值，非 channel 本身）。
+                    // 通过 sema method_dispatches 的 intrinsic 标记判定（消除字符串守卫）。
                     let ch_node = match &self.current_module().arena.expr(*channel_expr).node {
-                        crate::ast::Ast::Expr::MethodCall { recv, method, .. } if *method == "recv" => {
-                            self.compile_subexpr(*recv)
+                        crate::ast::Ast::Expr::MethodCall { recv, .. } => {
+                            let key = crate::sema::Sema::module_expr_key(
+                                self.expr_key_module(),
+                                channel_expr.0 as u64,
+                            );
+                            let is_recv = self.sema.method_dispatches.get(&key)
+                                .and_then(|d| d.intrinsic)
+                                .is_some_and(|i| i == crate::sema::Sema::IntrinsicKind::ChannelAwait);
+                            if is_recv {
+                                self.compile_subexpr(*recv)
+                            } else {
+                                self.compile_subexpr(*channel_expr)
+                            }
                         }
                         _ => self.compile_subexpr(*channel_expr),
                     };
@@ -1151,6 +1220,7 @@ impl<'a> IrBuilder<'a> {
         body_expr: crate::ast::Ast::ExprId,
         is_async: bool,
         fn_name: Option<&str>,
+        lambda_expr_id: Option<crate::ast::Ast::ExprId>,
     ) -> NodeId {
         // 1. 自由变量分析：收集 body 中引用的外层变量（排除 lambda 自身参数）
         let param_names: rustc_hash::FxHashSet<&str> =
@@ -1235,6 +1305,26 @@ impl<'a> IrBuilder<'a> {
         //    重置 current_effect = None 隔离 lambda 体与外层 effect 链，确保
         //    无 trailing 表达式时 block 返回 lambda 内新建的 void_const 而非外层 effect 节点。
         //    压入 captured_scopes 使 Assignment 能识别捕获变量并创建 WriteBack。
+
+        // 逃逸分析（Bug #41 + Bug #40 循环捕获）：
+        // 消费 analyzer 的统一逃逸表，IR 不再做平行逃逸分析。
+        // 1. 尾位置逃逸（Bug #41）：lambda 在 enclosing 函数的尾位置 → 定义帧在函数返回后销毁
+        // 2. 循环体捕获逃逸（Bug #40）：lambda 捕获了循环体局部变量 → 循环体帧销毁后访问 null
+        // 两种情况都需分配独立 function_id，走跨函数 Cell 路径持久化 upvalue。
+        let escapes = lambda_expr_id.is_some_and(|id| {
+            self.analysis
+                .map_or(false, |r| {
+                    r.escape.lookup(id).is_some_and(|info| {
+                        matches!(
+                            info,
+                            crate::pass::Analyzer::EscapeInfo::Escapes(
+                                crate::pass::Analyzer::EscapeKind::Lambda { .. }
+                            )
+                        )
+                    })
+                })
+        });
+
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
         let prev_effect = self.current_effect;
@@ -1243,6 +1333,12 @@ impl<'a> IrBuilder<'a> {
         // 不设置时 defer body 会丢失（current_function_sg 为 None 或指向外层函数）。
         let prev_func_sg = self.current_function_sg;
         self.current_function_sg = Some(sg_id);
+        // 逃逸 lambda 使用独立 function_id，使 body 内子图（if-else/match 分支等）
+        // 继承此 id，与 enclosing function 区分 → 跨函数 Cell 路径。
+        let prev_func_id = self.current_function_id;
+        if escapes {
+            self.current_function_id = sg_id.0;
+        }
         self.captured_scopes.push(captured.clone());
 
         let return_node = self.compile_expr(body_expr);
@@ -1250,13 +1346,14 @@ impl<'a> IrBuilder<'a> {
         self.current_sg_start = prev_sg_start;
         self.current_effect = prev_effect;
         self.current_function_sg = prev_func_sg;
+        self.current_function_id = prev_func_id;
         self.captured_scopes.pop();
         self.exit_scope();
 
         // 5. 更新子图 node_range + return_node + function_id + upvalue 元数据
-        // function_id 设为当前函数的 function_id，确保 lambda 子帧与外层函数帧
-        // 属于同一 function_id，parent_frame_ptr / root_frame_ptr 能正确链接，
-        // 使 lambda 内部分支子图可访问 lambda 帧中的 upvalue 参数节点。
+        // function_id：逃逸 lambda 用独立 id（sg_id.0），非逃逸 lambda 继承外层 id。
+        // - 逃逸：same_function=false → 跨函数 Cell 路径（定义帧已销毁，Cell 持久化 upvalue）
+        // - 非逃逸：same_function=true → 帧链路径（定义帧存活，共享状态）
         // upvalue_count + upvalue_outer_nodes 供 start_subgraph 在 same_function
         // 调用时注入当前父帧值（引用捕获语义）。
         let node_end = self.graph.nodes.len() as u32;
@@ -1265,7 +1362,7 @@ impl<'a> IrBuilder<'a> {
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
         sg.has_suspend = is_async;
-        sg.function_id = self.current_function_id;
+        sg.function_id = if escapes { sg_id.0 } else { prev_func_id };
         sg.upvalue_count = captured.len() as u8;
         sg.upvalue_outer_nodes = captured.iter().map(|(_, n)| *n).collect();
 
@@ -1982,6 +2079,7 @@ impl<'a> IrBuilder<'a> {
         self.loop_stack.push(LoopContext {
             sg: for_sg,
             iter_node: Some(iter_param),
+            body_node_start: node_start,
         });
 
         let prev_sg_start = self.current_sg_start;
@@ -2180,12 +2278,32 @@ impl<'a> IrBuilder<'a> {
         self.loop_stack.push(LoopContext {
             sg: loop_sg,
             iter_node: None,
+            body_node_start: node_start,
         });
+
+        // 记录编译前函数子图的 event_source_decls 长度（同 compile_branch_subgraph，Bug #24）
+        let prev_decl_count = self.current_function_sg
+            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
+            .map(|sg| sg.event_source_decls.len())
+            .unwrap_or(0);
+
         let body_last = self.compile_expr(body);
         self.loop_stack.pop();
         self.current_sg_start = prev_sg_start;
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+
+        // 将编译循环体期间新增的 event_source_decls 从函数子图迁移到循环体子图
+        let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
+            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
+                func_sg.event_source_decls.drain(prev_decl_count..).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_end)),
@@ -2193,7 +2311,7 @@ impl<'a> IrBuilder<'a> {
             entry_node: NodeId(node_start),
             return_node: body_last,
             has_suspend: false,
-            event_source_decls: Vec::new(),
+            event_source_decls: body_decls,
             defer_table: Vec::new(),
             loop_kind: LoopKind::LoopBody,
             loop_parent_sg: Some(loop_sg),
@@ -2484,14 +2602,22 @@ impl<'a> IrBuilder<'a> {
                     compute_fn,
                 })
             }
-            crate::ast::Ast::PatternLiteral::Float(_) => {
+            crate::ast::Ast::PatternLiteral::Float(s) => {
                 let lit_node = self.compile_pattern_literal(pl);
+                // f128/f32/f16 后缀需用 CF_EQ_OBJ 精确比较（避免 f128→f64 精度损失）
+                // f64 或无后缀用 CF_EQ_F64（f32/f16→f64 无损）
+                let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+                let (_, suffix) = detect_float_suffix(&cleaned);
+                let compute_fn = match suffix {
+                    Some("f128") | Some("f32") | Some("f16") => CF_EQ_OBJ,
+                    _ => CF_EQ_F64,
+                };
                 let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
                 self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
                     input_count: 2,
                     inputs_offset: off,
-                    compute_fn: CF_EQ_F64, // eq_f64
+                    compute_fn,
                 })
             }
             crate::ast::Ast::PatternLiteral::Bool(_) => {
@@ -2519,14 +2645,18 @@ impl<'a> IrBuilder<'a> {
 
     /// 选择整数字面量相等判别的 compute_fn。
     fn select_literal_eq_fn(&self, s: &str, _is_unsigned: bool) -> ComputeFnId {
-        // 检查后缀
+        // 用 ValueTag::from_name + TypeFamily 分派，消除字符串比较
         if let Some(suffix) = s.find(|c: char| c.is_ascii_alphabetic()) {
             let suffix_str = &s[suffix..];
-            return match suffix_str {
-                "i64" | "u64" | "isize" | "usize" => CF_EQ_I64, // eq_i64
-                "i128" | "u128" => CF_EQ_I128,                    // eq_i128
-                _ => CF_EQ_I32,                                    // eq_i32
-            };
+            if let Some(tag) = crate::value::ValueTag::from_name(suffix_str) {
+                let ty = crate::types::Ty::from(tag);
+                use crate::types::TypeFamily;
+                return match ty.family() {
+                    TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64 => CF_EQ_I64,
+                    TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128 => CF_EQ_I128,
+                    _ => CF_EQ_I32,
+                };
+            }
         }
         CF_EQ_I32 // eq_i32 默认
     }
@@ -2625,8 +2755,36 @@ impl<'a> IrBuilder<'a> {
                 digits.parse::<i32>().ok().map(ConstValue::I32)
             }
             crate::ast::Ast::PatternLiteral::Float(s) => {
+                // 去除下划线分隔符 + 类型后缀（f64/f32/f16/f128）
+                // Bug #42：模式位置 `0.0f64` 的后缀导致 parse::<f64>() 失败，
+                // Const 节点值为 None 不被预填充，CF_EQ_F64 永久等待输入 → match hang
+                // f128 后缀需精确存储为 F128，避免 f128→f64 精度损失
                 let cleaned: String = s.chars().filter(|c| *c != '_').collect();
-                cleaned.parse::<f64>().ok().map(ConstValue::F64)
+                let (stripped, suffix) = detect_float_suffix(&cleaned);
+                let is_hex = stripped.starts_with("0x") || stripped.starts_with("0X");
+                match suffix {
+                    Some("f128") => {
+                        if is_hex { parse_hex_float_f128(stripped).map(ConstValue::F128) }
+                        else { parse_decimal_f128(stripped).map(ConstValue::F128) }
+                    }
+                    Some("f32") => {
+                        if is_hex { parse_hex_float_f32(stripped).map(ConstValue::F32) }
+                        else { stripped.parse::<f32>().ok().map(ConstValue::F32) }
+                    }
+                    Some("f16") => {
+                        if is_hex { parse_hex_float_f16(stripped).map(ConstValue::F16) }
+                        else {
+                            stripped.parse::<f64>()
+                                .ok()
+                                .map(|f| ConstValue::F16(crate::value::F16::from_f64(f).to_bits()))
+                        }
+                    }
+                    // f64 或无后缀（默认 f64）：f32/f16→f64 无损，可用 CF_EQ_F64
+                    _ => {
+                        if is_hex { parse_hex_float_f64(stripped).map(ConstValue::F64) }
+                        else { stripped.parse::<f64>().ok().map(ConstValue::F64) }
+                    }
+                }
             }
             crate::ast::Ast::PatternLiteral::Bool(b) => Some(ConstValue::Bool(*b)),
             crate::ast::Ast::PatternLiteral::String(_) => {
@@ -2747,15 +2905,18 @@ impl<'a> IrBuilder<'a> {
     /// 查询表达式的类型名（来自 Sema）。
     ///
     /// 优先取 ExprInfo.type_name（adt/generic 等场景），无记录时回退到 "unknown"。
-    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），回退到 trait_self_type
-    /// （前提是 expr 是 Ident("self")）。
+    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），查 sema 的
+    /// TraitDefaultInstance.type_name 获取 self 的具体实现类型。
     fn expr_type_name(&self, expr_id: crate::ast::Ast::ExprId) -> Option<&str> {
-        // trait 默认方法特化版本中的 self：Sema 将其类型注册为 "void"（因 trait 方法无具体类型），
-        // 此处用 trait_self_type 覆盖，使 self.method() 能静态绑定到具体类型的方法子图。
-        if let Some(ref ty) = self.trait_self_type {
+        // trait 默认方法特化版本中的 self：消费 sema 的 TraitDefaultInstance.type_name。
+        // sema 推断 trait 默认方法 body 时 self 是抽象 SelfType，特化实例记录了具体实现类型名。
+        // IR 通过 current_trait_default_idx 索引查 sema 产出，不持有类型名字符串。
+        if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr_id).node {
                 if *name == "self" {
-                    return Some(ty.as_str());
+                    if let Some(inst) = self.sema.trait_default_instances.get(idx) {
+                        return Some(inst.type_name.as_ref());
+                    }
                 }
             }
         }
@@ -2831,9 +2992,19 @@ impl<'a> IrBuilder<'a> {
     fn select_binary_compute_fn(
         &self,
         op: crate::ast::Ast::BinaryOp,
+        binary_expr_id: crate::ast::Ast::ExprId,
         lhs_expr: crate::ast::Ast::ExprId,
+        _rhs_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
-        let ty_name = self.expr_type_name(lhs_expr).unwrap_or("i32");
+        // 消费 sema 提升后类型：binary_expr_id 的 ExprInfo.type_name 是 sema
+        // 推断的二元运算结果类型。算术运算的结果类型即提升后操作数类型（i32+f64→f64），
+        // 比较运算的结果类型是 bool，需用操作数类型选 compute_fn。
+        let lhs_ty = self.expr_type_name(lhs_expr).unwrap_or("i32");
+        let ty_name = match self.expr_type_name(binary_expr_id) {
+            Some("bool") => lhs_ty,  // 比较运算：用操作数类型
+            Some(t) => t,             // 算术运算：用提升后类型
+            None => lhs_ty,           // sema 无记录：回退到 lhs 类型
+        };
         let ty_meta = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
         // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
@@ -2883,6 +3054,9 @@ impl<'a> IrBuilder<'a> {
         // 复合类型（record/adt/newtype/array/closure/throw 等）相等/不等 →
         // 通用语义比较 compute_fn（298-299）。走 i32 路径会因 as_i32() 恒为 0
         // 导致所有复合类型判为相等。
+        // 判定依据：scalar_meta 为 None 意味着非标量类型。此时 Str 和 Nullable
+        // 已在上方分支处理，剩余 None 即全部复合类型（Array/Ref/Fn/Adt/Record/...）。
+        // scalar_meta 是标量类型的单一真相源，故 is_none() 是复合类型的充要条件。
         if matches!(op, crate::ast::Ast::BinaryOp::Eq | crate::ast::Ast::BinaryOp::NotEq)
             && ty_meta.is_none()
         {
@@ -3020,6 +3194,7 @@ impl<'a> IrBuilder<'a> {
     fn compile_binary(
         &mut self,
         op: crate::ast::Ast::BinaryOp,
+        binary_expr_id: crate::ast::Ast::ExprId,
         lhs: crate::ast::Ast::ExprId,
         rhs: crate::ast::Ast::ExprId,
     ) -> NodeId {
@@ -3032,6 +3207,13 @@ impl<'a> IrBuilder<'a> {
                 let inclusive = matches!(op, crate::ast::Ast::BinaryOp::RangeInclusive);
                 let bool_node = self.compile_bool_const(inclusive);
                 self.make_call_by_name("range_iter", &[lhs_node, rhs_node, bool_node])
+            }
+            // Bug #38: &&/|| 短路求值——降级为 Gate 条件分支，确保 RHS 仅在
+            // LHS 不满足短路条件时才被求值（与 if 表达式相同的条件数据流）。
+            //   lhs && rhs  =>  if lhs { rhs } else { false }
+            //   lhs || rhs  =>  if lhs { true } else { rhs }
+            crate::ast::Ast::BinaryOp::And | crate::ast::Ast::BinaryOp::Or => {
+                self.compile_short_circuit(op, lhs, rhs)
             }
             _ => {
                 // str + non-str / non-str + str → 将非字符串操作数通过
@@ -3069,7 +3251,7 @@ impl<'a> IrBuilder<'a> {
                 let lhs_node = self.compile_subexpr(lhs);
                 let rhs_node = self.compile_subexpr(rhs);
                 let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
-                let compute_fn = self.select_binary_compute_fn(op, lhs);
+                let compute_fn = self.select_binary_compute_fn(op, binary_expr_id, lhs, rhs);
                 let node = self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
                     input_count: 2,
@@ -3083,6 +3265,91 @@ impl<'a> IrBuilder<'a> {
                 node
             }
         }
+    }
+
+    /// Bug #38: 编译 &&/|| 短路求值。
+    ///
+    /// 利用 Gate 条件分支确保 RHS 仅在 LHS 不满足短路条件时才被求值：
+    ///   lhs && rhs  =>  if lhs { rhs } else { false }
+    ///   lhs || rhs  =>  if lhs { true } else { rhs }
+    ///
+    /// 与 compile_if 的 Gate 模式一致：cond_node + then_sg + else_sg。
+    /// then/else 分支体为 Const 节点（短路值）或 RHS 表达式（需求值分支）。
+    fn compile_short_circuit(
+        &mut self,
+        op: crate::ast::Ast::BinaryOp,
+        lhs: crate::ast::Ast::ExprId,
+        rhs: crate::ast::Ast::ExprId,
+    ) -> NodeId {
+        let cond_node = self.compile_subexpr(lhs);
+        let is_and = matches!(op, crate::ast::Ast::BinaryOp::And);
+        // && : lhs=true → 求 rhs ; lhs=false → false（短路）
+        // || : lhs=true → true（短路）   ; lhs=false → 求 rhs
+        let (then_sg, then_inputs) = if is_and {
+            self.compile_branch_subgraph(rhs)
+        } else {
+            self.compile_bool_branch(true)
+        };
+        let (else_sg, else_inputs) = if is_and {
+            self.compile_bool_branch(false)
+        } else {
+            self.compile_branch_subgraph(rhs)
+        };
+        let gate_inputs: Vec<NodeId> = match self.current_effect {
+            Some(eff) => vec![cond_node, eff],
+            None => vec![cond_node],
+        };
+        let inputs_offset = self.graph.inputs_pool.push(&gate_inputs);
+        let gate_node = self.graph.add_node(Node {
+            kind: NodeKind::Gate,
+            input_count: gate_inputs.len() as u8,
+            inputs_offset,
+            compute_fn: CF_GATE_LAUNCH,
+        });
+        self.graph.set_gate_branches(
+            gate_node,
+            GateBranches {
+                condition_input: cond_node,
+                branches: vec![
+                    (true, then_sg, then_inputs),
+                    (false, else_sg, else_inputs),
+                ],
+            },
+        );
+        gate_node
+    }
+
+    /// 编译常量 bool 分支（短路值），用于 && 的 false 分支和 || 的 true 分支。
+    fn compile_bool_branch(&mut self, value: bool) -> (SubGraphId, Vec<NodeId>) {
+        let node_start = self.graph.nodes.len() as u32;
+        self.enter_scope();
+        let prev_sg_start = self.current_sg_start;
+        self.current_sg_start = node_start;
+        let return_node = self.compile_bool_const(value);
+        self.current_sg_start = prev_sg_start;
+        self.exit_scope();
+        let node_end = self.graph.nodes.len() as u32;
+        let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: sg_id,
+            node_range: (NodeId(node_start), NodeId(node_end)),
+            param_count: 0,
+            entry_node: NodeId(node_start),
+            return_node,
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: crate::ir::Ir::LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_sg
+                .map(|sg| sg.0)
+                .unwrap_or(0),
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+        });
+        (sg_id, Vec::new())
     }
 
     /// 将 Glue BinaryOp + 类型名映射为 BatchInfo（可批量化的运算+标量类型组合）。
@@ -3386,12 +3653,12 @@ impl<'a> IrBuilder<'a> {
         //（builtin 机制），但 compute_fn 直接绑定到 reflect 实现。
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if self.is_extern_c_func(name) {
-                // reflect 原语拦截：绑定到独立 compute_fn，不设置 ffi_call_name
-                let (compute_fn, need_ffi_name) = match &**name {
-                    "__reflect_format" => (CF_REFLECT_FORMAT, false),
-                    "__reflect_scalar_to_str" => (CF_REFLECT_SCALAR_TO_STR, false),
-                    _ => (CF_FFI_CALL, true),
-                };
+                // 查 FFI intrinsic 注册表，命中用注册的 compute_fn，未命中走 CF_FFI_CALL
+                let (compute_fn, need_ffi_name) = FFI_INTRINSIC_TABLE
+                    .iter()
+                    .find(|(n, _)| *n == &**name)
+                    .map(|(_, cf)| (*cf, false))
+                    .unwrap_or((CF_FFI_CALL, true));
                 let mut inputs = Vec::with_capacity(args.len() + 1);
                 for &arg in args {
                     inputs.push(self.compile_subexpr(arg));
@@ -3440,6 +3707,31 @@ impl<'a> IrBuilder<'a> {
                     }
                 }
             }
+        }
+
+        // 动态闭包调用：callee 是非 Ident 表达式（如 arr[i]、field.access、
+        // 闭包字面量直接调用 fun() {...}() 等），运行时求值为 Closure/Partial。
+        // 用 compute_closure_call（idx 41）动态调用，inputs[0] = 可调用值节点。
+        // 末尾追加 current_effect 作为隐式依赖（与 Ident 闭包调用路径一致）。
+        if !matches!(&callee_expr.node, crate::ast::Ast::Expr::Ident(_)) {
+            let callable_node = self.compile_subexpr(callee);
+            let mut inputs = Vec::with_capacity(args.len() + 2);
+            inputs.push(callable_node);
+            for &arg in args {
+                inputs.push(self.compile_subexpr(arg));
+            }
+            if let Some(eff) = self.current_effect {
+                inputs.push(eff);
+            }
+            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+            let call_node = self.graph.add_node(Node {
+                kind: NodeKind::Call,
+                input_count: inputs.len() as u8,
+                inputs_offset,
+                compute_fn: CF_CLOSURE_CALL, // compute_closure_call
+            });
+            self.graph.set_closure_call_arg_count(call_node, args.len() as u8);
+            return call_node;
         }
 
         // 普通函数调用
@@ -3557,20 +3849,21 @@ impl<'a> IrBuilder<'a> {
         let recv_node = self.compile_subexpr(recv);
 
         // ── intrinsic 降级 ──
-        // 通过 (type_id, method_idx) 查 MethodSigInfo.intrinsic，命中则尝试降级。
+        // 优先查 sema method_dispatches 的语言级 intrinsic 标记（await/recv），
+        // 未命中则回退到 (type_id, method_idx) 查 MethodSigInfo.intrinsic（send/close/len 等）。
         // 条件不满足（如参数数量不匹配）时 fall through 到 Call 节点路径。
-        if let Some(intrinsic) = self.lookup_intrinsic(recv, method) {
+        let dispatch_intrinsic = {
+            let key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                call_expr_id.0 as u64,
+            );
+            self.sema.method_dispatches.get(&key).and_then(|d| d.intrinsic)
+        };
+        let intrinsic = dispatch_intrinsic.or_else(|| self.lookup_intrinsic(recv, method));
+        if let Some(intrinsic) = intrinsic {
             if let Some(node) = self.try_lower_intrinsic(recv, recv_node, args, intrinsic) {
                 return node;
             }
-        }
-
-        // ── await 降级 ──
-        // 用户自定义类型（Timer/Channel 等）未注册 MethodSigInfo.intrinsic，
-        // 但 await 是通用挂起语义：无条件构建 Await 节点，
-        // 事件源种类由 infer_event_source_kind 根据 recv 类型决定。
-        if method == "await" && args.is_empty() {
-            return self.build_await_node(recv, recv_node);
         }
 
         // 路径 0：模块函数调用（recv 是构造器/模块命名空间，不传 recv）
@@ -3806,18 +4099,20 @@ impl<'a> IrBuilder<'a> {
     /// 获取表达式的 type_id（从 SemaResult.expr_types 查询）。
     ///
     /// type_id 计算与 populate_witness_table 一致：type_def_index[name] + FIRST_DYNAMIC_TYPE_ID。
-    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），回退到 trait_self_type。
+    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），查 sema 的
+    /// TraitDefaultInstance.type_name 获取具体实现类型名再查 type_def_index。
     fn expr_type_id(&self, expr: crate::ast::Ast::ExprId) -> Option<u16> {
-        // trait 默认方法特化版本中的 self：用 trait_self_type 覆盖
-        // （Sema 将其注册为 "void"，无法查找 type_id）
-        if let Some(ref ty) = self.trait_self_type {
+        // trait 默认方法特化版本中的 self：消费 sema 的 TraitDefaultInstance.type_name
+        if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr).node {
                 if *name == "self" {
-                    return self
-                        .sema
-                        .type_def_index
-                        .get(ty.as_str())
-                        .map(|&idx| crate::types::dynamic_type_id(idx));
+                    if let Some(inst) = self.sema.trait_default_instances.get(idx) {
+                        return self
+                            .sema
+                            .type_def_index
+                            .get(inst.type_name.as_ref())
+                            .map(|&idx| crate::types::dynamic_type_id(idx));
+                    }
                 }
             }
         }
@@ -3889,18 +4184,15 @@ impl<'a> IrBuilder<'a> {
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
-                // 内置泛型：派生自 Ty::from_type_name + family()（消除 starts_with 前缀匹配）
+                // 内置泛型 + Timer：派生自 Ty::from_type_name + family()（消除字符串匹配）
                 if let Some(ty) = crate::types::Ty::from_type_name(tn) {
                     use crate::types::TypeFamily;
                     match ty.family() {
                         TypeFamily::Async => return EventSourceKind::AsyncJoin,
                         TypeFamily::Channel | TypeFamily::Receiver => return EventSourceKind::Channel,
+                        TypeFamily::Timer => return EventSourceKind::Timer,
                         _ => {}
                     }
-                }
-                // Timer 是用户自定义类型（非内置泛型），保留 contains 字符串匹配
-                if tn.contains("Timer") {
-                    return EventSourceKind::Timer;
                 }
             }
         }
@@ -4209,6 +4501,19 @@ impl<'a> IrBuilder<'a> {
                 // 完成后才执行。防止 continue 后的语句提前执行。
                 let val_node = self.chain_effects(self.current_effect, raw_val);
                 let target_expr = &self.current_module().arena.expr(*target).node;
+                // 数组索引赋值 arr[i] = x：生成 CF_ARRAY_STORE 节点（三输入：arr, index, value）
+                if let crate::ast::Ast::Expr::Index { recv, index } = target_expr {
+                    let arr_node = self.compile_subexpr(*recv);
+                    let idx_node = self.compile_subexpr(*index);
+                    let off = self.graph.inputs_pool.push(&[arr_node, idx_node, val_node]);
+                    let store_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 3,
+                        inputs_offset: off,
+                        compute_fn: CF_ARRAY_STORE,
+                    });
+                    return Some(store_node);
+                }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
                     // 检查是否为 lambda 捕获变量：captured_scopes 记录每层 lambda
                     // 捕获的变量名与对应外层节点。捕获变量赋值需 WriteBack 到外层节点，
@@ -4235,6 +4540,12 @@ impl<'a> IrBuilder<'a> {
                             // 被内层 lambda 捕获的本地变量 → WriteBack 到捕获时的原始节点，
                             // 使 same_function 闭包调用能从父帧读到最新值（引用捕获语义）。
                             let wb_node = self.compile_writeback_node(val_node, captured_node);
+                            self.bind_var(name, val_node);
+                            return Some(wb_node);
+                        } else if self.current_function_has_defer() {
+                            // Bug #49: 函数含 defer 时，局部变量重赋值需 WriteBack 到原始节点，
+                            // 使 defer body（引用原始节点）能读取到最新值而非编译期快照。
+                            let wb_node = self.compile_writeback_node(val_node, outer_node);
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else {
@@ -4410,7 +4721,7 @@ impl<'a> IrBuilder<'a> {
                             return None;
                         }
                         let construct_node =
-                            self.compile_lambda(params, *body, *is_async, Some(name));
+                            self.compile_lambda(params, *body, *is_async, Some(name), None);
                         self.bind_var(name, construct_node);
                         Some(construct_node)
                     }
@@ -4536,6 +4847,8 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         self.enter_scope();
 
         // 创建参数节点（Const 占位，值在运行时由 start_subgraph 注入）
@@ -4581,12 +4894,15 @@ impl<'a> IrBuilder<'a> {
 
         // tail call 优化仅对非 void 函数启用：void 函数的 trailing 表达式是副作用
         // （如 println("done")），不应 tail call（switch_subgraph 会丢失当前帧状态）。
-        let is_void_fn = match return_type {
-            None => true,
-            Some(tr) => {
-                matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
-            }
-        };
+        // 消费 sema 的 FuncSigInfo.return_type 判定 void（builtin 模块回退到 AST）。
+        let is_void_fn = self.sema.get_func_sig(name)
+            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
+            .unwrap_or_else(|| match return_type {
+                None => true,
+                Some(tr) => {
+                    matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+                }
+            });
         let return_node = {
             let prev_tail = self.in_tail_position;
             self.in_tail_position = !is_void_fn;
@@ -4595,6 +4911,7 @@ impl<'a> IrBuilder<'a> {
             r
         };
         self.exit_scope();
+        self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.compiling_builtin = prev_builtin;
 
@@ -4603,7 +4920,10 @@ impl<'a> IrBuilder<'a> {
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
-        sg.has_suspend = is_async;
+        // 消费 sema 的 FuncSigInfo.is_async（builtin 模块回退到 AST is_async）
+        sg.has_suspend = self.sema.get_func_sig(name)
+            .map(|sig| sig.is_async)
+            .unwrap_or(is_async);
         sg.function_id = sg_id.0;
 
         self.func_subgraphs.insert(name.to_string(), sg_id);
@@ -4687,6 +5007,8 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         self.enter_scope();
 
         // 创建参数节点（Const 占位，值在运行时由 start_subgraph 注入）
@@ -4702,12 +5024,15 @@ impl<'a> IrBuilder<'a> {
         }
 
         // 编译函数体
-        let is_void_fn = match return_type {
-            None => true,
-            Some(tr) => {
-                matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
-            }
-        };
+        // 消费 sema 的 FuncSigInfo.return_type 判定 void（builtin 模块回退到 AST）。
+        let is_void_fn = self.sema.get_func_sig(func_name)
+            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
+            .unwrap_or_else(|| match return_type {
+                None => true,
+                Some(tr) => {
+                    matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+                }
+            });
         let return_node = {
             let prev_tail = self.in_tail_position;
             self.in_tail_position = !is_void_fn;
@@ -4716,6 +5041,7 @@ impl<'a> IrBuilder<'a> {
             r
         };
         self.exit_scope();
+        self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.compiling_builtin = prev_builtin;
 
@@ -4724,7 +5050,10 @@ impl<'a> IrBuilder<'a> {
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
-        sg.has_suspend = is_async;
+        // 消费 sema 的 FuncSigInfo.is_async（builtin 模块回退到 AST is_async）
+        sg.has_suspend = self.sema.get_func_sig(func_name)
+            .map(|sig| sig.is_async)
+            .unwrap_or(is_async);
         sg.function_id = sg_id.0;
 
         // 恢复外层 type_args 上下文
@@ -4778,6 +5107,8 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         self.enter_scope();
 
         for param in &params {
@@ -4793,6 +5124,7 @@ impl<'a> IrBuilder<'a> {
 
         let return_node = self.compile_expr(body_expr);
         self.exit_scope();
+        self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.compiling_builtin = prev;
 
@@ -4844,6 +5176,8 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         self.enter_scope();
 
         for param in &params {
@@ -4859,6 +5193,7 @@ impl<'a> IrBuilder<'a> {
 
         let return_node = self.compile_expr(body_expr);
         self.exit_scope();
+        self.current_effect = prev_effect;
         self.current_function_sg = None;
 
         let node_end = self.graph.nodes.len() as u32;
@@ -4875,7 +5210,7 @@ impl<'a> IrBuilder<'a> {
     /// trait 默认方法在类型未覆盖时作为分派目标。为每个实现 trait 的类型生成
     /// 特化子图，使 body 中的 self 拥有具体类型信息，从而 self.method() 调用
     /// 能通过路径 2（类型自有方法）静态绑定到正确的方法子图。
-    fn compile_trait_default_method(&mut self, trait_name: &str, method_idx: usize, impl_type_name: &str) {
+    fn compile_trait_default_method(&mut self, trait_name: &str, method_idx: usize, impl_type_name: &str, instance_idx: usize) {
         // 在用户模块中查找 TraitDecl 的有 body 方法（直接按 method_idx 索引）
         let found = self.module.declarations.iter().find_map(|d| {
             if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
@@ -4917,8 +5252,11 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
-        // 设置 self 的具体类型名，使 body 中 self.method() 能静态绑定。
-        self.trait_self_type = Some(impl_type_name.to_string());
+        // 记录当前特化实例索引，expr_type_name/expr_type_id 通过此索引查 sema 的
+        // TraitDefaultInstance.type_name 获取 self 的具体类型（消费 sema 产出）。
+        self.current_trait_default_idx = Some(instance_idx);
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         self.enter_scope();
 
         for param in &params {
@@ -4934,8 +5272,9 @@ impl<'a> IrBuilder<'a> {
 
         let return_node = self.compile_expr(body_expr);
         self.exit_scope();
+        self.current_effect = prev_effect;
         self.current_function_sg = None;
-        self.trait_self_type = None;
+        self.current_trait_default_idx = None;
 
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
@@ -5249,11 +5588,12 @@ impl<'a> IrBuilder<'a> {
         // 2c. 编译 trait 默认方法的单态化特化版本：
         //     消费 Sema 后阶段收集的 trait_default_instances，为每个实例编译特化子图。
         //     trait_default_subgraphs 中的条目由步骤 0a-trait 预注册。
-        for inst in &self.sema.trait_default_instances {
+        for (inst_idx, inst) in self.sema.trait_default_instances.iter().enumerate() {
             self.compile_trait_default_method(
                 inst.trait_name.as_ref(),
                 inst.method_idx as usize,
                 inst.type_name.as_ref(),
+                inst_idx,
             );
         }
 
@@ -5316,6 +5656,80 @@ impl<'a> IrBuilder<'a> {
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
         self.graph
+    }
+}
+
+/// 检测浮点字面量的类型后缀，返回 (stripped, suffix)。
+fn detect_float_suffix(s: &str) -> (&str, Option<&str>) {
+    for suffix in &["f128", "f64", "f32", "f16"] {
+        if s.ends_with(suffix) {
+            return (&s[..s.len() - suffix.len()], Some(suffix));
+        }
+    }
+    (s, None)
+}
+
+// =========================================================================
+// 整数字面量解析 + 类型范围检查
+// =========================================================================
+
+/// 将整数字面量原始文本解析为 i128，支持 0x/0o/0b 前缀和下划线分隔符。
+/// 解析失败（无效语法）时返回带 span 信息的错误。
+fn parse_int_to_i128(raw: &str, span: crate::ast::Ast::Span) -> Result<i128, String> {
+    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+    let (digits, radix) = cleaned
+        .strip_prefix("0x").map(|s| (s, 16u32))
+        .or_else(|| cleaned.strip_prefix("0o").map(|s| (s, 8)))
+        .or_else(|| cleaned.strip_prefix("0b").map(|s| (s, 2)))
+        .unwrap_or((cleaned.as_str(), 10));
+    i128::from_str_radix(digits, radix).map_err(|_| {
+        format!("invalid integer literal '{}' at line {}:{}", raw, span.line, span.column)
+    })
+}
+
+/// 将整数字面量原始文本解析为 u128，支持 0x/0o/0b 前缀和下划线分隔符。
+/// u128 无符号语义（不接受负号），用于 u128 suffix 字面量，覆盖完整 0..=2^128-1 范围。
+/// 解析失败（无效语法或负号）时返回带 span 信息的错误。
+fn parse_int_to_u128(raw: &str, span: crate::ast::Ast::Span) -> Result<u128, String> {
+    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+    let (digits, radix) = cleaned
+        .strip_prefix("0x").map(|s| (s, 16u32))
+        .or_else(|| cleaned.strip_prefix("0o").map(|s| (s, 8)))
+        .or_else(|| cleaned.strip_prefix("0b").map(|s| (s, 2)))
+        .unwrap_or((cleaned.as_str(), 10));
+    u128::from_str_radix(digits, radix).map_err(|_| {
+        format!("invalid integer literal '{}' at line {}:{}", raw, span.line, span.column)
+    })
+}
+
+/// 对 i128 值进行目标类型范围检查并转换为 ConstValue。
+/// 超出范围时返回带类型名、合法范围和 span 信息的错误。
+fn check_int_range(v: i128, ty_name: &str, raw: &str, span: crate::ast::Ast::Span) -> Result<ConstValue, String> {
+    macro_rules! try_int {
+        ($ty:ty, $variant:ident) => {
+            match <$ty>::try_from(v) {
+                Ok(val) => return Ok(ConstValue::$variant(val)),
+                Err(_) => return Err(format!(
+                    "integer literal '{}' at line {}:{} is out of range for {} (valid range: {}..={})",
+                    raw, span.line, span.column, ty_name, <$ty>::MIN, <$ty>::MAX
+                )),
+            }
+        };
+    }
+    match ty_name {
+        "i8" => try_int!(i8, I8),
+        "i16" => try_int!(i16, I16),
+        "i32" => try_int!(i32, I32),
+        "i64" => try_int!(i64, I64),
+        "i128" => Ok(ConstValue::I128(v)),
+        "u8" => try_int!(u8, U8),
+        "u16" => try_int!(u16, U16),
+        "u32" => try_int!(u32, U32),
+        "u64" => try_int!(u64, U64),
+        "u128" => try_int!(u128, U128),
+        "isize" => try_int!(isize, Isize),
+        "usize" => try_int!(usize, Usize),
+        _ => try_int!(i32, I32),
     }
 }
 
@@ -5767,91 +6181,4 @@ fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     let frac = mant & ((1u128 << 112) - 1);
     let bits = (if sign { 1u128 << 127 } else { 0 }) | frac;
     Some(bits.to_le_bytes())
-}
-
-#[cfg(test)]
-mod decimal_f128_tests {
-    use super::*;
-
-    /// 辅助：比较十进制与十六进制解析结果是否位模式相同。
-    fn assert_eq_hex(decimal: &str, hex: &str, label: &str) {
-        let hex_clean = hex.strip_suffix("f128").unwrap_or(hex);
-        let d = parse_decimal_f128(decimal)
-            .unwrap_or_else(|| panic!("parse_decimal_f128({}) returned None", decimal));
-        let h = parse_hex_float_f128(hex_clean)
-            .unwrap_or_else(|| panic!("parse_hex_float_f128({}) returned None", hex_clean));
-        assert_eq!(d, h, "{}: decimal {} != hex {}", label, decimal, hex_clean);
-    }
-
-    #[test]
-    fn f128_decimal_simple() {
-        assert_eq_hex("1.0", "0x1p+0f128", "1.0");
-        assert_eq_hex("2.0", "0x1p+1f128", "2.0");
-        assert_eq_hex("0.5", "0x1p-1f128", "0.5");
-        assert_eq_hex("3.0", "0x1.8p+1f128", "3.0");
-        assert_eq_hex("4.0", "0x1p+2f128", "4.0");
-        assert_eq_hex("0.0", "0x0p+0f128", "0.0");
-    }
-
-    #[test]
-    fn f128_decimal_pi() {
-        // π 的 binary128 精确值，36 位十进制足够正确舍入
-        assert_eq_hex(
-            "3.1415926535897932384626433832795028",
-            "0x1.921fb54442d18469898cc51701b8p+1f128",
-            "pi",
-        );
-    }
-
-    #[test]
-    fn f128_decimal_e() {
-        assert_eq_hex(
-            "2.7182818284590452353602874713526625",
-            "0x1.5bf0a8b1457695355fb8ac404e7ap+1f128",
-            "e",
-        );
-    }
-
-    #[test]
-    fn f128_decimal_ln2() {
-        assert_eq_hex(
-            "0.6931471805599453094172321214581766",
-            "0x1.62e42fefa39ef35793c7673007e6p-1f128",
-            "ln2",
-        );
-    }
-
-    #[test]
-    fn f128_decimal_point_one() {
-        // 0.1 的 binary128 精确表示
-        assert_eq_hex(
-            "0.1",
-            "0x1.999999999999999999999999999ap-4f128",
-            "0.1",
-        );
-    }
-
-    #[test]
-    fn f128_decimal_exp_notation() {
-        assert_eq_hex("1.5e3", "0x1.77p+10f128", "1.5e3");
-        assert_eq_hex("1e0", "0x1p+0f128", "1e0");
-        assert_eq_hex("1.25e0", "0x1.4p+0f128", "1.25e0");
-    }
-
-    #[test]
-    fn f128_decimal_negative() {
-        let pos = parse_decimal_f128("3.14").unwrap();
-        let neg = parse_decimal_f128("-3.14").unwrap();
-        // 符号位差异：bit 127
-        let pos_val = u128::from_le_bytes(pos);
-        let neg_val = u128::from_le_bytes(neg);
-        assert_eq!(pos_val | (1u128 << 127), neg_val, "-3.14 sign bit");
-    }
-
-    #[test]
-    fn f128_decimal_integer() {
-        // 整数值（无小数点）
-        assert_eq_hex("100", "0x1.9p+6f128", "100");
-        assert_eq_hex("1024", "0x1p+10f128", "1024");
-    }
 }

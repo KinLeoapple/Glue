@@ -29,6 +29,61 @@ impl<S: LockStrategy> Engine<S> {
         fid
     }
 
+    /// 初始化 defer body 帧：same_function 分支帧设置（Bug #52）。
+    ///
+    /// defer body 子图编译为 same_function 分支子图（function_id = 父函数），
+    /// 但 `init_frame` 用 defer body 自身的 node_range 创建帧，
+    /// node_offset 和 value_table 大小不匹配父函数，导致 WriteBack
+    /// 计算的 local 索引越界（`writeback target out of current frame range`）。
+    ///
+    /// 此方法用父帧的 node_offset 和 value_table 大小创建帧，
+    /// 复制父帧已就绪的值，再用 `prepare_same_function_frame` 设置 pending_inputs，
+    /// 使 defer body 能正确读写父函数的局部变量。
+    pub(super) fn init_defer_frame(
+        &self,
+        body_subgraph: SubGraphId,
+        parent_frame: &Frame,
+    ) -> FrameId {
+        let parent_start = parent_frame.node_offset;
+        let parent_node_count = parent_frame.value_table.len();
+        let child_sg = &self.graph.subgraphs[body_subgraph.0 as usize];
+        let (branch_start, branch_end) = child_sg.node_range;
+
+        let fid = self.alloc_frame_id();
+        let mut frame = Frame::new(fid, body_subgraph, parent_node_count, self.graph.clone());
+        frame.node_offset = parent_start;
+
+        // 复制父帧已就绪的值（跳过 defer body 范围内的节点）
+        for i in 0..parent_node_count {
+            let gid = (parent_start as usize + i) as u32;
+            let in_child = gid >= branch_start.0 && gid < branch_end.0;
+            if in_child {
+                continue;
+            }
+            if parent_frame.value_table.ready[i] {
+                frame.value_table.values[i] = parent_frame.value_table.values[i].clone();
+                frame.value_table.ready[i] = true;
+                frame.value_table.refcounts[i] = 0;
+            }
+        }
+
+        // 设置 pending_inputs + 预填充 Const + 0-input 节点入队
+        self.prepare_same_function_frame(&mut frame);
+
+        // 帧链指针：defer body 通过帧链穿透访问外层变量（Bug #47）
+        let parent_ptr = parent_frame as *const Frame as *mut Frame;
+        let parent_root = if !parent_frame.root_frame_ptr.is_null() {
+            parent_frame.root_frame_ptr
+        } else {
+            parent_ptr
+        };
+        frame.parent_frame_ptr = parent_ptr;
+        frame.root_frame_ptr = parent_root;
+
+        self.frames.lock().insert(fid, Box::new(frame));
+        fid
+    }
+
     /// 帧节点初始化：重置 + 预填充。
     pub(super) fn prepare_frame(&self, frame: &mut Frame) {
         // 重置帧状态（帧复用时必须重置，避免旧值残留）
@@ -75,17 +130,11 @@ impl<S: LockStrategy> Engine<S> {
             if loop_kind == crate::ir::Ir::LoopKind::For {
                 Self::reset_node_pending(loop_frame, cond_local, 1);
             } else {
-                Self::reset_node_ready(loop_frame, cond_local);
-                // Const cond_node 重新预填充
-                if self.graph.nodes[cond_node.0 as usize].kind == crate::ir::Ir::NodeKind::Const {
-                    if let Some(cv) = self.graph.const_values[cond_node.0 as usize] {
-                        let handle = super::Schedule::alloc_const_value(cv);
-                        let consumer_count =
-                            self.graph.downstreams[cond_node.0 as usize].len() as u16;
-                        loop_frame.set_value(cond_local, handle, consumer_count);
-                    }
-                }
-                loop_frame.push_ready(cond_local);
+                // While/Loop：递归重置条件依赖树。
+                // cond_node 可能是复合表达式（如 `i < 10 && i < 5`），其输入节点
+                // （lt1, lt2）在上一轮已求值，若不重置会保持陈旧值，导致 cond_node
+                // 读取旧比较结果（条件恒 true → 死循环）。
+                self.reset_condition_tree(loop_frame, loop_sg_id, cond_node, loop_offset);
             }
         }
 
@@ -242,6 +291,114 @@ impl<S: LockStrategy> Engine<S> {
             }
             if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
                 frame.push_ready(NodeId(i as u32));
+            }
+        }
+    }
+
+    /// 递归重置条件依赖树（While/Loop 循环迭代重置）。
+    ///
+    /// `reset_loop_iteration` 只重置顶层 cond_node 时，cond_node 的输入节点
+    /// （如 `&&`/`||` 的比较操作数 `lt1`/`lt2`）保持上一轮的陈旧值，导致
+    /// cond_node 读取陈旧比较结果（条件恒 true → 死循环）。
+    ///
+    /// 此方法递归收集 cond_node 依赖树中所有位于循环子图内（排除嵌套子图
+    /// body_sg/void_sg 和 Gate 节点）的节点，重置其值并按依赖关系设置
+    /// pending_inputs，确保每轮迭代从头重新求值。
+    fn reset_condition_tree(
+        &self,
+        loop_frame: &mut Frame,
+        loop_sg_id: SubGraphId,
+        cond_node: NodeId,
+        loop_offset: u32,
+    ) {
+        let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
+        let (sg_start, sg_end) = sg.node_range;
+
+        // 收集嵌套子图范围（body_sg, void_sg）
+        let nested_ranges: Vec<(u32, u32)> = self
+            .graph
+            .subgraphs
+            .iter()
+            .filter(|s| {
+                s.id != loop_sg_id
+                    && s.node_range.0 .0 >= sg_start.0
+                    && s.node_range.1 .0 <= sg_end.0
+            })
+            .map(|s| (s.node_range.0 .0, s.node_range.1 .0))
+            .collect();
+        let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
+        let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
+
+        // DFS 收集 cond_node 依赖树中所有位于循环子图内的节点（排除 Gate）
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut stack = vec![cond_node];
+        let mut cond_nodes: Vec<NodeId> = Vec::new();
+        while let Some(gid) = stack.pop() {
+            if !visited.insert(gid.0) {
+                continue;
+            }
+            if !is_in_sg(gid.0) {
+                continue;
+            }
+            if self.graph.nodes[gid.0 as usize].kind == NodeKind::Gate {
+                continue;
+            }
+            cond_nodes.push(gid);
+            let node = &self.graph.nodes[gid.0 as usize];
+            let inputs = self
+                .graph
+                .inputs_pool
+                .get(node.inputs_offset, node.input_count);
+            for &inp in inputs {
+                stack.push(inp);
+            }
+        }
+
+        // 阶段 1：重置每个节点的值 + 设置 pending_inputs
+        for &gid in &cond_nodes {
+            let local = NodeId(gid.0.wrapping_sub(loop_offset));
+            let node = &self.graph.nodes[gid.0 as usize];
+            let inputs = self
+                .graph
+                .inputs_pool
+                .get(node.inputs_offset, node.input_count);
+
+            // pending = 依赖树内的输入数（这些输入将被重新求值）
+            // 外部输入（如循环外变量）通过帧链访问，已就绪，不计 pending
+            let pending: u16 = inputs
+                .iter()
+                .filter(|&&inp| {
+                    visited.contains(&inp.0)
+                        && is_in_sg(inp.0)
+                        && self.graph.nodes[inp.0 as usize].kind != NodeKind::Gate
+                })
+                .count() as u16;
+
+            Self::reset_node_pending(loop_frame, local, pending);
+
+            // 预填充 Const 节点
+            if node.kind == NodeKind::Const {
+                if let Some(cv) = self.graph.const_values[gid.0 as usize] {
+                    let handle = super::Schedule::alloc_const_value(cv);
+                    let consumer_count =
+                        self.graph.downstreams[gid.0 as usize].len() as u16;
+                    loop_frame.set_value(local, handle, consumer_count);
+                }
+            }
+        }
+
+        // 阶段 2：入队（Const 节点 + 0-pending 非 Const 节点）
+        for &gid in &cond_nodes {
+            let local = NodeId(gid.0.wrapping_sub(loop_offset));
+            let i = local.0 as usize;
+            let is_const = self.graph.nodes[gid.0 as usize].kind == NodeKind::Const;
+            let pending = if i < loop_frame.pending_inputs.len() {
+                loop_frame.pending_inputs[i]
+            } else {
+                0
+            };
+            if is_const || pending == 0 {
+                loop_frame.push_ready(local);
             }
         }
     }

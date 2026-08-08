@@ -1,0 +1,371 @@
+// 大胆 ADT 边缘测试：深递归 ADT/多变体/复杂嵌套模式/ADT 相等性/ADT 数组
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #19: 嵌套函数不能自递归 → 递归函数放顶层
+//   Bug #21: 超范围字面量静默退出 → 所有字面量加显式类型后缀
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 递归 ADT：二叉树 ───
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+fun treeSum(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(v, l, r) => v + treeSum(l) + treeSum(r)
+    }
+}
+
+fun treeDepth(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, l, r) => {
+            val dl = treeDepth(l)
+            val dr = treeDepth(r)
+            if dl > dr { dl + 1 } else { dr + 1 }
+        }
+    }
+}
+
+fun treeCount(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, l, r) => 1 + treeCount(l) + treeCount(r)
+    }
+}
+
+// ─── 多变体 ADT（8 变体）───
+type Color =
+    | Red
+    | Green
+    | Blue
+    | Yellow
+    | Cyan
+    | Magenta
+    | Black
+    | White
+
+fun colorName(c: Color): str {
+    match c {
+        Red => "red"
+        Green => "green"
+        Blue => "blue"
+        Yellow => "yellow"
+        Cyan => "cyan"
+        Magenta => "magenta"
+        Black => "black"
+        White => "white"
+    }
+}
+
+// ─── 带数据的变体 ───
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+    | Triangle(f64, f64, f64)
+    | Square(f64)
+
+fun shapeArea(s: Shape): f64 {
+    match s {
+        Circle(r) => 3.14159f64 * r * r
+        Rect(w, h) => w * h
+        Triangle(b, h, _) => 0.5f64 * b * h
+        Square(side) => side * side
+    }
+}
+
+// ─── 嵌套 ADT（Shape 含在记录中）───
+type Drawing = Drawing(shapes: Shape[])
+
+// ─── 链表 ADT ───
+type List =
+    | Nil
+    | Cons(i32, List)
+
+fun listLen(l: List): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + listLen(t)
+    }
+}
+
+fun listSum(l: List): i32 {
+    match l {
+        Nil => 0
+        Cons(h, t) => h + listSum(t)
+    }
+}
+
+// ─── Option ADT（手动实现）───
+type Opt =
+    | None_
+    | Some_(i32)
+
+fun optMap(o: Opt): Opt {
+    match o {
+        None_ => None_
+        Some_(v) => Some_(v * 2)
+    }
+}
+
+fun optGet(o: Opt, default: i32): i32 {
+    match o {
+        None_ => default
+        Some_(v) => v
+    }
+}
+
+// 链表反转（顶层函数，避免 Bug #19 嵌套递归）
+fun reverseList(l: List, acc: List): List {
+    match l {
+        Nil => acc
+        Cons(h, t) => reverseList(t, Cons(h, acc))
+    }
+}
+
+fun main(): void {
+    println("=== Edge ADT ===")
+
+    // ─── 1. 二叉树深度递归 ───
+    println("--- Binary Tree ---")
+    val t = Node(1,
+        Node(2, Node(4, Leaf, Leaf), Node(5, Leaf, Leaf)),
+        Node(3, Leaf, Node(6, Leaf, Leaf))
+    )
+    check(treeSum(t) == 21, "tree sum = 1+2+3+4+5+6")
+    check(treeDepth(t) == 3, "tree depth 3")
+    check(treeCount(t) == 6, "tree node count 6")
+
+    val empty_tree = Leaf
+    check(treeSum(empty_tree) == 0, "empty tree sum 0")
+    check(treeDepth(empty_tree) == 0, "empty tree depth 0")
+
+    val single = Node(42, Leaf, Leaf)
+    check(treeSum(single) == 42, "single node sum")
+    check(treeDepth(single) == 1, "single node depth 1")
+
+    // 左斜树
+    val left_skew = Node(1, Node(2, Node(3, Leaf, Leaf), Leaf), Leaf)
+    check(treeSum(left_skew) == 6, "left skew sum")
+    check(treeDepth(left_skew) == 3, "left skew depth 3")
+
+    // 右斜树
+    val right_skew = Node(1, Leaf, Node(2, Leaf, Node(3, Leaf, Leaf)))
+    check(treeSum(right_skew) == 6, "right skew sum")
+    check(treeDepth(right_skew) == 3, "right skew depth 3")
+
+    // ─── 2. 多变体 ADT（8 变体）───
+    println("--- Multi-variant ADT (8 variants) ---")
+    check(colorName(Red) == "red", "color Red")
+    check(colorName(Green) == "green", "color Green")
+    check(colorName(Blue) == "blue", "color Blue")
+    check(colorName(Yellow) == "yellow", "color Yellow")
+    check(colorName(Cyan) == "cyan", "color Cyan")
+    check(colorName(Magenta) == "magenta", "color Magenta")
+    check(colorName(Black) == "black", "color Black")
+    check(colorName(White) == "white", "color White")
+
+    // 变体相等性
+    check(Red == Red, "Red == Red")
+    check(Red != Green, "Red != Green")
+    check(Blue != Red, "Blue != Red")
+
+    // ─── 3. 带数据的变体 ───
+    println("--- Variants with Data ---")
+    check(shapeArea(Circle(2.0f64)) == 12.56636f64, "circle area r=2 (pi*r^2)")
+    check(shapeArea(Rect(3.0f64, 4.0f64)) == 12.0f64, "rect area 3x4")
+    check(shapeArea(Square(5.0f64)) == 25.0f64, "square area s=5")
+    check(shapeArea(Triangle(4.0f64, 3.0f64, 5.0f64)) == 6.0f64, "triangle area 4x3")
+
+    // 变体相等性（带数据）
+    check(Circle(1.0f64) == Circle(1.0f64), "circle equality")
+    check(Circle(1.0f64) != Circle(2.0f64), "circle inequality")
+    check(Rect(1.0f64, 2.0f64) == Rect(1.0f64, 2.0f64), "rect equality")
+    check(Rect(1.0f64, 2.0f64) != Rect(1.0f64, 3.0f64), "rect inequality")
+    check(Circle(1.0f64) != Rect(1.0f64, 1.0f64), "circle != rect (different variant)")
+
+    // ─── 4. 链表 ADT ───
+    println("--- Linked List ADT ---")
+    val list = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    check(listLen(list) == 4, "list length 4")
+    check(listSum(list) == 10, "list sum 1+2+3+4")
+
+    val empty_list = Nil
+    check(listLen(empty_list) == 0, "empty list length 0")
+    check(listSum(empty_list) == 0, "empty list sum 0")
+
+    val single_elem = Cons(42, Nil)
+    check(listLen(single_elem) == 1, "single list length 1")
+    check(listSum(single_elem) == 42, "single list sum 42")
+
+    // ─── 5. Option ADT ───
+    println("--- Option ADT ---")
+    val some = Some_(10)
+    val none = None_
+    check(optGet(some, 0) == 10, "opt get some = 10")
+    check(optGet(none, 99) == 99, "opt get none = default 99")
+    check(optMap(some) == Some_(20), "opt map some * 2 = 20")
+    check(optMap(none) == None_, "opt map none = none")
+
+    // ─── 6. ADT 数组 ───
+    println("--- ADT Arrays ---")
+    val colors = [Red, Green, Blue]
+    check(colors.len() == 3, "color array len")
+    check(colors[0] == Red, "color arr[0] = Red")
+    check(colors[1] == Green, "color arr[1] = Green")
+    check(colors[2] == Blue, "color arr[2] = Blue")
+
+    val shapes = [Circle(1.0f64), Rect(2.0f64, 3.0f64), Square(4.0f64)]
+    check(shapes.len() == 3, "shape array len")
+    check(shapes[0] == Circle(1.0f64), "shape arr[0] equality")
+    check(shapes[1] == Rect(2.0f64, 3.0f64), "shape arr[1] equality")
+
+    // ADT 数组迭代求面积
+    var total_area: f64 = 0.0
+    var si: i32 = 0
+    while si < shapes.len() {
+        total_area = total_area + shapeArea(shapes[si])
+        si = si + 1
+    }
+    check(total_area == 3.14159f64 + 6.0f64 + 16.0f64, "shape array total area")
+
+    // ─── 7. 嵌套 ADT 模式匹配 ───
+    println("--- Nested ADT Patterns ---")
+    fun classifyNode(t: Tree): str {
+        match t {
+            Leaf => "leaf"
+            Node(_, Leaf, Leaf) => "leaf-leaf"
+            Node(_, Leaf, _) => "has-right"
+            Node(_, _, Leaf) => "has-left"
+            Node(_, _, _) => "both"
+        }
+    }
+    check(classifyNode(Leaf) == "leaf", "classify leaf")
+    check(classifyNode(Node(1, Leaf, Leaf)) == "leaf-leaf", "classify leaf-leaf")
+    check(classifyNode(Node(1, Leaf, Node(2, Leaf, Leaf))) == "has-right", "classify has-right")
+    check(classifyNode(Node(1, Node(2, Leaf, Leaf), Leaf)) == "has-left", "classify has-left")
+    check(classifyNode(Node(1, Node(2, Leaf, Leaf), Node(3, Leaf, Leaf))) == "both", "classify both")
+
+    // ─── 8. 深递归 ADT（50 层链表）───
+    println("--- 50-deep Linked List ---")
+    // 通过 while 循环构建 50 元素链表（函数式，无原地修改）
+    var deep_list: List = Nil
+    var li: i32 = 50
+    while li > 0 {
+        deep_list = Cons(li, deep_list)
+        li = li - 1
+    }
+    check(listLen(deep_list) == 50, "50-deep list length")
+    // sum 1..50 = 1275
+    check(listSum(deep_list) == 1275, "50-deep list sum 1..50 = 1275")
+
+    // ─── 9. ADT 在记录中 ───
+    println("--- ADT in Records ---")
+    type ShapeBox = ShapeBox(label: str, shape: Shape)
+    val box = ShapeBox("circle", Circle(5.0f64))
+    check(box.label == "circle", "shape box label")
+    check(box.shape == Circle(5.0f64), "shape box shape equality")
+    check(shapeArea(box.shape) == 78.53975f64, "shape box area")
+
+    // ─── 10. 大胆：ADT match 提取值运算 ───
+    println("--- ADT Value Extraction ---")
+    fun doubleShape(s: Shape): Shape {
+        match s {
+            Circle(r) => Circle(r * 2.0f64)
+            Rect(w, h) => Rect(w * 2.0f64, h * 2.0f64)
+            Triangle(a, b, c) => Triangle(a * 2.0f64, b * 2.0f64, c * 2.0f64)
+            Square(side) => Square(side * 2.0f64)
+        }
+    }
+    check(doubleShape(Circle(1.0f64)) == Circle(2.0f64), "double circle")
+    check(doubleShape(Rect(2.0f64, 3.0f64)) == Rect(4.0f64, 6.0f64), "double rect")
+    check(doubleShape(Square(3.0f64)) == Square(6.0f64), "double square")
+
+    // ─── 11. 大胆：or-pattern on ADT ───
+    println("--- ADT Or-patterns ---")
+    fun isPrimary(c: Color): bool {
+        match c {
+            Red | Green | Blue => true
+            _ => false
+        }
+    }
+    check(isPrimary(Red) == true, "Red is primary")
+    check(isPrimary(Green) == true, "Green is primary")
+    check(isPrimary(Blue) == true, "Blue is primary")
+    check(isPrimary(Yellow) == false, "Yellow not primary")
+    check(isPrimary(Black) == false, "Black not primary")
+
+    fun isGrayscale(c: Color): bool {
+        match c {
+            Black | White => true
+            _ => false
+        }
+    }
+    check(isGrayscale(Black) == true, "Black is grayscale")
+    check(isGrayscale(White) == true, "White is grayscale")
+    check(isGrayscale(Red) == false, "Red not grayscale")
+
+    // ─── 12. 大胆：递归 ADT 构建 + map ───
+    println("--- Recursive ADT Build & Map ---")
+    // 构建 1..10 链表
+    var nums: List = Nil
+    var ni: i32 = 10
+    while ni > 0 {
+        nums = Cons(ni, nums)
+        ni = ni - 1
+    }
+    check(listLen(nums) == 10, "10-list length")
+    check(listSum(nums) == 55, "10-list sum 1..10 = 55")
+
+    // 链表反转（reverseList 已移至顶层，避免 Bug #19）
+    val reversed = reverseList(nums, Nil)
+    check(listLen(reversed) == 10, "reversed list length")
+    check(listSum(reversed) == 55, "reversed list sum (same)")
+    // 验证顺序反转：第一个元素应为 10
+    match reversed {
+        Cons(h, _) => check(h == 10, "reversed first = 10")
+        Nil => check(false, "reversed should not be Nil")
+    }
+
+    // ─── 13. 大胆：ADT 嵌套在数组中并递归 ───
+    println("--- ADT Array Recursion ---")
+    val trees = [
+        Node(1, Node(2, Leaf, Leaf), Leaf),
+        Node(3, Leaf, Node(4, Leaf, Leaf)),
+        Node(5, Node(6, Leaf, Leaf), Node(7, Leaf, Leaf))
+    ]
+    check(trees.len() == 3, "tree array len 3")
+    check(treeSum(trees[0]) == 3, "tree[0] sum = 1+2")
+    check(treeSum(trees[1]) == 7, "tree[1] sum = 3+4")
+    check(treeSum(trees[2]) == 18, "tree[2] sum = 5+6+7")
+
+    // 数组中所有树的总和
+    var all_tree_sum: i32 = 0
+    var ti2: i32 = 0
+    while ti2 < trees.len() {
+        all_tree_sum = all_tree_sum + treeSum(trees[ti2])
+        ti2 = ti2 + 1
+    }
+    check(all_tree_sum == 28, "all trees sum = 3+7+18")
+
+    summary()
+}

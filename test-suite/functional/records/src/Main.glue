@@ -85,5 +85,60 @@ fun main(): void {
     mp.x = 10
     check(mp.x == 10, "var record field update")
 
+    // ─── 记录边缘测试 ───
+
+    // 深嵌套记录（4 层）
+    type L4 = L4(v: L3)
+    type L3 = L3(v: L2)
+    type L2 = L2(v: L1)
+    type L1 = L1(v: i32)
+    val deep_rec = L4(L3(L2(L1(42))))
+    check(deep_rec.v.v.v.v == 42, "4-deep nested record access")
+    check(deep_rec.v.v.v == L1(42), "3-deep nested record equality")
+
+    // 多字段记录（8 字段）
+    type Big = Big(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32)
+    val big_rec = Big(1, 2, 3, 4, 5, 6, 7, 8)
+    check(big_rec.a == 1, "8-field record a")
+    check(big_rec.d == 4, "8-field record d")
+    check(big_rec.h == 8, "8-field record h")
+    check(big_rec.a + big_rec.b + big_rec.c + big_rec.d + big_rec.e + big_rec.f + big_rec.g + big_rec.h == 36, "8-field sum")
+
+    // 嵌套记录数组
+    val box_arr = [Box(Point(1, 1)), Box(Point(2, 2)), Box(Point(3, 3))]
+    check(box_arr[0].inner.x == 1, "nested record array [0].inner.x")
+    check(box_arr[2].inner.y == 3, "nested record array [2].inner.y")
+
+    // 记录字段更新后原记录不变
+    val orig_p = Point(10, 20)
+    val updated_p = Point(orig_p.x + 1, orig_p.y)
+    check(orig_p.x == 10, "original unchanged after update")
+    check(updated_p.x == 11, "updated x")
+    check(updated_p.y == 20, "updated y keeps original")
+
+    // 记录作为函数返回值
+    fun makePoint(x: i32, y: i32): Point {
+        Point(x, y)
+    }
+    check(makePoint(5, 6) == Point(5, 6), "record from function return")
+
+    // 记录相等性深度
+    check(Point(1, 2) == Point(1, 2), "record equality same values")
+    check(Point(1, 2) != Point(1, 3), "record inequality different y")
+    check(Point(1, 2) != Point(2, 2), "record inequality different x")
+
+    // 记录解构 match 全字段
+    fun sumPoint(p: Point): i32 {
+        match p {
+            Point(x, y) => x + y
+        }
+    }
+    check(sumPoint(Point(10, 20)) == 30, "record destruct match")
+
+    // 多字段记录更新（显式构造）
+    val big_updated = Big(big_rec.a, big_rec.b, big_rec.c, big_rec.d, 99, big_rec.f, big_rec.g, big_rec.h)
+    check(big_updated.e == 99, "8-field update single field")
+    check(big_updated.a == 1, "8-field update keeps others")
+
     summary()
 }

@@ -21,6 +21,9 @@ fun summary(): void {
 
 type Addr = Addr(city: str, zip: i32)
 type User = User(name: str, addr: Addr?)
+type DeepOuter = DeepOuter(mid: DeepMid?)
+type DeepMid = DeepMid(inner: DeepInner?)
+type DeepInner = DeepInner(v: i32?)
 
 // ?? 合并
 fun firstNonNull(a: i32?, b: i32?, c: i32?): i32 {
@@ -112,6 +115,64 @@ fun main(): void {
     check(city2 == null, "?. chain on null short-circuits to null")
     // 链式访问带 ?? 合并
     check((nullUser?.addr?.city ?? "unknown") == "unknown", "?. chain with ?? coalesce")
+
+    // ─── 可空边缘测试 ───
+
+    // 深层 ?. 链（4 层）
+    val deepNull: DeepOuter? = null
+    check((deepNull?.mid?.inner?.v ?? -1) == -1, "4-layer ?. chain on null")
+    val deepVal = DeepOuter(DeepMid(DeepInner(42)))
+    check((deepVal?.mid?.inner?.v ?? -1) == 42, "4-layer ?. chain on value")
+    val deepMidNull = DeepOuter(null)
+    check((deepMidNull?.mid?.inner?.v ?? -1) == -1, "4-layer ?. chain mid null")
+
+    // 多 ?? 链（5 个）
+    val a1: i32? = null
+    val a2: i32? = null
+    val a3: i32? = null
+    val a4: i32? = null
+    val a5: i32? = 77
+    check((a1 ?? a2 ?? a3 ?? a4 ?? a5) == 77, "5-chain ?? coalesce to 5th")
+
+    // null 数组
+    val nulls = [null, 1, null, 2, null]
+    check((nulls[0] ?? -1) == -1, "nullable array elem 0 null")
+    check((nulls[1] ?? -1) == 1, "nullable array elem 1 value")
+    check((nulls[2] ?? -1) == -1, "nullable array elem 2 null")
+    check((nulls[3] ?? -1) == 2, "nullable array elem 3 value")
+    check((nulls[4] ?? -1) == -1, "nullable array elem 4 null")
+
+    // 可空 record 字段访问
+    val userNullAddr = User("Bob", null)
+    check(userNullAddr.name == "Bob", "nullable record field non-null")
+    check(userNullAddr.addr == null, "nullable record field is null")
+    check((userNullAddr.addr?.city ?? "N/A") == "N/A", "nullable record field ?.city")
+
+    // 可空值在数组中迭代
+    val optArr = [10, null, 20, null, 30]
+    var opt_sum: i32 = 0
+    var oi: i32 = 0
+    while oi < optArr.len() {
+        opt_sum = opt_sum + (optArr[oi] ?? 0)
+        oi = oi + 1
+    }
+    check(opt_sum == 60, "nullable array iterate with ?? default")
+
+    // null 的 null
+    val nn: i32? = null
+    check((nn ?? (null ?? 99)) == 99, "nested ?? inside ??")
+
+    // ! 断言链
+    val some_opt: i32? = 42
+    val force_chain = some_opt!
+    check(force_chain == 42, "force unwrap chain")
+
+    // 字符串可空边界
+    val empty_str: str? = ""
+    check((empty_str ?? "default") == "", "empty str is non-null")
+    val null_str: str? = null
+    check((null_str ?? "default") == "default", "null str coalesce")
+    check((null_str?.len() ?? -1) == -1, "null str ?.len() short-circuits")
 
     summary()
 }

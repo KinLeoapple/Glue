@@ -1,0 +1,350 @@
+// 大胆杂项边缘测试：跨类型交互 / cast 链 / nullable 嵌套 / 运算符边界 / 字符串边界
+//
+// 探测未知行为，记录实际表现（INFO 行），check 期望值。
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层
+//   Bug #21: i32 超范围字面量静默退出     → 已修复（现报编译错误）
+//   Bug #22: 有符号 MIN / -1 已修复（wrapping 语义）
+//   Bug #28: ?? 不支持 Throw              → 仅对 Nullable 用 ??
+//   Bug #34: arr[i] = x 空操作            → 已修复（现支持原地修改）
+//   Bug #36: 不支持 \uXXXX/\0 转义        → 直接输入 Unicode 字符
+//   Bug #38: &&/|| 不短路                 → 不依赖短路副作用
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 顶层辅助函数 ───
+fun addI64(a: i64, b: i64): i64 { a + b }
+fun isPos(x: i32): bool { x > 0 }
+
+fun main(): void {
+    println("=== Edge Misc ===")
+
+    // ─── 1. 跨类型算术（探测：是否允许隐式转换）───
+    println("--- Cross-type Arithmetic ---")
+    val i32v: i32 = 10
+    val i64v: i64 = 1000000000000i64
+    val f64v: f64 = 2.5f64
+    // i32 + i32 正常
+    check(i32v + i32v == 20, "i32 + i32")
+    // i64 + i64 正常
+    check(addI64(i64v, i64v) == 2000000000000i64, "i64 + i64 via fn")
+    // 探测：i32 与 i64 直接相加（是否编译/隐式转换）
+    // 注：如不允许，会 parse/type error 或静默退出
+    println("  INFO: i32(10) + i64(1e12) probe below")
+    // 不能直接写 i32v + i64v（类型不匹配），改用 cast
+    val mixed_sum = cast(i32v).to(i64) + i64v
+    check(mixed_sum == 1000000000010i64, "cast i32->i64 then add i64")
+
+    // ─── 2. 跨类型比较（探测）───
+    println("--- Cross-type Comparison ---")
+    // i32 == i32
+    check(i32v == 10, "i32 == i32 literal")
+    // 探测：i32 == i64（是否允许）
+    println("  INFO: i32(10) == i64(10) probe below")
+    val cross_eq = cast(i32v).to(i64) == 10i64
+    check(cross_eq, "cast i32->i64 == i64 literal")
+    // f64 比较
+    check(f64v == 2.5f64, "f64 == f64 literal")
+    check(f64v < 3.0f64, "f64 < f64")
+    check(f64v > 2.0f64, "f64 > f64")
+    // 探测：i32 == f64（如 10 == 10.0）
+    println("  INFO: i32(10) == f64(10.0) probe below")
+    val num_eq = cast(i32v).to(f64) == 10.0f64
+    check(num_eq, "cast i32->f64 == f64 10.0")
+
+    // ─── 3. cast 链（往返转换）───
+    println("--- Cast Chains ---")
+    // i32 -> f64 -> i32（应可逆，值范围内）
+    val roundtrip = cast(cast(42i32).to(f64)).to(i32)
+    check(roundtrip == 42, "i32->f64->i32 roundtrip")
+    // char -> i32 -> char（应可逆）
+    val ch_roundtrip = cast(cast('A').to(i32)).to(char)
+    check(ch_roundtrip == 'A', "char->i32->char roundtrip")
+    // bool -> i32（true 应为 1，false 应为 0）— Bug #43 已修复
+    val bool_to_i = cast(true).to(i32)
+    println("  INFO: cast(true).to(i32) = {bool_to_i} (expect 1)")
+    check(bool_to_i == 1, "bool true -> i32 = 1")
+    val bool_false_i = cast(false).to(i32)
+    println("  INFO: cast(false).to(i32) = {bool_false_i} (expect 0)")
+    check(bool_false_i == 0, "bool false -> i32 = 0")
+    // i32 -> bool（非零应为 true）
+    val i_to_bool = cast(42i32).to(bool)
+    check(i_to_bool == true, "i32 42 -> bool = true")
+    val zero_to_bool = cast(0i32).to(bool)
+    check(zero_to_bool == false, "i32 0 -> bool = false")
+
+    // ─── 4. cast 截断与溢出（探测）───
+    println("--- Cast Truncation & Overflow ---")
+    // i64 -> i32 截断（大 i64 截断为 i32）
+    val big_i64: i64 = 4294967296i64  // 2^32
+    val truncated = cast(big_i64).to(i32)
+    println("  INFO: cast(4294967296i64).to(i32) = {truncated} (truncation, expect 0)")
+    check(truncated == 0, "i64 2^32 -> i32 truncated to 0")
+    // f64 -> i32 截断（小数截断）
+    val trunc_f = cast(3.99f64).to(i32)
+    check(trunc_f == 3, "f64 3.99 -> i32 = 3 (truncation)")
+    val trunc_neg = cast(-2.7f64).to(i32)
+    check(trunc_neg == -2, "f64 -2.7 -> i32 = -2 (truncation toward zero)")
+    // f64 -> i32 溢出（超大 f64）
+    val huge_f = 1e18f64  // Bug #20: 科学计数法可能解析错误，探测
+    println("  INFO: 1e18f64 literal = {huge_f} (Bug #20 if 1.0)")
+    val huge_cast = cast(huge_f).to(i32)
+    println("  INFO: cast(1e18).to(i32) = {huge_cast} (overflow, behavior unknown)")
+
+    // ─── 5. 运算符优先级 ───
+    println("--- Operator Precedence ---")
+    check(2 + 3 * 4 == 14, "2 + 3*4 = 14 (mult first)")
+    check((2 + 3) * 4 == 20, "(2+3)*4 = 20")
+    check(2 * 3 + 4 * 5 == 26, "2*3 + 4*5 = 26")
+    check(10 - 2 - 3 == 5, "10-2-3 = 5 (left assoc)")
+    check(100 / 10 / 2 == 5, "100/10/2 = 5 (left assoc)")
+    check(2 + 3 < 10, "2+3 < 10 (arith before compare)")
+    check(2 < 3 == true, "2 < 3 == true (compare before ==)")
+    // 一元负号
+    check(-3 + 5 == 2, "-3 + 5 = 2")
+    check(-(3 + 5) == -8, "-(3+5) = -8")
+    check(10 - -5 == 15, "10 - -5 = 15")
+
+    // ─── 6. 取模边界（非 Bug #22 的安全值）───
+    println("--- Modulo Edges ---")
+    check(7 % 3 == 1, "7 % 3 = 1")
+    check(6 % 3 == 0, "6 % 3 = 0")
+    check(0 % 5 == 0, "0 % 5 = 0")
+    // 负数取模（语言语义探测：结果符号跟随被除数还是除数）
+    val neg_mod = -7 % 3
+    println("  INFO: -7 % 3 = {neg_mod} (sign follows dividend = -1, divisor = 2)")
+    val neg_mod2 = 7 % -3
+    println("  INFO: 7 % -3 = {neg_mod2} (sign follows dividend = 1, divisor = -2)")
+    check(-6 % 3 == 0, "-6 % 3 = 0")
+    check(6 % -3 == 0, "6 % -3 = 0")
+    // 取模与除法关系
+    check((7 / 3) * 3 + (7 % 3) == 7, "(7/3)*3 + 7%3 == 7")
+
+    // ─── 7. 整数除法（截断方向）───
+    println("--- Integer Division ---")
+    check(7 / 2 == 3, "7 / 2 = 3 (truncation)")
+    check(-7 / 2 == -3, "-7 / 2 = -3 (truncation toward zero)")
+    check(7 / -2 == -3, "7 / -2 = -3 (truncation toward zero)")
+    check(-7 / -2 == 3, "-7 / -2 = 3")
+    check(0 / 5 == 0, "0 / 5 = 0")
+
+    // ─── 8. 字符串边界 ───
+    println("--- String Boundary ---")
+    val empty_s = ""
+    check(empty_s.len() == 0, "empty string len 0")
+    check(empty_s + empty_s == "", "empty + empty = empty")
+    check(empty_s + "x" == "x", "empty + 'x' = 'x'")
+    check("x" + empty_s == "x", "'x' + empty = 'x'")
+    val single = "A"
+    check(single.len() == 1, "single char string len 1")
+    check(single[0] == 'A', "single char [0] = 'A'")
+    // 字符串相等
+    check("hello" == "hello", "str == same str")
+    check("hello" != "world", "str != different str")
+    check("" == "", "empty str == empty str")
+    // 字符串拼接链
+    val chain = "a" + "b" + "c" + "d"
+    check(chain == "abcd", "4-str concat chain")
+    check(("a" + "b") + ("c" + "d") == "abcd", "grouped concat")
+
+    // ─── 9. nullable 嵌套（探测）───
+    println("--- Nullable Nesting ---")
+    val some: i32? = 42i32
+    val none: i32? = null
+    check(some == 42i32, "i32? some == 42")
+    check(none == null, "i32? none == null")
+    check(some != null, "i32? some != null")
+    check(none == null, "i32? none == null (repeat)")
+    // ?? 链
+    val chain1 = none ?? none ?? 99i32
+    check(chain1 == 99, "null ?? null ?? 99 = 99")
+    val chain2 = some ?? none ?? 99i32
+    check(chain2 == 42, "some ?? null ?? 99 = 42 (short-circuit)")
+    val chain3 = none ?? some ?? 99i32
+    check(chain3 == 42, "null ?? some ?? 99 = 42")
+    // nullable record（探测）
+    type Pt = Pt(x: i32, y: i32)
+    val pt_some: Pt? = Pt(1, 2)
+    val pt_none: Pt? = null
+    check(pt_some != null, "Pt? some != null")
+    check(pt_none == null, "Pt? none == null")
+    // nullable record ?? 默认
+    val pt_default = pt_none ?? Pt(0, 0)
+    check(pt_default == Pt(0, 0), "Pt? null ?? Pt(0,0)")
+
+    // ─── 10. 布尔运算组合 ───
+    println("--- Boolean Combinations ---")
+    check(true && true, "true && true")
+    check(!false, "!false")
+    check(true || false, "true || false")
+    check(!true == false, "!true == false")
+    // bool 比较
+    check(true == true, "true == true")
+    check(false == false, "false == false")
+    check(true != false, "true != false")
+    // bool 与字面量
+    val b1: bool = 5 > 3
+    val b2: bool = 2 > 8
+    check(b1 && !b2, "b1 && !b2")
+    check(b1 || b2, "b1 || b2")
+    check((b1 && b2) == false, "b1 && b2 == false")
+
+    // ─── 11. 大整数边界 ───
+    println("--- Large Integer Boundaries ---")
+    val i32_max: i32 = 2147483647
+    val i32_min: i32 = -2147483648
+    check(i32_max == 2147483647, "i32 MAX")
+    check(i32_min == -2147483648, "i32 MIN")
+    val i64_max: i64 = 9223372036854775807i64
+    check(i64_max == 9223372036854775807i64, "i64 MAX")
+    val u64_max: u64 = 18446744073709551615u64
+    check(u64_max == 18446744073709551615u64, "u64 MAX")
+    // u128 MAX（Bug #25：字面量无法表示，用 cast）
+    val u128_max = cast(-1i128).to(u128)
+    println("  INFO: cast(-1i128).to(u128) = {u128_max} (u128 MAX, Bug #25 workaround)")
+    // wrapping 加法（i32 MAX + 1 应回绕到 MIN）
+    val wrap_add = i32_max + 1
+    check(wrap_add == -2147483648, "i32 MAX + 1 wrapping to MIN")
+    val wrap_sub = i32_min - 1
+    check(wrap_sub == 2147483647, "i32 MIN - 1 wrapping to MAX")
+
+    // ─── 12. 字符串插值边界 ───
+    println("--- String Interpolation Edges ---")
+    val n: i32 = 42
+    val s: str = "world"
+    val f: f64 = 3.14f64
+    val b: bool = true
+    check("n={n}" == "n=42", "interp i32")
+    check("s={s}" == "s=world", "interp str")
+    check("f={f}" == "f=3.14", "interp f64")
+    check("b={b}" == "b=true", "interp bool")
+    // 空插值探测：`{}` 会被当作空表达式插值 → parse error，故不测试
+    // 多重插值
+    check("{n}-{s}-{f}" == "42-world-3.14", "multi interp")
+    // 嵌套表达式
+    check("sum={n + 8}" == "sum=50", "interp expr")
+    check("cmp={n > 40}" == "cmp=true", "interp bool expr")
+
+    // ─── 13. 数组边界 ───
+    println("--- Array Boundary ---")
+    val arr = [10, 20, 30]
+    check(arr.len() == 3, "array len 3")
+    check(arr[0] == 10, "arr[0]")
+    check(arr[2] == 30, "arr[2]")
+    // 空数组
+    val empty_arr: i32[] = []
+    check(empty_arr.len() == 0, "empty array len 0")
+    // 空数组 ++ 元素
+    val built = empty_arr ++ [1, 2, 3]
+    check(built.len() == 3, "empty ++ [1,2,3] len 3")
+    check(built[0] == 1, "built[0]")
+
+    // ─── 14. 类型推断边界 ───
+    println("--- Type Inference Edges ---")
+    // 推断 i32
+    val inferred_i = 10
+    check(inferred_i == 10, "inferred i32")
+    // 推断 f64
+    val inferred_f = 2.5f64
+    check(inferred_f == 2.5f64, "inferred f64")
+    // 推断 str
+    val inferred_s = "hi"
+    check(inferred_s == "hi", "inferred str")
+    // 推断 bool
+    val inferred_b = true
+    check(inferred_b == true, "inferred bool")
+    // 推断数组类型
+    val inferred_arr = [1, 2, 3]
+    check(inferred_arr.len() == 3, "inferred array")
+    check(inferred_arr[1] == 2, "inferred array [1]")
+
+    // ─── 15. 嵌套表达式求值 ───
+    println("--- Nested Expression Eval ---")
+    check((1 + 2) * (3 + 4) == 21, "grouped arith")
+    check(((1 + 2) * 3) + 4 == 13, "deeply nested")
+    // 函数调用在表达式中
+    check(addI64(10i64, 20i64) + 5i64 == 35i64, "fn call in expr")
+    check(isPos(5) && !isPos(-3), "fn call in bool expr")
+    // 三元式（if-as-expression 嵌套）
+    val grade = if n >= 90 { "A" } else if n >= 80 { "B" } else if n >= 70 { "C" } else { "F" }
+    check(grade == "F", "if-else chain (42 -> F)")
+
+    // ─── 16. 大胆：i8/u8 边界 ───
+    println("--- i8/u8 Boundaries ---")
+    val i8_max: i8 = 127i8
+    val i8_min: i8 = -128i8
+    check(i8_max == 127i8, "i8 MAX")
+    check(i8_min == -128i8, "i8 MIN")
+    val u8_max: u8 = 255u8
+    check(u8_max == 255u8, "u8 MAX")
+    val u8_zero: u8 = 0u8
+    check(u8_zero == 0u8, "u8 zero")
+    // i8 溢出回绕
+    val i8_wrap = i8_max + 1i8
+    check(i8_wrap == -128i8, "i8 MAX + 1 wrapping to MIN")
+    val u8_wrap = u8_max + 1u8
+    check(u8_wrap == 0u8, "u8 MAX + 1 wrapping to 0")
+
+    // ─── 17. 大胆：f64 特殊值运算 ───
+    println("--- f64 Special Value Arithmetic ---")
+    val pos_inf = 1.0f64 / 0.0f64
+    val neg_inf = -1.0f64 / 0.0f64
+    val nan_val = 0.0f64 / 0.0f64
+    println("  INFO: 1.0/0.0 = {pos_inf} (expect inf)")
+    println("  INFO: -1.0/0.0 = {neg_inf} (expect -inf)")
+    println("  INFO: 0.0/0.0 = {nan_val} (expect NaN)")
+    // inf 比较
+    check(pos_inf > 1.0f64, "inf > 1.0")
+    check(neg_inf < -1.0f64, "-inf < -1.0")
+    // NaN 比较（NaN != NaN）
+    check(nan_val != nan_val, "NaN != NaN (IEEE 754)")
+    check(!(nan_val == nan_val), "!(NaN == NaN)")
+
+    // ─── 18. 大胆：科学计数法字面量细化 Bug #20 ───
+    println("--- Scientific Notation Probe (Bug #20 refine) ---")
+    val e0: f64 = 1e0f64
+    val e1: f64 = 1e1f64
+    val e10: f64 = 1e10f64
+    val e18: f64 = 1e18f64
+    val e300: f64 = 1e300f64
+    val e_neg5: f64 = 1e-5f64
+    val e15_10: f64 = 1.5e10f64
+    println("  INFO: 1e0 = {e0} (expect 1.0)")
+    println("  INFO: 1e1 = {e1} (expect 10.0)")
+    println("  INFO: 1e10 = {e10} (expect 10000000000.0)")
+    println("  INFO: 1e18 = {e18} (expect 1e18)")
+    println("  INFO: 1e300 = {e300} (expect 1e300, Bug #20 if 1.0)")
+    println("  INFO: 1e-5 = {e_neg5} (expect 0.00001)")
+    println("  INFO: 1.5e10 = {e15_10} (expect 15000000000.0)")
+    check(e1 == 10.0f64, "1e1 = 10.0")
+    check(e10 == 10000000000.0f64, "1e10 parsed")
+    check(e300 != 1.0f64, "1e300 != 1.0 (Bug #20)")
+    check(e_neg5 == 0.00001f64, "1e-5 = 0.00001")
+    // 无后缀变体（原 Bug #20 复现路径）
+    val ns300: f64 = 1e300
+    val ns15_10: f64 = 1.5e10
+    println("  INFO: no-suffix 1e300 = {ns300} (Bug #20 repro path)")
+    println("  INFO: no-suffix 1.5e10 = {ns15_10} (Bug #20 repro path)")
+    check(ns300 != 1.0f64, "no-suffix 1e300 != 1.0 (Bug #20)")
+    check(ns15_10 == 15000000000.0f64, "no-suffix 1.5e10 = 15e9 (Bug #20)")
+
+    summary()
+}

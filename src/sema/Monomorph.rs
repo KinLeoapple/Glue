@@ -570,13 +570,16 @@ fn process_method_call<'a>(
         .insert(call_key, instance_id);
 
     // v3 阶段 1：记录方法分派元信息（最佳努力匹配，完整 trait 解析留待后续阶段）
+    // 键使用 module_expr_key（与 call_instantiations 一致），供 IR 查询 intrinsic
+    let dispatch_key = crate::sema::Sema::module_expr_key(module_name, call_expr.0 as u64);
     sema_result.method_dispatches.insert(
-        call_expr.0 as u64,
+        dispatch_key,
         DispatchInfo {
             trait_id: 0,
             method_idx: 0,
             impl_fn_idx: 0,
             instance_id,
+            intrinsic: None,
         },
     );
 }

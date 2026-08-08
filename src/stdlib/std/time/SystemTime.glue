@@ -108,7 +108,7 @@ pub fun to_utc_components(ns: i128): TimeComponents {
 // 仅 __localtime_offset_minutes 保留为 syscall（依赖 libc/kernel32）
 pub fun to_local_components(ns: i128): TimeComponents {
     val offset_min = __localtime_offset_minutes()
-    val offset_ns = cast(offset_min).to(i128) * cast(60_000_000_000).to(i128)
+    val offset_ns = cast(offset_min).to(i128) * cast(60_000_000_000i128).to(i128)
     to_utc_components(ns + offset_ns)
 }
 

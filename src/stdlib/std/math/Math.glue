@@ -381,7 +381,7 @@ fun leading_zeros_32_impl(x: u32): u32 {
     if x == 0 { return 32 }
     var c = 0
     var v = x
-    while v < 2147483648 {
+    while v < (1u32 << 31) {
         v = v << 1
         c = c + 1
     }
@@ -391,7 +391,7 @@ fun leading_zeros_64_impl(x: u64): u64 {
     if x == 0 { return 64 }
     var c = 0
     var v = x
-    while v < 9223372036854775808 {
+    while v < (1u64 << 63) {
         v = v << 1
         c = c + 1
     }
@@ -401,7 +401,7 @@ fun leading_zeros_128_impl(x: u128): u128 {
     if x == 0 { return 128 }
     var c = 0
     var v = x
-    while v < 170141183460469231731687303715884105728 {
+    while v < (1u128 << 127) {
         v = v << 1
         c = c + 1
     }

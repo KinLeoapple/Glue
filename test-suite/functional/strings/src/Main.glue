@@ -95,5 +95,79 @@ fun main(): void {
     check("d: {5 == 10}" == "d: false", "interp int == int with prefix")
     check("r: {true == false}" == "r: false", "interp bool == bool with prefix")
 
+    // ─── 字符串边缘测试 ───
+
+    // 4 字节 UTF-8（emoji，码点 > 0xFFFF）
+    val emoji = "😀"
+    check(emoji.len() == 1, "emoji length 1 (1 codepoint)")
+    val mixed_emoji = "a😀b"
+    check(mixed_emoji.len() == 3, "mixed ASCII+emoji length 3")
+    check(mixed_emoji[0] == 'a', "mixed emoji [0] = a")
+    check(mixed_emoji[1] == '😀', "mixed emoji [1] = 😀")
+    check(mixed_emoji[2] == 'b', "mixed emoji [2] = b")
+
+    // 多种 emoji 组合
+    val emojis = "🎉🎊🎈"
+    check(emojis.len() == 3, "3 emojis length 3")
+    check(emojis[0] == '🎉', "emoji [0] = 🎉")
+    check(emojis[2] == '🎈', "emoji [2] = 🎈")
+
+    // 混合脚本（ASCII + 拉丁 + CJK + emoji）
+    val mixed_script = "Hello世界🌍"
+    check(mixed_script.len() == 8, "mixed script length 8")
+    check(mixed_script[0] == 'H', "mixed script [0]")
+    check(mixed_script[5] == '世', "mixed script [5] = 世")
+    check(mixed_script[6] == '界', "mixed script [6] = 界")
+    check(mixed_script[7] == '🌍', "mixed script [7] = 🌍")
+
+    // 长字符串（迭代构建）
+    var long_str: str = ""
+    var si: i32 = 0
+    while si < 100 {
+        long_str = long_str + "x"
+        si = si + 1
+    }
+    check(long_str.len() == 100, "100-char string length")
+    check(long_str[0] == 'x', "100-char [0]")
+    check(long_str[99] == 'x', "100-char [99]")
+
+    // 长字符串拼接
+    var concat_long: str = ""
+    var ci: i32 = 0
+    while ci < 50 {
+        concat_long = concat_long + "ab"
+        ci = ci + 1
+    }
+    check(concat_long.len() == 100, "50x 'ab' = 100 chars")
+
+    // 插值中嵌入复杂表达式
+    val a_val: i32 = 10
+    val b_val: i32 = 20
+    check("{a_val + b_val}" == "30", "interp arithmetic expression")
+    check("{a_val * b_val + 5}" == "205", "interp complex arithmetic")
+    check("result: {a_val > 5}" == "result: true", "interp comparison")
+    check("{a_val == 10 && b_val == 20}" == "true", "interp logical and")
+
+    // 插值嵌套（插值中包含函数调用结果）
+    fun doubleIt(n: i32): i32 { n * 2 }
+    check("{doubleIt(21)}" == "42", "interp function call")
+
+    // 空字符串边缘
+    check("".len() == 0, "empty length")
+    check("" + "" == "", "empty + empty")
+    check("".len() + "".len() == 0, "empty lengths sum")
+
+    // 特殊字符组合（\t \n \\ \" = 4 chars）
+    val special = "\t\n\\\""
+    check(special.len() == 4, "special escapes length 4")
+    check(special[0] == '\t', "special [0] = tab")
+    check(special[1] == '\n', "special [1] = newline")
+
+    // 字符串比较边界
+    check("a" < "b", "string lexicographic less")
+    check("abc" < "abd", "string prefix comparison")
+    check("abc" < "abcd", "string shorter prefix less")
+    check("Z" < "a", "uppercase before lowercase (ASCII)")
+
     summary()
 }

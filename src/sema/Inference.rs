@@ -696,11 +696,18 @@ impl<'a> InferContext<'a> {
 
         // unify 构造器返回类型与期望类型，实现 GADT 类型精化
         // 失败时注册约束供不动点迭代重试
-        self.unify_or_constrain(ctor_return_ty, expected_ty);
+        let ctor_compatible = self.arena.unify(ctor_return_ty, expected_ty).is_ok();
+        if !ctor_compatible {
+            self.unify_or_constrain(ctor_return_ty, expected_ty);
+        }
 
         // 对子模式按构造器字段类型递归推断并绑定变量
+        // 当构造器返回类型与期望类型不兼容时（如 Error ADT 用于解包 Throw 的 error_type），
+        // 子模式绑定到 expected_ty 而非构造器字段类型，确保模式变量获得正确的运行时类型
         for (i, &sub_pat) in sub_patterns.iter().enumerate() {
-            let sub_ty = if i < field_type_reprs.len() {
+            let sub_ty = if !ctor_compatible {
+                expected_ty
+            } else if i < field_type_reprs.len() {
                 self.type_repr_to_handle(&field_type_reprs[i])
             } else {
                 self.arena.fresh_type_var()
@@ -807,13 +814,20 @@ impl<'a> InferContext<'a> {
             return self.arena.make_adt(name.into(), Box::new([]));
         }
         visiting.insert(name.to_string());
-        // 5. 别名穿透：type Name = str → 解析 str
-        let alias_target: Option<String> = self
+        // 5. 别名穿透：type Name = T → 解析 T
+        // 优先使用已解析的 target_type（TypeHandle），覆盖函数/Record/Array 等非命名目标；
+        // 退而使用 target_type_name（命名目标，如 type A = B）。
+        let (alias_target_ty, alias_target_name): (Option<TypeHandle>, Option<String>) = self
             .sema_result
             .get_type_def(name)
             .filter(|td| td.kind == TypeDefKind::Alias)
-            .and_then(|td| td.target_type_name.as_deref().map(String::from));
-        if let Some(target_name) = alias_target {
+            .map(|td| (td.target_type, td.target_type_name.as_deref().map(String::from)))
+            .unwrap_or((None, None));
+        if let Some(inner_ty) = alias_target_ty {
+            visiting.remove(name);
+            return inner_ty;
+        }
+        if let Some(target_name) = alias_target_name {
             let result = self.resolve_name_to_type(&target_name, type_param_map, visiting);
             visiting.remove(name);
             return result;
@@ -1669,6 +1683,13 @@ impl<'a> InferContext<'a> {
                         if let Ty::Nullable(_) = self.arena.get(rl) {
                             return self.arena.nullable_inner(rl);
                         }
+                        // Throw<T,E> ?? rhs → 返回 T（Ok 值类型），与 Nullable 对称（Bug #28）
+                        if let Ty::Throw(_) = self.arena.get(rl) {
+                            let value_ty = self.arena.throw_parts(rl).0;
+                            // unify rhs 到 value_ty，确保默认值类型兼容
+                            let _ = self.try_widen_unify(value_ty, right_ty);
+                            return value_ty;
+                        }
                         left_ty
                     }
                 }
@@ -1897,6 +1918,40 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
+                // 语言级 intrinsic 标记：await/recv 由 sema 统一识别，
+                // 注册到 method_dispatches 供 IR 消费（消除 IR 侧字符串守卫）。
+                // await 是通用挂起语义（对所有类型）；recv 仅对 Channel/Receiver 类型标记。
+                {
+                    let intrinsic = if *method == "await" && args.is_empty() {
+                        Some(crate::sema::Sema::IntrinsicKind::Await)
+                    } else if *method == "recv" && args.is_empty() {
+                        match self.arena.get(recv_resolved_0a) {
+                            Ty::Channel(_) | Ty::Receiver(_) => {
+                                Some(crate::sema::Sema::IntrinsicKind::ChannelAwait)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if intrinsic.is_some() {
+                        let key = crate::sema::Sema::module_expr_key(
+                            &self.current_module_name,
+                            expr.0 as u64,
+                        );
+                        self.sema_result.method_dispatches.insert(
+                            key,
+                            crate::sema::Sema::DispatchInfo {
+                                trait_id: 0,
+                                method_idx: 0,
+                                impl_fn_idx: 0,
+                                instance_id: 0,
+                                intrinsic,
+                            },
+                        );
+                    }
+                }
+
                 // 路径 1（优先）：类型感知的方法查找
                 // 通过 lookup_method_type 按接收者类型查 witness_table / func_sigs / 内置方法，
                 // 确保同名方法（如 Instant.add_duration 与 DateTime.add_duration）分派到正确签名。
@@ -2061,6 +2116,11 @@ impl<'a> InferContext<'a> {
                     let inner = self.arena.nullable_inner(rl);
                     let _ = self.try_widen_unify(inner, right_ty);
                     inner
+                } else if let Ty::Throw(_) = self.arena.get(rl) {
+                    // Throw<T,E> ?? rhs → 返回 T，与 Nullable 对称（Bug #28）
+                    let value_ty = self.arena.throw_parts(rl).0;
+                    let _ = self.try_widen_unify(value_ty, right_ty);
+                    value_ty
                 } else {
                     left_ty
                 }
@@ -4832,10 +4892,21 @@ impl FlowContext {
     /// 查询某路径的窄化类型：从栈顶向下查找。
     ///
     /// 内层 scope 的窄化覆盖外层（path-sensitive）。
+    ///
+    /// Bug #35: ConstructorMatch 的 fact 表示 scrutinee 变量被窄化为 ADT 类型。
+    /// 如果该 fact 的 bound_vars 包含 path，说明 path 已被模式变量遮蔽
+    /// （如 `match w { W3(w) => w * w }` 中模式变量 w 遮蔽参数 w）。
+    /// 此时 scrutinee 的窄化类型不适用于模式变量，应跳过此 fact，
+    /// 让 infer_expr 走 env 查询获取模式变量的正确字段类型。
     pub fn lookup_narrowed(&self, path: &str) -> Option<TypeHandle> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.lookup(path) {
-                return Some(ty);
+            if let Some(fact) = scope.lookup_fact(path) {
+                if let NarrowKind::ConstructorMatch { bound_vars, .. } = &fact.kind {
+                    if bound_vars.iter().any(|v| v.as_ref() == path) {
+                        continue;
+                    }
+                }
+                return Some(fact.narrowed_ty);
             }
         }
         None

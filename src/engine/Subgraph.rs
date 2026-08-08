@@ -70,6 +70,24 @@ impl<S: LockStrategy> Engine<S> {
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
         let same_function = parent_sg.function_id == child_sg.function_id;
 
+        if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+            let (cs, ce) = child_sg.node_range;
+            let child_sz = ce.0 - cs.0;
+            if child_sz <= 3 {
+                let nested: Vec<(u32, u32, u32)> = self.graph.subgraphs.iter()
+                    .filter(|sg| sg.id != subgraph_id
+                        && sg.node_range.0 .0 >= cs.0
+                        && sg.node_range.1 .0 <= ce.0)
+                    .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0, sg.id.0))
+                    .collect();
+                eprintln!("[START-SG] target_sg={} same_func={} child_range=[{},{}) parent_sg={} parent_range=[{},{}) nested_count={} nested={:?}",
+                    subgraph_id.0, same_function, cs.0, ce.0,
+                    parent_frame.subgraph_id.0,
+                    parent_sg.node_range.0 .0, parent_sg.node_range.1 .0,
+                    nested.len(), nested);
+            }
+        }
+
         if same_function {
             // 同函数分支：值表扩展到父帧大小，复制父帧值。
             // 使用父帧的 node_offset/value_table.len() 而非 parent_sg.node_range，
@@ -131,7 +149,13 @@ impl<S: LockStrategy> Engine<S> {
                     for &inp in inputs {
                         let il = inp.0.wrapping_sub(parent_start) as usize;
                         if il < parent_node_count {
-                            if !child.value_table.ready[il] { pending += 1; }
+                            let inp_gid = (parent_start as usize + il) as u32;
+                            let inp_in_branch = inp_gid >= branch_start.0 && inp_gid < child_sg.node_range.1 .0;
+                            // 分支内节点：未就绪则计入 pending
+                            // 外层变量/effect（!in_branch）：通过帧链穿透访问，不计 pending
+                            if inp_in_branch && !child.value_table.ready[il] {
+                                pending += 1;
+                            }
                         }
                         // 帧范围外（il >= parent_node_count 或下溢）→ 帧链穿透，不计 pending
                     }
@@ -169,24 +193,26 @@ impl<S: LockStrategy> Engine<S> {
                 child.set_value(lid, arg.clone(), cc);
                 child.push_ready(lid);
             }
-            // upvalue 参数：优先从父帧读取（引用捕获语义，使 same_function 调用
-            // 能看到外层变量的最新值），父帧无此值时回退到 args 中的 Cell 解包值
-            // （逃逸闭包场景：upvalue 来自已销毁的帧，如循环体局部变量）。
+            // upvalue 参数注入：从父帧读取最新值（引用捕获语义），使 same_function
+            // 调用能看到外层变量的最新值（而非闭包构造时的快照）。
+            // 递归闭包例外：self_upvalue_idx 对应的 slot 注入闭包自身引用，
+            // 而非父帧值（父帧中 self slot 是 void_const 占位）。
+            let self_upvalue_idx = closure_val.as_ref()
+                .and_then(|v| v.heap_obj())
+                .and_then(|h| match h {
+                    crate::value::HeapObj::Closure(c) => Some(c.self_upvalue_idx),
+                    crate::value::HeapObj::Partial(p) => Some(p.self_upvalue_idx),
+                    _ => None,
+                })
+                .unwrap_or(-1);
             for (i, &outer_node) in child_sg.upvalue_outer_nodes.iter().enumerate() {
                 let arg_idx = actual_param_count + i;
                 if arg_idx >= branch_param_count { break; }
                 let lid = NodeId((param_local_offset + arg_idx) as u32);
                 let gid = branch_start.0 as usize + arg_idx;
                 let cc = self.graph.downstreams[gid].len() as u16;
-                // 直接检查父帧是否就绪：get_value_by_global 在 pending_inputs=0
-                // 且未就绪时会返回未初始化的值表内容（非 NULL），不能用 is_null 判断。
-                let parent_local = outer_node.0.wrapping_sub(parent_frame.node_offset);
-                let parent_ready = (parent_local as usize) < parent_frame.value_table.len()
-                    && parent_frame.value_table.ready[parent_local as usize];
-                let val = if parent_ready {
-                    parent_frame.get_value_by_global(outer_node)
-                } else if arg_idx < args.len() {
-                    args[arg_idx].clone()
+                let val = if self_upvalue_idx >= 0 && i == self_upvalue_idx as usize {
+                    closure_val.clone().unwrap_or_else(|| parent_frame.get_value_by_global(outer_node))
                 } else {
                     parent_frame.get_value_by_global(outer_node)
                 };
@@ -301,7 +327,8 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
-        // 非 LoopBody：回写返回值 + 唤醒 caller（含 pending_completions 竞态处理）
+        // 非 LoopBody：回写返回值 + 唵醒 caller（含 pending_completions 竞态处理）
+        let child_sg_id = child_frame.subgraph_id;
         let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
         let child_signal = child_frame.control_signal.clone();
         let caller = child_frame.caller;
@@ -335,11 +362,40 @@ impl<S: LockStrategy> Engine<S> {
                 caller_frame.suspend_state = SuspendState::NotSuspended;
                 caller_frame.suspend_event = None;
 
-                // Gate 分支子图的控制信号传播
-                let is_gate =
-                    self.graph.nodes[call_graph_id.0 as usize].kind == crate::ir::Ir::NodeKind::Gate;
-                if is_gate && !matches!(child_signal, ControlSignal::None) {
-                    caller_frame.control_signal = child_signal;
+                // 控制信号传播：子帧的 throw/return/break/continue 信号传播给调用方帧。
+                // 仅在同函数内传播（Gate 分支子图、循环子图）：
+                // - if-else/match arm（Gate 节点）内 throw/return/break/continue → 传播给父帧
+                //   （break/continue 需穿透到 LoopBody 帧，否则循环体内的 if-break 无效）
+                // - while/loop/for（循环帧）内 throw/return → 传播给函数帧
+                // 不传播的情况：
+                // - 跨函数调用：函数帧的 Return 信号是函数级返回，返回值已通过
+                //   extract_child_return 提取，传播会导致调用方帧错误提前退出
+                // - Lambda/嵌套函数调用（Call 节点 + loop_kind==None + 同 function_id）：
+                //   虽然与调用方共享 function_id（为帧链穿透），但它是独立函数调用，
+                //   返回值已提取，传播 Return 会导致调用方帧错误退出（静默退出 bug）
+                // - 循环帧的 Break/Continue：已被循环消费，传播会导致函数错误退出
+                let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
+                let is_gate = self.graph.nodes[call_graph_id.0 as usize].kind
+                    == crate::ir::Ir::NodeKind::Gate;
+                let should_propagate = match child_signal {
+                    ControlSignal::Return(_) => {
+                        // Return：Gate 分支 + 循环帧传播；Lambda/函数调用不传播
+                        is_gate || child_loop_kind != crate::ir::Ir::LoopKind::None
+                    }
+                    ControlSignal::Break | ControlSignal::Continue => {
+                        // Break/Continue：仅 Gate 分支传播（穿透到 LoopBody）
+                        // 循环帧的 Break/Continue 已被循环消费
+                        is_gate
+                    }
+                    ControlSignal::None => false,
+                };
+                if should_propagate {
+                    let child_fn_id = self.graph.subgraphs[child_sg_id.0 as usize].function_id;
+                    let caller_fn_id =
+                        self.graph.subgraphs[caller_frame.subgraph_id.0 as usize].function_id;
+                    if child_fn_id == caller_fn_id {
+                        caller_frame.control_signal = child_signal;
+                    }
                 }
 
                 notify_downstream(

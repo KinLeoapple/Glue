@@ -70,13 +70,13 @@ pub fun from_nanos(ns: i64): Duration {
 }
 
 pub fun from_mins(m: i64): Duration {
-    Duration(cast(m).to(i128) * 60_000_000_000)
+    Duration(cast(m).to(i128) * 60_000_000_000i128)
 }
 
 pub fun from_hours(h: i64): Duration {
-    Duration(cast(h).to(i128) * 3_600_000_000_000)
+    Duration(cast(h).to(i128) * 3_600_000_000_000i128)
 }
 
 pub fun from_days(d: i64): Duration {
-    Duration(cast(d).to(i128) * 86_400_000_000_000)
+    Duration(cast(d).to(i128) * 86_400_000_000_000i128)
 }

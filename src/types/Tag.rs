@@ -199,6 +199,8 @@ pub enum TypeFamily {
     Sender,
     /// Receiver<T>
     Receiver,
+    /// Timer（事件源分派用，用户自定义类型但事件源语义内置）
+    Timer,
 
     // ── 复合 ──
     Array, Ref, Fn, Nullable, Trait,

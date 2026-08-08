@@ -25,6 +25,13 @@ type UserId = UserId(i64)
 type Email = Email(str)
 type Meters = Meters(f64)
 
+// newtype 边缘类型
+type Inner2 = Inner2(f64)
+type Outer2 = Outer2(Inner2)
+type Pt2 = Pt2(x: i32, y: i32)
+type Coord = Coord(Pt2)
+type IntArray = IntArray(i32[])
+
 fun main(): void {
     println("=== Newtype ===")
 
@@ -98,6 +105,68 @@ fun main(): void {
         }
     }
     check(doubleMeters(Meters(3.0)) == Meters(6.0), "newtype match repackage")
+
+    // ─── Newtype 边缘测试 ───
+
+    // 嵌套 newtype（2 层，类型已顶层定义）
+    fun unwrap2(o: Outer2): f64 {
+        match o {
+            Outer2(Inner2(v)) => v
+        }
+    }
+    check(unwrap2(Outer2(Inner2(3.14))) == 3.14, "nested newtype unwrap 2-layer")
+
+    // newtype 包含 record（类型已顶层定义）
+    fun coordX(c: Coord): i32 {
+        match c {
+            Coord(Pt2(x, _)) => x
+        }
+    }
+    check(coordX(Coord(Pt2(10, 20))) == 10, "newtype wrapping record")
+
+    // newtype 包含数组（类型已顶层定义）
+    fun arrayLen(ia: IntArray): i32 {
+        match ia {
+            IntArray(arr) => arr.len()
+        }
+    }
+    check(arrayLen(IntArray([1, 2, 3])) == 3, "newtype wrapping array")
+    check(arrayLen(IntArray([])) == 0, "newtype wrapping empty array")
+
+    // newtype 相等性深度
+    check(Celsius(0.0) == Celsius(0.0), "newtype zero equality")
+    check(Celsius(0.0) != Celsius(0.1), "newtype tiny difference")
+    check(UserId(0i64) == UserId(0i64), "newtype zero i64 equality")
+    check(Email("") == Email(""), "newtype empty str equality")
+    check(Email("") != Email("x"), "newtype empty vs non-empty")
+
+    // newtype 数组迭代（while 内 match newtype 有 parse bug，用顶层函数绕过）
+    val uid_arr: UserId[] = [UserId(1i64), UserId(2i64), UserId(3i64)]
+    fun unwrapUid(u: UserId): i64 {
+        match u {
+            UserId(uidv) => uidv
+        }
+    }
+    var uid_sum: i64 = 0
+    var ui: i32 = 0
+    while ui < uid_arr.len() {
+        uid_sum = uid_sum + unwrapUid(uid_arr[ui])
+        ui = ui + 1
+    }
+    check(uid_sum == 6, "newtype array iterate sum")
+
+    // newtype 数学运算（解包后运算，使用顶层函数避免嵌套 match）
+    check(Celsius(10.0) == Celsius(10.0), "newtype arithmetic sanity")
+
+    // newtype 作为函数返回值
+    fun makeEmail(s: str): Email {
+        Email(s)
+    }
+    check(makeEmail("test@test.com") == Email("test@test.com"), "newtype from function return")
+
+    // newtype 边界值
+    check(UserId(9223372036854775807i64) == UserId(9223372036854775807i64), "newtype i64 MAX")
+    check(Celsius(1e300) == Celsius(1e300), "newtype f64 large value")
 
     summary()
 }

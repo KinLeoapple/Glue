@@ -47,6 +47,8 @@ pub enum Ty {
     Sender(DetailId),
     /// Receiver<T>（arena 存 { elem: TypeHandle }）
     Receiver(DetailId),
+    /// Timer（事件源分派用，用户自定义类型但事件源语义内置）
+    Timer(DetailId),
 
     // ── Basic: 4 个复合类型（DetailId 索引 arena 中的结构详情）──
     /// 数组 [T; N]（arena 存 { elem: TypeHandle, size: Option<u64> }）
@@ -113,6 +115,7 @@ impl Ty {
             Ty::Atomic(_) => TypeFamily::Atomic,
             Ty::Sender(_) => TypeFamily::Sender,
             Ty::Receiver(_) => TypeFamily::Receiver,
+            Ty::Timer(_) => TypeFamily::Timer,
             Ty::Array(_) => TypeFamily::Array,
             Ty::Ref(_) => TypeFamily::Ref,
             Ty::Fn(_) => TypeFamily::Fn,
@@ -239,6 +242,7 @@ impl Ty {
             Ty::Atomic(_) => "Atomic",
             Ty::Sender(_) => "Sender",
             Ty::Receiver(_) => "Receiver",
+            Ty::Timer(_) => "Timer",
             Ty::Array(_) => "array",
             Ty::Ref(_) => "ref",
             Ty::Fn(_) => "fn",
@@ -280,7 +284,7 @@ impl Ty {
     pub fn has_detail(&self) -> bool {
         matches!(self,
             Ty::Throw(_) | Ty::Channel(_) | Ty::Async(_) | Ty::Lazy(_)
-            | Ty::Atomic(_) | Ty::Sender(_) | Ty::Receiver(_)
+            | Ty::Atomic(_) | Ty::Sender(_) | Ty::Receiver(_) | Ty::Timer(_)
             | Ty::Array(_) | Ty::Ref(_) | Ty::Fn(_) | Ty::Nullable(_)
             | Ty::Adt(_) | Ty::Record(_) | Ty::Trait(_)
             | Ty::TraitObject(_) | Ty::ModuleRef(_) | Ty::Generic(_))
@@ -305,6 +309,7 @@ impl Ty {
             "Atomic" => Ty::Atomic(placeholder),
             "Sender" => Ty::Sender(placeholder),
             "Receiver" => Ty::Receiver(placeholder),
+            "Timer" => Ty::Timer(placeholder),
             _ => return None,
         })
     }

@@ -273,6 +273,11 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
         .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
         .collect();
 
+    if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+        eprintln!("[PREPARE] sg={} node_range=[{},{}) nested={:?}",
+            sg_id.0, node_start.0, node_end_global, nested_ranges);
+    }
+
     let is_nested = |global_idx: u32| -> bool {
         nested_ranges.iter().any(|&(s, e)| global_idx >= s && global_idx < e)
     };
@@ -319,6 +324,11 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
                 let consumer_count = graph.downstreams[offset + i].len() as u16;
                 frame.set_value(local_id, handle, consumer_count);
                 frame.push_ready(local_id);
+            } else if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+                let gid = NodeId((offset + i) as u32);
+                let n = graph.nodes[offset + i];
+                eprintln!("[WARN] sg={} Const node={} cf={} has NO const_values! inputs_count={}",
+                    sg_id.0, gid.0, n.compute_fn.0, n.input_count);
             }
         }
     }
@@ -439,7 +449,27 @@ impl<S: LockStrategy> Engine<S> {
             // 弹出就绪节点（局部 id）
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
-                None => break,
+                None => {
+                    if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+                        let sg_id = frame.subgraph_id;
+                        let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
+                        let ncnt = (ne.0 - ns.0) as usize;
+                        eprintln!("[STALL] frame={} sg={} node_range=[{},{}) control={:?} pending={:?}",
+                            fid.0, sg_id.0, ns.0, ne.0, frame.control_signal, frame.pending.is_some());
+                        for i in 0..ncnt {
+                            let gid = NodeId(i as u32 + ns.0);
+                            let n = &graph.nodes[gid.0 as usize];
+                            let ready = frame.value_table.ready.get(i).copied().unwrap_or(false);
+                            let pi = frame.pending_inputs[i];
+                            if pi != PENDING_EXTERNAL || !ready {
+                                let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
+                                eprintln!("  node={} kind={:?} cf={} ready={} pending={} inputs={:?}",
+                                    gid.0, n.kind, n.compute_fn.0, ready, pi, inputs);
+                            }
+                        }
+                    }
+                    break;
+                }
             };
 
             let node_start = frame.node_offset;
@@ -530,7 +560,8 @@ impl<S: LockStrategy> Engine<S> {
                                             .kind
                                             == NodeKind::Gate;
                                         caller_is_gate
-                                            && caller_loop_kind != crate::ir::Ir::LoopKind::LoopBody
+                                            && caller_loop_kind
+                                                != crate::ir::Ir::LoopKind::LoopBody
                                             && caller_has_caller
                                     } else {
                                         false
@@ -856,6 +887,13 @@ impl<S: LockStrategy> Engine<S> {
                 break;
             }
 
+            // compute_propagate 等直接设 control_signal 的 compute_fn：
+            // 检查是否被设为非 None（compute_propagate 在 Err 时设 Return）
+            // 与同步路径（Compute.rs:2955-2960）保持一致，跳过 notify_downstream
+            if !matches!(frame.control_signal, ControlSignal::None) {
+                break;
+            }
+
             // 通知下游（含槽级 RC）
             notify_downstream(frame, &graph, local_id, graph_node_id, NodeId(node_start));
         }
@@ -872,7 +910,7 @@ impl<S: LockStrategy> Engine<S> {
                 graph.subgraphs[sg_id.0 as usize].defer_table.clone()
             };
             for entry in defer_entries.iter().rev() {
-                let defer_fid = self.init_frame(entry.body_subgraph);
+                let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
                 let mut defer_frame = self.frames.lock().remove(&defer_fid);
                 if let Some(df) = defer_frame.as_deref_mut() {
                     self.run_frame_nodes(df, defer_fid, queue);
@@ -893,7 +931,7 @@ impl<S: LockStrategy> Engine<S> {
             graph.subgraphs[sg_id.0 as usize].defer_table.clone()
         };
         for entry in defer_entries.iter().rev() {
-            let defer_fid = self.init_frame(entry.body_subgraph);
+            let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
             let mut defer_frame = self.frames.lock().remove(&defer_fid);
             if let Some(df) = defer_frame.as_deref_mut() {
                 self.run_frame_nodes(df, defer_fid, queue);
