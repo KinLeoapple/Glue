@@ -113,6 +113,47 @@ impl Num for f64 {
     fn to_u32(self) -> u32 { self as u32 }
 }
 
+// F16 实现 Num：委托到精确 IEEE 754 binary16 运算（不经 f64 中转）
+impl Num for F16 {
+    fn checked_add(self, other: Self) -> Option<Self> { Some(self + other) }
+    fn checked_sub(self, other: Self) -> Option<Self> { Some(self - other) }
+    fn checked_mul(self, other: Self) -> Option<Self> { Some(self * other) }
+    fn checked_div(self, other: Self) -> Option<Self> { Some(self / other) }
+    fn checked_rem(self, other: Self) -> Option<Self> { Some(self % other) }
+    fn neg(self) -> Option<Self> { Some(-self) }
+    fn zero() -> Self { F16(0) }
+    fn wrapping_add(self, other: Self) -> Self { self + other }
+    fn wrapping_sub(self, other: Self) -> Self { self - other }
+    fn wrapping_mul(self, other: Self) -> Self { self * other }
+    fn wrapping_neg(self) -> Self { -self }
+    fn abs(self) -> Self {
+        // 清除符号位
+        F16(self.0 & 0x7FFF)
+    }
+    fn to_u32(self) -> u32 { self.to_f32() as u32 }
+}
+
+// F128 实现 Num：委托到精确 IEEE 754 binary128 运算（不经 f64 中转）
+impl Num for F128 {
+    fn checked_add(self, other: Self) -> Option<Self> { Some(self + other) }
+    fn checked_sub(self, other: Self) -> Option<Self> { Some(self - other) }
+    fn checked_mul(self, other: Self) -> Option<Self> { Some(self * other) }
+    fn checked_div(self, other: Self) -> Option<Self> { Some(self / other) }
+    fn checked_rem(self, other: Self) -> Option<Self> { Some(self % other) }
+    fn neg(self) -> Option<Self> { Some(-self) }
+    fn zero() -> Self { F128::from_f64(0.0) }
+    fn wrapping_add(self, other: Self) -> Self { self + other }
+    fn wrapping_sub(self, other: Self) -> Self { self - other }
+    fn wrapping_mul(self, other: Self) -> Self { self * other }
+    fn wrapping_neg(self) -> Self { -self }
+    fn abs(self) -> Self {
+        // 清除符号位（bit 127）
+        let bits = u128::from_le_bytes(self.0) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        F128(bits.to_le_bytes())
+    }
+    fn to_u32(self) -> u32 { self.to_f64() as u32 }
+}
+
 /// 位运算 trait
 pub trait BitOps: Sized + Copy {
     fn bit_and(self, other: Self) -> Self;
@@ -317,9 +358,15 @@ pub fn parse_str(s: &str, dst_tag: ValueTag) -> Result<Vec<u8>, ParseError> {
             write_u16_le(f16.0, &mut result);
         }
         ValueTag::F128 => {
-            let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
-            let f128 = F128::from_f64(v);
-            result.copy_from_slice(&f128.0);
+            // 运行时字符串→f128：不经 f64 中转，直接解析为 binary128（与编译期字面量一致）
+            // 优先用精确十进制解析；失败时（如 "inf"/"nan"）回退 f64 路径
+            if let Some(bits) = crate::ir::Builder::parse_decimal_f128(trimmed) {
+                result.copy_from_slice(&bits);
+            } else {
+                let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
+                let f128 = F128::from_f64(v);
+                result.copy_from_slice(&f128.0);
+            }
         }
         _ => return Err(ParseError::ParseFailed(format!("unsupported tag: {:?}", dst_tag))),
     }
@@ -611,6 +658,16 @@ fn cast_int_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: 
 }
 
 fn cast_int_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
+    // F128 目标：整数经 as f64 对 >2^53 的值会丢精度，改用 from_i128/from_u128 精确构造
+    if dst_tag == ValueTag::F128 {
+        let f = if src_tag.is_signed() {
+            F128::from_i128(read_int_as_i128(src_tag, src_bytes))
+        } else {
+            F128::from_u128(read_int_as_u128(src_tag, src_bytes))
+        };
+        write_f128(f, dst);
+        return;
+    }
     let val = if src_tag.is_signed() {
         read_int_as_i128(src_tag, src_bytes) as f64
     } else {
@@ -791,8 +848,11 @@ fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => a.checked_div(b).expect("division by zero"),
-        BinOp::Mod => a.checked_rem(b).expect("division by zero"),
+        // 除零语义与标量 arith_div/arith_mod 一致：
+        //   - 整数 checked_div/checked_rem 在除零时返回 None → unwrap_or(zero) 返回 0
+        //   - 浮点 checked_div/checked_rem 恒返回 Some（除零产生 inf/nan）→ unwrap_or 不触发
+        BinOp::Div => a.checked_div(b).unwrap_or(T::zero()),
+        BinOp::Mod => a.checked_rem(b).unwrap_or(T::zero()),
         BinOp::Band => a.bit_and(b),
         BinOp::Bor => a.bit_or(b),
         BinOp::Bxor => a.bit_xor(b),

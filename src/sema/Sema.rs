@@ -1038,15 +1038,8 @@ fn type_handle_name_matches(arena: &TypeArena, h: TypeHandle, name: &str) -> boo
         Ty::Adt(_) => arena.adt_parts(h).0 == name,
         Ty::Generic(_) => arena.generic_parts(h).0 == name,
         Ty::Trait(_) => arena.trait_parts(h).0 == name,
-        // 内置泛型专用变体：通过 family 名匹配（type_args 绑定通常不涉及内置泛型，
-        // 此分支仅作健壮性兜底）
-        Ty::Throw(_) => name == "Throw",
-        Ty::Channel(_) => name == "Channel",
-        Ty::Async(_) => name == "Async",
-        Ty::Lazy(_) => name == "Lazy",
-        Ty::Atomic(_) => name == "Atomic",
-        Ty::Sender(_) => name == "Sender",
-        Ty::Receiver(_) => name == "Receiver",
+        // 其余类型（含内置泛型 Throw/Channel/Async/Lazy/Atomic/Sender/Receiver/Timer
+        // 及标量/str/void 等）统一走 ty.name()，单一真相源
         ty => ty.name() == name,
     }
 }
@@ -1117,7 +1110,7 @@ fn resolve_named_type_resolved(
 
 /// 解析 TypeNode 为 TypeHandle（resolved 版本，含 alias/newtype 链展开）。
 ///
-/// 与 `resolve_type_node_to_handle` 的差异：Named 分支查询 `sema_result.type_defs`，
+/// 与 `concretize_type` 的差异：Named 分支查询 `sema_result.type_defs`，
 /// 若为 alias/newtype 且 target_type 已知，递归解析到具体标量类型。
 /// 用于需要穿透 alias 链获取最终标量通道类型的场景（如 field_value 标量单态化）。
 pub fn resolve_type_node_resolved<'a>(
@@ -1134,7 +1127,8 @@ pub fn resolve_type_node_resolved<'a>(
         TypeNode::Named { name } => resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting),
         TypeNode::Generic { name, args } => {
             // Lazy<T>：递归解析内部类型
-            if *name == "Lazy" && !args.is_empty() {
+            if Ty::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Lazy)
+                && !args.is_empty() {
                 if let Some(inner_ty) =
                     resolve_type_node_resolved(arena, Some(args[0]), type_args, ast, sema_result)
                 {
@@ -1424,7 +1418,7 @@ fn ast_fun_decl_to_func_sig<'a>(
 
 /// 从 AST MethodDecl 构造 MethodSigInfo（不注册到 func_sigs）。
 ///
-/// 复用 `resolve_param_type` / `resolve_type_node_to_handle` 进行类型解析，
+/// 复用 `resolve_param_type` / `concretize_type` 进行类型解析，
 /// 产出按 method_idx 索引的方法签名，存入 TypeDefInfo.methods。
 fn build_method_sig_info<'a>(
     arena: &mut TypeArena,
@@ -1443,7 +1437,8 @@ fn build_method_sig_info<'a>(
 
     let (_, return_type_repr, is_throwing) = match method.return_type {
         Some(rt) => {
-            let _ = resolve_type_node_to_handle(arena, rt, &[], ast, sema_result);
+            // return type 的自包含表示（TypeRepr）由 type_node_to_repr 直接从 AST 构造，
+            // 不需要在此解析为 TypeHandle（旧 concretize_type 调用结果被丢弃，无副作用，已移除）。
             let repr = type_node_to_repr(&ast.ty(rt).node, ast);
             ((), Some(repr), is_throw_type(&ast.ty(rt).node))
         }
@@ -1515,7 +1510,7 @@ fn ast_fun_decl_to_func_sig_inner<'a>(
     // return_type + is_throwing
     let (return_ty, is_throwing) = match return_type {
         Some(rt) => {
-            let ty = resolve_type_node_to_handle(arena, rt, &[], ast, sema_result);
+            let ty = concretize_type(arena, rt, &[], ast, sema_result);
             (ty, is_throw_type(&ast.ty(rt).node))
         }
         None => (arena.make(Ty::Void), false),
@@ -1554,7 +1549,7 @@ pub(crate) fn ast_trait_decl_to_trait_def<'a>(
         .iter()
         .map(|m| {
             let return_type = match m.return_type {
-                Some(rt) => resolve_type_node_to_handle(arena, rt, &[], ast, sema_result),
+                Some(rt) => concretize_type(arena, rt, &[], ast, sema_result),
                 None => arena.make(Ty::Void),
             };
             TraitMethodSig {
@@ -1600,7 +1595,7 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
             (TypeDefKind::Record, vec![ctor], None, None)
         }
         AstTypeDef::Alias { target } => {
-            let target_ty = resolve_type_node_to_handle(arena, *target, &[], ast, sema_result);
+            let target_ty = concretize_type(arena, *target, &[], ast, sema_result);
             let target_name = type_name_from_node(Some(*target), ast);
             (
                 TypeDefKind::Alias,
@@ -1610,7 +1605,7 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
             )
         }
         AstTypeDef::Newtype { name: nt_name, inner } => {
-            let target_ty = resolve_type_node_to_handle(arena, *inner, &[], ast, sema_result);
+            let target_ty = concretize_type(arena, *inner, &[], ast, sema_result);
             let target_name = type_name_from_node(Some(*inner), ast);
             let target_repr = type_node_to_repr(&ast.ty(*inner).node, ast);
             let ctor = CtorDefInfo {
@@ -1658,7 +1653,7 @@ fn resolve_param_type<'a>(
         Some(tr) => {
             let node = &ast.ty(tr).node;
             let is_ref = matches!(node, TypeNode::RefType { .. });
-            let ty = resolve_type_node_to_handle(arena, tr, &[], ast, sema_result);
+            let ty = concretize_type(arena, tr, &[], ast, sema_result);
             let name = type_name_from_node(Some(tr), ast).map(|n| n.into());
             let repr = type_node_to_repr(node, ast);
             (ty, is_ref, name, repr)
@@ -1672,28 +1667,30 @@ fn resolve_param_type<'a>(
     }
 }
 
-/// 将 TypeNode 解析为 TypeHandle（直接从 AST 构造 arena 类型）。
-pub(crate) fn resolve_type_node_to_handle<'a>(
+/// 单一类型具体化入口（registration 阶段）：将 AST TypeNode 解析为 TypeHandle。
+///
+/// 统一 registration 阶段的类型解析，结构保留（make_ref/make_array/make_nullable/
+/// make_fn/make_record）+ Named 别名/newtype 链展开（含循环检测与深度上限）。
+///
+/// 与 `resolve_type_node_resolved` 的差异：后者为标量通道宽度计算专用，将
+/// Ref/Array 投影为 Adt(name)；本函数保留结构，是通用类型具体化入口。
+/// 推断阶段（含 type_binding_stack/self_binding_stack 上下文）使用 InferContext
+/// 的 `type_from_ast_with_params`，其上下文无法由本自由函数提供，故为独立阶段入口。
+pub(crate) fn concretize_type<'a>(
     arena: &mut TypeArena,
     type_ref: AstTypeRef,
     type_args: &[TypeHandle],
     ast: &AstArena<'a>,
-    _sema_result: &mut SemaResult,
+    sema_result: &mut SemaResult,
 ) -> TypeHandle {
     let tn = &ast.ty(type_ref).node;
     match tn {
         TypeNode::Named { name } => {
-            // Check type_args binding first (generic type parameter)
-            for &ta in type_args {
-                if arena.get(ta).name() == *name {
-                    return ta;
-                }
-            }
-            if let Some(ty) = Ty::from_type_name(name) {
-                arena.make(ty)
-            } else {
-                arena.make_adt((*name).into(), Box::new([]))
-            }
+            // 委托 resolve_named_type_resolved：type_args 绑定 → 内置标量 →
+            // alias/newtype 链展开（visiting 循环检测 + MAX_TYPE_RECURSION_DEPTH 深度上限）
+            // → 用户自定义 Adt。消除旧 Named 分支仅 Ty::from_type_name/make_adt 的精度缺失。
+            let mut visiting = FxHashSet::default();
+            resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting)
         }
         TypeNode::Generic { name, .. } => {
             if let Some(ty) = Ty::from_type_name(name) {
@@ -1703,15 +1700,15 @@ pub(crate) fn resolve_type_node_to_handle<'a>(
             }
         }
         TypeNode::Nullable { inner } => {
-            let inner = resolve_type_node_to_handle(arena, *inner, type_args, ast, _sema_result);
+            let inner = concretize_type(arena, *inner, type_args, ast, sema_result);
             arena.make_nullable(inner)
         }
         TypeNode::RefType { inner } => {
-            let inner = resolve_type_node_to_handle(arena, *inner, type_args, ast, _sema_result);
+            let inner = concretize_type(arena, *inner, type_args, ast, sema_result);
             arena.make_ref(inner, false)
         }
         TypeNode::RawPtr { inner } => {
-            let inner = resolve_type_node_to_handle(arena, *inner, type_args, ast, _sema_result);
+            let inner = concretize_type(arena, *inner, type_args, ast, sema_result);
             arena.make_ref(inner, true)
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
@@ -1720,7 +1717,7 @@ pub(crate) fn resolve_type_node_to_handle<'a>(
             arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
         }
         TypeNode::Array { element_type, size } => {
-            let elem = resolve_type_node_to_handle(arena, *element_type, type_args, ast, _sema_result);
+            let elem = concretize_type(arena, *element_type, type_args, ast, sema_result);
             arena.make_array(elem, *size)
         }
         TypeNode::SelfType => {
@@ -1732,7 +1729,7 @@ pub(crate) fn resolve_type_node_to_handle<'a>(
             arena.make_adt("Self".into(), Box::new([]))
         }
         TypeNode::KindAnnotated { inner, .. } => {
-            resolve_type_node_to_handle(arena, *inner, type_args, ast, _sema_result)
+            concretize_type(arena, *inner, type_args, ast, sema_result)
         }
     }
 }
@@ -1741,7 +1738,8 @@ pub(crate) fn resolve_type_node_to_handle<'a>(
 ///
 /// Throw 在 TypeNode 中表示为 `Generic { name: "Throw", args: [V, E] }`。
 fn is_throw_type(tn: &TypeNode) -> bool {
-    matches!(tn, TypeNode::Generic { name, .. } if *name == "Throw")
+    matches!(tn, TypeNode::Generic { name, .. }
+        if Ty::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Throw))
 }
 
 /// 将 AST TypeNode 递归转换为自包含的 TypeRepr（不依赖 AstArena 引用）。
@@ -1805,7 +1803,7 @@ fn constructor_def_to_ctor_info<'a>(
 
     for f in &c.fields {
         field_names.push(f.name.map(|n| n.into()));
-        let ty = resolve_type_node_to_handle(arena, f.ty, &[], ast, sema_result);
+        let ty = concretize_type(arena, f.ty, &[], ast, sema_result);
         field_types.push(ty);
         field_type_reprs.push(type_node_to_repr(&ast.ty(f.ty).node, ast));
     }
@@ -1836,7 +1834,7 @@ fn record_fields_to_ctor_info<'a>(
 
     for f in fields {
         field_names.push(Some(f.name.into()));
-        let ty = resolve_type_node_to_handle(arena, f.ty, &[], ast, sema_result);
+        let ty = concretize_type(arena, f.ty, &[], ast, sema_result);
         field_types.push(ty);
         field_type_reprs.push(type_node_to_repr(&ast.ty(f.ty).node, ast));
     }

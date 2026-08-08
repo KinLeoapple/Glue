@@ -146,7 +146,13 @@ fn infer_type_args<'a>(
             let mut args = Vec::with_capacity(hints.len());
             for &tn in hints {
                 let h = resolve_type_node_resolved(arena, Some(tn), &[], ctx.ast, sema_result)
-                    .unwrap_or_else(|| arena.make_adt("type_arg".into(), Box::new([])));
+                    .unwrap_or_else(|| {
+                        sema_result.add_error(SemaError::new(
+                            &format!("failed to resolve type argument in {}", func_name),
+                            0, 0,
+                        ));
+                        arena.make(crate::types::Ty::Unknown)
+                    });
                 args.push(h);
             }
             return args;
@@ -375,7 +381,13 @@ fn get_or_create_instance<'a>(
     let instance_id = sema_result.monomorph_instances.len() as u32;
     let return_handle =
         resolve_type_node_resolved(arena, fd.return_type, type_args, ast, sema_result)
-            .unwrap_or_else(|| arena.make_adt("return".into(), Box::new([])));
+            .unwrap_or_else(|| {
+                sema_result.add_error(SemaError::new(
+                    &format!("failed to resolve return type of {}", func_name),
+                    0, 0,
+                ));
+                arena.make(crate::types::Ty::Unknown)
+            });
 
     let mut instance = MonomorphInstance {
         instance_id,
@@ -943,7 +955,13 @@ pub fn collect_monomorph_instances<'a>(
                         &module.arena,
                         sema_result,
                     )
-                    .unwrap_or_else(|| arena.make_adt("return".into(), Box::new([])));
+                    .unwrap_or_else(|| {
+                        sema_result.add_error(SemaError::new(
+                            &format!("failed to resolve return type of {}", name),
+                            0, 0,
+                        ));
+                        arena.make(crate::types::Ty::Unknown)
+                    });
 
                     let instance = MonomorphInstance {
                         instance_id: sema_result.monomorph_instances.len() as u32,

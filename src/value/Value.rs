@@ -304,6 +304,21 @@ impl fmt::Display for F16 {
     }
 }
 
+// IEEE 754 totalOrder 语义：NaN 视为最大（符号位区分），-0 < +0，负数按量级反序
+impl PartialOrd for F16 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for F16 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let a = self.0 as i16;
+        let b = other.0 as i16;
+        // 负数（符号位=1）按量级反序：翻转符号位外的所有位
+        let ka = if a < 0 { a ^ 0x7FFF } else { a };
+        let kb = if b < 0 { b ^ 0x7FFF } else { b };
+        ka.cmp(&kb)
+    }
+}
+
 /// f32 bit pattern → f16 bit pattern（IEEE 754 round-to-nearest）
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
@@ -383,11 +398,9 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F128(pub [u8; 16]);
 
-/// # 已知限制 [V-7]
-/// `from_f64`/`to_f64` 对**非整数值**存在精度丢失（pre-existing，原 scalar.rs 遗留）：
-/// 仅对整数值保证精确往返。当前实现仅搬运 f64 的 53 位 mantissa 到 binary128 的高 53 位，
-/// 丢弃低 60 位 mantissa 信息，未实现完整的 113 位 mantissa 舍入逻辑。
-/// 依赖 f128 的数值程序在实现完整 IEEE 754 binary128 转换前，不应假设 f64↔f128 往返保真。
+/// f64→f128 是无损的（f64 的 53 位 mantissa 左移 60 位填满 binary128 的 113 位，无信息丢失）。
+/// f128→f64（to_f64）已实现 round-to-nearest-even，对超出 f64 精度的低位正确舍入。
+/// 因此 f64→f128→f64 往返保真；f128→f64→f128 仅在 f128 值超出 f64 精度时有舍入（符合 IEEE 754 语义）。
 impl F128 {
     pub fn from_f64(x: f64) -> Self {
         let bits = x.to_bits();
@@ -420,33 +433,60 @@ impl F128 {
         let exp = ((bits >> 112) & 0x7FFF) as i32;
         let mant = bits & ((1u128 << 112) - 1);
 
+        // NaN / Inf
         if exp == 0x7FFF {
-            let m: u64 = if mant != 0 {
-                ((mant >> 60) as u64) | 0x8000000000000
-            } else {
-                0
-            };
+            // 任意非零 payload → canonical NaN；Inf → Inf
+            let m: u64 = if mant != 0 { 1 } else { 0 };
             return f64::from_bits((sign << 63) | (0x7FF << 52) | m);
         }
 
-        if exp == 0 {
-            if mant == 0 {
-                return f64::from_bits(sign << 63);
-            }
-            // F128 subnormal 值转 f64 精度丢失，返回 ±0.0（已知限制）
-            return f64::from_bits(sign << 63);
-        }
+        // 真实指数（正规数 exp-16383，次正规数 -16382）
+        let true_exp = if exp == 0 { -16382 } else { exp - 16383 };
+        // 113 位完整 mantissa（正规数补隐含 1）
+        let full_mant: u128 = if exp == 0 { mant } else { mant | (1u128 << 112) };
 
-        let new_exp = exp - 16383 + 1023;
-        if new_exp >= 0x7FF {
+        // f64 指数（bias 1023）
+        let f64_exp = true_exp + 1023;
+        if f64_exp >= 0x7FF {
+            // 溢出 → ±Inf
             return f64::from_bits((sign << 63) | (0x7FF << 52));
         }
-        if new_exp <= 0 {
-            return f64::from_bits(sign << 63);
+        if f64_exp <= 0 {
+            // 次正规或下溢：需将 113 位 mantissa 右移到 f64 次正规位置
+            // f64 次正规 mantissa 在 bit 0..51，隐含位为 0，指数为 0（true_exp = -1022）
+            // 目标 shift = 112 - 51 + (1 - f64_exp) = 62 - f64_exp
+            let shift = (62 - f64_exp) as u32;
+            if shift >= 128 {
+                return f64::from_bits(sign << 63); // 下溢 → ±0
+            }
+            let round_bit = (full_mant >> (shift.saturating_sub(1))) & 1;
+            let sticky = if shift >= 2 {
+                (full_mant & ((1u128 << (shift - 1)) - 1)) != 0
+            } else {
+                false
+            };
+            let mut result_mant = (full_mant >> shift) as u64;
+            // round-to-nearest-even
+            if round_bit != 0 && (sticky || (result_mant & 1) != 0) {
+                result_mant = result_mant.saturating_add(1);
+            }
+            return f64::from_bits((sign << 63) | result_mant);
         }
 
-        let m = (mant >> 60) as u64;
-        f64::from_bits((sign << 63) | ((new_exp as u64) << 52) | m)
+        // 正规数：113 位 mantissa → 53 位（隐含 1 + 52 位 fraction），右移 60 位并舍入
+        let shift = 60u32;
+        let round_bit = (full_mant >> (shift - 1)) & 1;
+        let sticky = (full_mant & ((1u128 << (shift - 1)) - 1)) != 0;
+        let mut result_mant = (full_mant >> shift) as u64;
+        // result_mant 此时为 53 位（含隐含 1），需放入 f64 的 52 位 fraction
+        if round_bit != 0 && (sticky || (result_mant & 1) != 0) {
+            result_mant += 1;
+            if result_mant >> 53 != 0 {
+                // 进位导致 mantissa 溢出（1.111... → 10.000...），指数 +1，mantissa 归零
+                return f64::from_bits((sign << 63) | (((f64_exp as u64) + 1) << 52));
+            }
+        }
+        f64::from_bits((sign << 63) | ((f64_exp as u64) << 52) | (result_mant & ((1u64 << 52) - 1)))
     }
 
     pub fn from_f32(x: f32) -> Self {
@@ -881,7 +921,8 @@ impl F128 {
             0u128
         };
         // result = a - q_int * b
-        let q_val = Self::from_f64(q_int as f64);
+        // 用 from_u128 精确构造（from_f64 对 q_int > 2^53 会丢精度）
+        let q_val = Self::from_u128(q_int);
         let prod = q_val.mul_f128(other);
         self.sub_f128(prod)
     }
@@ -906,7 +947,34 @@ impl fmt::Debug for F128 {
 
 impl fmt::Display for F128 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
+        // NaN/Inf 特判，正常值经 to_f64（Phase A2 已 round-to-nearest-even）打印。
+        // 完整精确十进制输出作为后续优化项，不阻塞本计划。
+        if self.is_nan() {
+            return write!(f, "NaN(f128)");
+        }
+        if self.is_infinite() {
+            let bits = u128::from_le_bytes(self.0);
+            return write!(f, "{}inf(f128)", if bits >> 127 != 0 { "-" } else { "" });
+        }
+        write!(f, "{}f128", self.to_f64())
+    }
+}
+
+// IEEE 754 totalOrder 语义
+impl PartialOrd for F128 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for F128 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let a = u128::from_le_bytes(self.0);
+        let b = u128::from_le_bytes(other.0);
+        // totalOrder 排序键：
+        //   负数（sign=1）：翻转所有位 → 映射到 [0, 0x7FFF...FFF]（-Inf 最小，-0 最大）
+        //   正数（sign=0）：置符号位 → 映射到 [0x8000...000, 0xFFFF...FFF]（+0 最小，+Inf 最大）
+        // 这样 -0 < +0（totalOrder 语义正确）
+        let ka = if (a >> 127) != 0 { !a } else { a | (1u128 << 127) };
+        let kb = if (b >> 127) != 0 { !b } else { b | (1u128 << 127) };
+        ka.cmp(&kb)
     }
 }
 

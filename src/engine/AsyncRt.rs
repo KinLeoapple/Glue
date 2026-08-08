@@ -180,6 +180,94 @@ impl Default for AsyncJoinRuntime {
 }
 
 // =========================================================================
+// EventSource trait — 事件源抽象
+//
+// 统一 await 事件源的「解码 + 原子检查就绪」语义，消除 resolve_check_and_register_await
+// 中按 EventSourceKind 的三路特判分支。新增事件源 = 新增一个 unit struct + impl + 一行分派。
+//
+// 每个实现负责：
+// 1. 从 PendingAwait 解码源专属数据
+// 2. 在源专属锁内检查就绪（锁在返回前释放，避免与 event_waiters 锁顺序冲突）
+// 3. 返回 (event, ready_value)：ready_value=Some 表示已就绪，None 表示需注册 waiter
+//
+// waiter 注册由调用方统一执行，消除三路重复 push。
+// =========================================================================
+
+/// 事件源 trait：统一 await 事件源的解码 + 就绪检查。
+trait EventSource<S: LockStrategy> {
+    fn resolve(
+        &self,
+        engine: &Engine<S>,
+        pending: &crate::ir::Ir::PendingAwait,
+    ) -> (RuntimeEvent, Option<Value>);
+}
+
+struct AsyncJoinSource;
+struct ChannelSource;
+struct TimerSource;
+
+impl<S: LockStrategy> EventSource<S> for AsyncJoinSource {
+    fn resolve(
+        &self,
+        engine: &Engine<S>,
+        pending: &crate::ir::Ir::PendingAwait,
+    ) -> (RuntimeEvent, Option<Value>) {
+        let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
+        let event = RuntimeEvent::AsyncJoin(async_id);
+        // try_get_result 消费式读取：result 已就绪则移除 entry 返回值。
+        // async_join_runtime 锁为临时量，语句末释放；event_waiters 锁由调用方另取，无嵌套。
+        let val = engine.async_join_runtime.lock().try_get_result(async_id);
+        (event, val)
+    }
+}
+
+impl<S: LockStrategy> EventSource<S> for ChannelSource {
+    fn resolve(
+        &self,
+        _engine: &Engine<S>,
+        pending: &crate::ir::Ir::PendingAwait,
+    ) -> (RuntimeEvent, Option<Value>) {
+        let ch = pending
+            .event_obj
+            .heap_obj()
+            .and_then(|h| h.channel())
+            .expect("await on non-channel value");
+        // recv 失败但 channel 已关闭 → 注入 Null；否则 None（需注册 waiter）。
+        let v = ch
+            .recv()
+            .or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
+        let event = RuntimeEvent::ChannelReady(crate::ir::Ir::ChannelId(ch.id()));
+        (event, v)
+    }
+}
+
+impl<S: LockStrategy> EventSource<S> for TimerSource {
+    fn resolve(
+        &self,
+        engine: &Engine<S>,
+        pending: &crate::ir::Ir::PendingAwait,
+    ) -> (RuntimeEvent, Option<Value>) {
+        let duration_ns = match pending.event_obj.heap_obj() {
+            Some(crate::value::HeapObj::Record(r)) => {
+                r.find_field(TIMER_DURATION_NS_FIELD)
+                    .map(|v| v.as_i64())
+                    .expect("timer event record missing duration_ns field")
+            }
+            _ => pending.event_obj.as_i64(),
+        };
+        // start + is_fired 在 timer_runtime 锁内原子化（check_and_fire 同锁），
+        // 显式 drop 释放 timer 锁后再由调用方注册 waiter（避免与 event_waiters 锁顺序冲突）。
+        let mut tr = engine.timer_runtime.lock();
+        let timer_id = tr.start(std::time::Duration::from_nanos(duration_ns as u64));
+        let event = RuntimeEvent::TimerFired(timer_id);
+        let fired = tr.is_fired(timer_id);
+        drop(tr);
+        let val = if fired { Some(Value::VOID) } else { None };
+        (event, val)
+    }
+}
+
+// =========================================================================
 // impl<S: LockStrategy> Engine<S> — 事件处理方法
 // =========================================================================
 
@@ -188,9 +276,10 @@ impl<S: LockStrategy> Engine<S> {
     ///
     /// 返回 (event, ready_value, await_node_local)：
     /// - ready_value = Some(v)：事件已就绪，调用方直接注入值继续执行
-    /// - ready_value = None：事件未就绪，waiter 已在锁内注册，调用方只需设帧状态后 return
+    /// - ready_value = None：事件未就绪，waiter 已注册，调用方只需设帧状态后 return
     ///
-    /// 关键：检查就绪与注册 waiter 在同一锁临界区，事件源无法在两步之间触发并丢失。
+    /// 事件源解码 + 就绪检查委托 EventSource trait；waiter 注册在此统一执行。
+    /// 各源专属锁在 EventSource::resolve 内释放，event_waiters 锁不与源锁嵌套。
     pub(super) fn resolve_check_and_register_await(
         &self,
         pending: &crate::ir::Ir::PendingAwait,
@@ -198,59 +287,20 @@ impl<S: LockStrategy> Engine<S> {
     ) -> (RuntimeEvent, Option<Value>, crate::ir::Ir::NodeId) {
         use crate::ir::Ir::EventSourceKind;
         let await_node = pending.await_node_local;
-        match pending.event_kind {
-            EventSourceKind::AsyncJoin => {
-                let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
-                let event = RuntimeEvent::AsyncJoin(async_id);
-                // 持 async_join_runtime 锁：try_get_result + 注册 waiter 原子化
-                // set_result 也在该锁内，无法在两步之间触发 on_event_arrived
-                let val = self.async_join_runtime.lock().try_get_result(async_id);
-                if val.is_none() {
-                    self.event_waiters.lock().push((event, fid));
-                }
-                (event, val, await_node)
-            }
-            EventSourceKind::Channel => {
-                let ch = pending
-                    .event_obj
-                    .heap_obj()
-                    .and_then(|h| h.channel())
-                    .expect("await on non-channel value");
-                let v = ch.recv().or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
-                let event = RuntimeEvent::ChannelReady(crate::ir::Ir::ChannelId(ch.id()));
-                if v.is_none() {
-                    // recv 失败：注册 waiter 后才释放控制权
-                    // ChannelNotify → on_event_arrived 会查 event_waiters，此时 waiter 已在位
-                    self.event_waiters.lock().push((event, fid));
-                }
-                (event, v, await_node)
-            }
-            EventSourceKind::Timer => {
-                let duration_ns = match pending.event_obj.heap_obj() {
-                    Some(crate::value::HeapObj::Record(r)) => {
-                        r.find_field(TIMER_DURATION_NS_FIELD)
-                            .map(|v| v.as_i64())
-                            .expect("timer event record missing duration_ns field")
-                    }
-                    _ => pending.event_obj.as_i64(),
-                };
-                // 持 timer_runtime 锁：start + is_fired + 注册 waiter 原子化
-                // check_and_fire 也在该锁内，无法在 start 和 is_fired 之间弹出 timer
-                let mut tr = self.timer_runtime.lock();
-                let timer_id = tr.start(std::time::Duration::from_nanos(duration_ns as u64));
-                let event = RuntimeEvent::TimerFired(timer_id);
-                let fired = tr.is_fired(timer_id);
-                drop(tr); // 释放 timer 锁后再注册 waiter（避免与 event_waiters 锁顺序冲突）
-                if !fired {
-                    self.event_waiters.lock().push((event, fid));
-                }
-                let val = if fired { Some(Value::VOID) } else { None };
-                (event, val, await_node)
-            }
+        let (event, val) = match pending.event_kind {
+            EventSourceKind::AsyncJoin => AsyncJoinSource.resolve(self, pending),
+            EventSourceKind::Channel => ChannelSource.resolve(self, pending),
+            EventSourceKind::Timer => TimerSource.resolve(self, pending),
             EventSourceKind::SubgraphComplete => {
                 panic!("SubgraphComplete should not go through await path");
             }
+        };
+        // 统一 waiter 注册：仅未就绪时注册。源专属锁已在各 EventSource::resolve 内释放，
+        // 此处 event_waiters 锁不与源锁嵌套，避免锁顺序冲突。
+        if val.is_none() {
+            self.event_waiters.lock().push((event, fid));
         }
+        (event, val, await_node)
     }
 
     /// 将事件值注入等待帧并唤醒（设 Ready + 推就绪队列 + 通知下游）。

@@ -34,9 +34,9 @@ const IO_ERR: i32 = -1;
 const UTF8_DECODE_ERR: i64 = -1;
 
 /// Result 变体构造器名（与 stdlib 的 Result 类型定义保持同步）。
-const CTOR_OK: &str = "Ok";
-const CTOR_ERR: &str = "Error";
-const CTOR_ERR_ALT: &str = "Err";
+pub(crate) const CTOR_OK: &str = "Ok";
+pub(crate) const CTOR_ERR: &str = "Error";
+pub(crate) const CTOR_ERR_ALT: &str = "Err";
 
 /// reflect 类型名常量（单点维护，供 __reflect_type_name / compute_cast_to_str 共用）。
 const TYPE_NAME_NULL: &str = "null";
@@ -44,6 +44,25 @@ const TYPE_NAME_VOID: &str = "void";
 const TYPE_NAME_STR: &str = "str";
 const TYPE_NAME_ARRAY: &str = "array";
 const TYPE_NAME_UNKNOWN: &str = "unknown";
+
+// =========================================================================
+// 运行时错误构造 — 统一使用 ErrorVal（与 Arena::alloc_error_val 同构）
+// =========================================================================
+
+/// 构造运行时错误值：用 ErrorValue（专用错误类型）包装在 ThrowVal::Err 中。
+///
+/// 与 `ValueArena::alloc_error_val` 使用相同的 `HeapObj::ErrorVal` 表示，
+/// 消除各 compute_fn 中手构造 RecordValue 的重复模式。
+/// compute_fn 无 Arena 访问权，直接构造 `Value::ref_val`。
+fn make_error_throw(type_name: &str, msg: &str) -> Value {
+    use crate::value::{HeapObj, ErrorValue, ThrowValue, ThrowPayload};
+    let err_val = Value::ref_val(HeapObj::ErrorVal(ErrorValue {
+        type_name: type_name.to_string(),
+        message: msg.to_string(),
+        is_error_subtype: true,
+    }));
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(err_val) }))
+}
 
 // =========================================================================
 // reflect 辅助函数 — 消除 FFI/fallback 双路径重复
@@ -453,6 +472,119 @@ impl_cmp_compute! {
     compute_gt_f64: > for as_f64;
     compute_le_f64: <= for as_f64;
     compute_ge_f64: >= for as_f64;
+}
+
+// ---- f128 比较（索引 302-307）：IEEE 754 语义，不经 to_f64 丢精度 ----
+// F128 的 derive PartialEq 是 bit-pattern 比较（NaN==NaN 为 true），
+// 不能直接用于 IEEE 语义。这里手动实现：
+//   - NaN 与任何值比较：eq/lt/gt/le/ge → false，ne → true
+//   - -0 == +0（bit pattern 仅符号位不同时视为相等）
+//   - 其余用 totalOrder 排序键（sign-aware bit-pattern）
+
+/// F128 NaN 判定
+#[inline]
+fn f128_is_nan(bits: u128) -> bool {
+    (bits >> 112) & 0x7FFF == 0x7FFF && (bits & ((1u128 << 112) - 1)) != 0
+}
+
+/// F128 totalOrder 排序键（非 NaN 值）
+#[inline]
+fn f128_sort_key(bits: u128) -> u128 {
+    // 负数（sign=1）：翻转所有位 → 映射到 [0, 0x7FFF...FFF]
+    // 正数（sign=0）：置符号位为 1 → 映射到 [0x8000...000, 0xFFFF...FFF]
+    // 这样 -0 < +0（totalOrder 语义），-Inf < +Inf 等
+    if (bits >> 127) != 0 { !bits } else { bits | (1u128 << 127) }
+}
+
+pub fn compute_eq_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let eq = if f128_is_nan(ab) || f128_is_nan(bb) {
+        false
+    } else {
+        ab == bb || (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
+    };
+    Value::bool_val(eq)
+}
+
+pub fn compute_ne_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let ne = if f128_is_nan(ab) || f128_is_nan(bb) {
+        true
+    } else {
+        ab != bb && ((ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF != 0)
+    };
+    Value::bool_val(ne)
+}
+
+pub fn compute_lt_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let lt = if f128_is_nan(ab) || f128_is_nan(bb) {
+        false
+    } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
+        false // -0 == +0，不小于
+    } else {
+        f128_sort_key(ab) < f128_sort_key(bb)
+    };
+    Value::bool_val(lt)
+}
+
+pub fn compute_gt_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let gt = if f128_is_nan(ab) || f128_is_nan(bb) {
+        false
+    } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
+        false // -0 == +0，不大于
+    } else {
+        f128_sort_key(ab) > f128_sort_key(bb)
+    };
+    Value::bool_val(gt)
+}
+
+pub fn compute_le_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let le = if f128_is_nan(ab) || f128_is_nan(bb) {
+        false
+    } else {
+        // -0 == +0 → le=true；否则 totalOrder less-or-equal
+        (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
+            || f128_sort_key(ab) < f128_sort_key(bb)
+    };
+    Value::bool_val(le)
+}
+
+pub fn compute_ge_f128(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = frame.get_value_by_global(inputs[0]).as_f128();
+    let b = frame.get_value_by_global(inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let ge = if f128_is_nan(ab) || f128_is_nan(bb) {
+        false
+    } else {
+        (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
+            || f128_sort_key(ab) > f128_sort_key(bb)
+    };
+    Value::bool_val(ge)
 }
 
 // ---- bool 逻辑（索引 22-24, 27）----
@@ -1417,19 +1549,10 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// 统一机制：Record 与 Adt 均通过 `find_field(name)` 按名取值，
 /// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
     let name = graph.field_set_names[node.0 as usize].as_deref();
-    let make_err = |msg: &str| {
-        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "FieldError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
-            field_names: vec![Some("message".to_string())],
-            field_ref_bits: 1,
-        }));
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
-    };
+    let make_err = |msg: &str| make_error_throw("FieldError", msg);
     let Some(h) = record_val.heap_obj() else {
         return make_err("field access on non-record value");
     };
@@ -1472,19 +1595,10 @@ pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: 数组索引（从 ArrayValue 按 i32 索引取元素）
 /// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let idx = frame.get_value_by_global(inputs[1]).as_i32() as usize;
-    let make_err = |msg: &str| {
-        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "IndexError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
-            field_names: vec![Some("message".to_string())],
-            field_ref_bits: 1,
-        }));
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
-    };
+    let make_err = |msg: &str| make_error_throw("IndexError", msg);
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
             arr.get(idx).cloned().unwrap_or_else(|| {
@@ -1507,7 +1621,7 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
 /// - array：按元素索引切片，返回新 array
 /// 越界时 clamp 到 [0, len]，与 Rust 切片语义一致（不 panic）。
 pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, ArrayValue, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::{HeapObj, ArrayValue, GlueStr};
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
     let start = frame.get_value_by_global(inputs[1]).as_usize();
@@ -1516,15 +1630,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
     if inclusive {
         end = end.saturating_add(1);
     }
-    let make_err = |msg: &str| {
-        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "SliceError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
-            field_names: vec![Some("message".to_string())],
-            field_ref_bits: 1,
-        }));
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
-    };
+    let make_err = |msg: &str| make_error_throw("SliceError", msg);
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
             let len = arr.len();
@@ -1564,19 +1670,11 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// 两输入：lhs, rhs。任一非 str 时返回错误值。
 pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, GlueStr, RecordValue, ThrowValue, ThrowPayload};
+    use crate::value::HeapObj;
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
     let rhs = frame.get_value_by_global(inputs[1]);
-    let make_err = |msg: &str| {
-        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "TypeError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(GlueStr::new(msg)))],
-            field_names: vec![Some("message".to_string())],
-            field_ref_bits: 1,
-        }));
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
-    };
+    let make_err = |msg: &str| make_error_throw("TypeError", msg);
     match (lhs.heap_obj(), rhs.heap_obj()) {
         (Some(HeapObj::Str(a)), Some(HeapObj::Str(b))) => {
             Value::ref_val(HeapObj::Str(a.concat(b)))
@@ -1902,7 +2000,8 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
         ValueTag::F32 => Value::f32(src_f64 as f32),
         ValueTag::F64 => Value::f64(src_f64),
-        ValueTag::F128 => Value::f128(crate::value::F128::from_f64(src_f64)),
+        // 用 as_f128() 精确访问器：整数源走 from_i128/from_u128，浮点源走 to_f64（已精确舍入）
+        ValueTag::F128 => Value::f128(val.as_f128()),
         ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
         ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
         _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
@@ -2187,8 +2286,9 @@ pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: Call 节点启动子图（参数收集 + 标记 frame.pending_call）。
 ///
+/// 统一 sync/async 调用路径：从 target_sg.has_suspend 推导 is_async，
+/// 核心循环检测 pending_call 后据此决定是否启动子帧 + 挂起当前帧。
 /// 不直接 start_subgraph（compute_fn 无 Engine 引用）。
-/// 核心循环检测 pending_call 后执行 start_subgraph + 帧挂起。
 pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     // 静态绑定：有 call_target → 收集参数 + 设 pending_call
@@ -2197,6 +2297,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
             eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
                 node, target_sg.0, frame.subgraph_id.0, frame.node_offset);
         }
+        let is_async = graph.subgraphs[target_sg.0 as usize].has_suspend;
         let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
         let n = &graph.nodes[node.0 as usize];
         let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
@@ -2213,7 +2314,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
             target_sg,
             args,
             call_node_local,
-            is_async: false,
+            is_async,
             closure_val: None,
         }));
         return Value::VOID;
@@ -2342,19 +2443,10 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
 /// 发送后设置 pending_channel_notify，run_ready_nodes 消费时触发 ChannelReady 事件
 /// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
 pub fn compute_channel_send(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, RecordValue, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
     let val = frame.get_value_by_global(inputs[1]);
-    let make_err = |msg: &str| {
-        let record_val = Value::ref_val(HeapObj::Record(RecordValue {
-            type_name: "ChannelError".to_string(),
-            fields: vec![Value::ref_val(HeapObj::Str(crate::value::GlueStr::new(msg)))],
-            field_names: vec![Some("message".to_string())],
-            field_ref_bits: 1,
-        }));
-        Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(record_val) }))
-    };
+    let make_err = |msg: &str| make_error_throw("ChannelError", msg);
     let ch = match ch_val.heap_obj().and_then(|h| h.channel()) {
         Some(ch) => ch,
         None => return make_err("send on non-channel value"),
@@ -2378,37 +2470,6 @@ pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
     let ch = ch_val.heap_obj().and_then(|h| h.channel())
         .expect("close on non-channel value");
     ch.close();
-    Value::VOID
-}
-
-/// compute_async_call_launch（idx 39）：async 函数调用，启动子帧但不挂起当前帧。
-///
-/// 与 compute_call_launch 相同参数收集逻辑，但 is_async=true。
-/// 核心循环检测 is_async=true 后：启动子帧 + call 节点写 AsyncHandle + 通知下游 + 不挂起。
-pub fn compute_async_call_launch(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::ir::Ir::PendingCall;
-
-    let graph = frame.graph.clone();
-    let target_sg = graph.call_targets[node.0 as usize]
-        .expect("async Call node has no target");
-    let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
-    let n = &graph.nodes[node.0 as usize];
-    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-    let args: Vec<Value> = inputs
-        .iter()
-        .take(param_count)
-        .map(|&in_node| frame.get_value_by_global(in_node))
-        .collect();
-    let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
-
-    frame.pending = Some(Pending::Call(PendingCall {
-        target_sg,
-        args,
-        call_node_local,
-        is_async: true,
-        closure_val: None,
-    }));
-
     Value::VOID
 }
 

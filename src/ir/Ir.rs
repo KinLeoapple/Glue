@@ -399,6 +399,13 @@ compute_fn_ids! {
     300 => CF_NE_BOOL,
     // 数组索引存储（301）：arr[i] = x，原地修改 Array 堆对象
     301 => CF_ARRAY_STORE,
+    // f128 比较（302-307）：f128 经 to_f64 会丢 60 位精度，需专用 bit-pattern 比较
+    302 => CF_EQ_F128,
+    303 => CF_NE_F128,
+    304 => CF_LT_F128,
+    305 => CF_GT_F128,
+    306 => CF_LE_F128,
+    307 => CF_GE_F128,
 }
 
 // =========================================================================
@@ -1426,7 +1433,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         36  => super::Compute::compute_call_launch,
         37  => super::Compute::compute_gate_launch,
         38  => super::Compute::compute_await,
-        39  => super::Compute::compute_async_call_launch,
+        39  => super::Compute::compute_call_launch, // CF_ASYNC_CALL_LAUNCH 别名：sync/async 统一走 compute_call_launch（is_async 由 has_suspend 推导）
         40  => super::Compute::compute_closure_construct,
         41  => super::Compute::compute_closure_call,
         42  => super::Compute::compute_cancel_async_handle,
@@ -1727,6 +1734,13 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         300 => super::Compute::compute_ne_bool,
         // 数组索引存储（301）
         301 => super::Compute::compute_array_store,
+        // f128 比较（302-307）
+        302 => super::Compute::compute_eq_f128,
+        303 => super::Compute::compute_ne_f128,
+        304 => super::Compute::compute_lt_f128,
+        305 => super::Compute::compute_gt_f128,
+        306 => super::Compute::compute_le_f128,
+        307 => super::Compute::compute_ge_f128,
     }
 }
 
@@ -1771,6 +1785,13 @@ pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
     s.insert(CF_NE_OBJ);
     // ── bool 不等（纯比较，与 CF_EQ_BOOL 对称）──
     s.insert(CF_NE_BOOL);
+    // ── f128 比较（纯比较，专用 bit-pattern 路径）──
+    s.insert(CF_EQ_F128);
+    s.insert(CF_NE_F128);
+    s.insert(CF_LT_F128);
+    s.insert(CF_GT_F128);
+    s.insert(CF_LE_F128);
+    s.insert(CF_GE_F128);
     // 注意：CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK 不加入 pure_set。
     // 虽然它们无外部可观察副作用，但每次执行产生独立对象（不同内存地址）。
     // 若被 LICM 外提或 CSE 消除，循环迭代会共享同一对象，导致状态污染。

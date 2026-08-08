@@ -1154,53 +1154,6 @@ pub fn optimize_with_analysis(
             break;
         }
     }
-
-    // 临时调试：dump call_target 映射 + 自递归检测
-    if std::env::var("GLUE_DUMP_GRAPH").is_ok() {
-        eprintln!("=== DUMP call_targets ===");
-        for (idx, ct) in graph.call_targets.iter().enumerate() {
-            if let Some(target) = ct {
-                let node = graph.nodes[idx];
-                if node.compute_fn == CF_CALL_LAUNCH {
-                    let sg = graph.find_function_sg_for_node(NodeId(idx as u32));
-                    eprintln!("[CT] node={} target_sg={} caller_sg={}",
-                        idx, target.0, sg.map(|s| s.0).unwrap_or(u32::MAX));
-                }
-            }
-        }
-        // dump 所有 sg 的简要信息
-        eprintln!("=== DUMP subgraphs (count={}) ===", graph.subgraphs.len());
-        for sg in &graph.subgraphs {
-            if sg.loop_kind != crate::ir::Ir::LoopKind::None || sg.loop_parent_sg.is_some() {
-                continue;
-            }
-            let (s, e) = sg.node_range;
-            let cnt = e.0.saturating_sub(s.0);
-            if cnt > 0 {
-                let ret_in_range = sg.return_node.0 >= s.0 && sg.return_node.0 < e.0;
-                if !ret_in_range {
-                    eprintln!("[DUMP] BAD sg={} node_range=[{},{}) return={} NOT IN RANGE",
-                        sg.id.0, s.0, e.0, sg.return_node.0);
-                }
-            }
-        }
-        // 验证：Const 节点必须有 const_values（参数占位除外）
-        eprintln!("=== DUMP broken Const nodes (no const_values, non-param) ===");
-        for (idx, n) in graph.nodes.iter().enumerate() {
-            if n.kind == NodeKind::Const && graph.const_values[idx].is_none() {
-                let sg = graph.find_innermost_sg_for_node(NodeId(idx as u32));
-                if let Some(sg_id) = sg {
-                    let sg_obj = &graph.subgraphs[sg_id.0 as usize];
-                    let local = idx as u32 - sg_obj.node_range.0 .0;
-                    if local >= sg_obj.param_count as u32 {
-                        eprintln!("[BROKEN] node={} local={} cf={} sg={} param_count={} range=[{},{}) hoisted={}",
-                            idx, local, n.compute_fn.0, sg_id.0, sg_obj.param_count,
-                            sg_obj.node_range.0 .0, sg_obj.node_range.1 .0, graph.hoisted_node[idx]);
-                    }
-                }
-            }
-        }
-    }
 }
 
 // =========================================================================

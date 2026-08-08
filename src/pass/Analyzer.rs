@@ -874,7 +874,7 @@ fn mark_entry_reason(
         cg.entry_reasons.insert(func, ReachableReason::ExternC);
         return;
     }
-    if attributes.iter().any(|a| a.name == "extern") {
+    if attributes.iter().any(|a| a.name == crate::ffi::ATTR_EXTERN) {
         cg.entry_reasons.insert(func, ReachableReason::ExternAttr);
         return;
     }

@@ -411,7 +411,7 @@ impl<'a> IrBuilder<'a> {
         target_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
         use crate::ast::Ast::CompoundAssignOp;
-        let ty = self.expr_type_name(target_expr).unwrap_or("i32");
+        let ty = self.expr_type_name_checked(target_expr, "compound_assign_op");
         let is_float = crate::value::ValueTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty).unwrap_or(CF_ADD_I32_FULL.0); // 回退 i32
         // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
@@ -935,7 +935,10 @@ impl<'a> IrBuilder<'a> {
                 let ty = suffix
                     .map(|s| s.to_string())
                     .or_else(|| self.expr_type_name(expr_id).map(|s| s.to_string()));
-                let ty_name = ty.as_deref().unwrap_or("i32");
+                let ty_name = ty.as_deref().unwrap_or_else(|| {
+                    debug_assert!(false, "missing ExprInfo for int literal expr {:?}", expr_id);
+                    "i32"
+                });
 
                 // u128 范围 (0..=2^128-1) 超出 i128，直接用 u128::from_str_radix 解析。
                 // 与浮点 suffix 分派同理：u128 是唯一超出 i128 表示范围的整数类型，
@@ -1965,9 +1968,10 @@ impl<'a> IrBuilder<'a> {
         });
         let method_idx = self.sema.get_trait_def(trait_name)
             .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method_name))
-            .map(|i| i as u16)
-            .unwrap_or(0);
-        self.graph.set_vtable_call(call_node, method_idx);
+            .map(|i| i as u16);
+        debug_assert!(method_idx.is_some(),
+            "trait method '{}' not found in trait '{}' for vtable dispatch", method_name, trait_name);
+        self.graph.set_vtable_call(call_node, method_idx.unwrap_or(0));
         call_node
     }
 
@@ -3793,6 +3797,24 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// `expr_type_name` 的 debug_assert 版本：sema 契约保证 ExprInfo 已登记，
+    /// 若缺失说明 sema 推断有漏记。debug 构建触发 assert，release 兜底 "i32" 防 panic。
+    #[inline]
+    fn expr_type_name_checked(&self, expr_id: crate::ast::Ast::ExprId, context: &str) -> &str {
+        match self.expr_type_name(expr_id) {
+            Some(ty) => ty,
+            None => {
+                debug_assert!(
+                    false,
+                    "missing ExprInfo for expr {:?} in {}",
+                    expr_id,
+                    context
+                );
+                "i32"
+            }
+        }
+    }
+
     /// 判断表达式是否为 nullable 类型（Ty::Nullable）。
     /// nullable 类型的 ==/!= 需要 null 判别式比较：?. 短路或 null 字面量
     /// 产生 Value::Null，str/i32 等专用比较函数不处理 Null 导致结果错误。
@@ -3846,14 +3868,16 @@ impl<'a> IrBuilder<'a> {
         // 消费 sema 提升后类型：binary_expr_id 的 ExprInfo.type_name 是 sema
         // 推断的二元运算结果类型。算术运算的结果类型即提升后操作数类型（i32+f64→f64），
         // 比较运算的结果类型是 bool，需用操作数类型选 compute_fn。
-        let lhs_ty = self.expr_type_name(lhs_expr).unwrap_or("i32");
+        let lhs_ty = self.expr_type_name_checked(lhs_expr, "binary_op");
         let ty_name = match self.expr_type_name(binary_expr_id) {
-            Some("bool") => lhs_ty,  // 比较运算：用操作数类型
+            Some(t) if Self::type_family(t) == crate::types::TypeFamily::Bool => lhs_ty,  // 比较运算：用操作数类型
             Some(t) => t,             // 算术运算：用提升后类型
             None => lhs_ty,           // sema 无记录：回退到 lhs 类型
         };
         let ty_meta = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
+        // f128 需专用比较路径：经 to_f64 会丢 60 位精度，导致不同 f128 误判相等
+        let is_f128 = crate::value::ValueTag::from_name(ty_name) == Some(crate::value::ValueTag::F128);
         // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
         let is_int = !is_float && Self::int_family(ty_name) != crate::types::TypeFamily::Bool;
         let base = Self::arith_base(ty_name);
@@ -3959,39 +3983,45 @@ impl<'a> IrBuilder<'a> {
         use crate::types::TypeFamily;
         match op {
             crate::ast::Ast::BinaryOp::Eq => {
-                if is_float { CF_EQ_F64 }     // eq_f64
+                if is_f128 { CF_EQ_F128 }
+                else if is_float { CF_EQ_F64 }     // eq_f64
                 else if fam == TypeFamily::Bool { CF_EQ_BOOL } // eq_bool
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_EQ_I128 } // eq_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_EQ_I64 }  // eq_i64
                 else { CF_EQ_I32 }              // eq_i32 (Int32 含 char)
             }
             crate::ast::Ast::BinaryOp::NotEq => {
-                if is_float { CF_NE_F64 }     // ne_f64
+                if is_f128 { CF_NE_F128 }
+                else if is_float { CF_NE_F64 }     // ne_f64
                 else if fam == TypeFamily::Bool { CF_NE_BOOL } // ne_bool
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_NE_I128 } // ne_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_NE_I64 }  // ne_i64
                 else { CF_NE_I32 }              // ne_i32
             }
             crate::ast::Ast::BinaryOp::Lt => {
-                if is_float { CF_LT_F64 }     // lt_f64
+                if is_f128 { CF_LT_F128 }
+                else if is_float { CF_LT_F64 }     // lt_f64
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_LT_I128 } // lt_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_LT_I64 }  // lt_i64
                 else { CF_LT_I32 }             // lt_i32
             }
             crate::ast::Ast::BinaryOp::Gt => {
-                if is_float { CF_GT_F64 }     // gt_f64
+                if is_f128 { CF_GT_F128 }
+                else if is_float { CF_GT_F64 }     // gt_f64
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_GT_I128 } // gt_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_GT_I64 }  // gt_i64
                 else { CF_GT_I32 }             // gt_i32
             }
             crate::ast::Ast::BinaryOp::LtEq => {
-                if is_float { CF_LE_F64 }     // le_f64
+                if is_f128 { CF_LE_F128 }
+                else if is_float { CF_LE_F64 }     // le_f64
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_LE_I128 } // le_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_LE_I64 }  // le_i64
                 else { CF_LE_I32 }              // le_i32
             }
             crate::ast::Ast::BinaryOp::GtEq => {
-                if is_float { CF_GE_F64 }     // ge_f64
+                if is_f128 { CF_GE_F128 }
+                else if is_float { CF_GE_F64 }     // ge_f64
                 else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { CF_GE_I128 } // ge_i128
                 else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { CF_GE_I64 }  // ge_i64
                 else { CF_GE_I32 }             // ge_i32
@@ -4014,7 +4044,7 @@ impl<'a> IrBuilder<'a> {
         op: crate::ast::Ast::UnaryOp,
         operand_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
-        let ty_name = self.expr_type_name(operand_expr).unwrap_or("i32");
+        let ty_name = self.expr_type_name_checked(operand_expr, "unary_op");
         let is_float = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
         let base = Self::arith_base(ty_name);
         match op {
@@ -4405,7 +4435,7 @@ impl<'a> IrBuilder<'a> {
                         }
                         // Err(...) → 先 record_construct，再 throw_err 包装（idx 45）
                         BuiltinCtorLower::Err => {
-                            let inner = self.compile_record_like("Error", args);
+                            let inner = self.compile_record_like(crate::ir::Compute::CTOR_ERR, args);
                             let inputs_offset = self.graph.inputs_pool.push(&[inner]);
                             self.graph.add_node(Node {
                                 kind: NodeKind::Call,
@@ -4793,17 +4823,10 @@ impl<'a> IrBuilder<'a> {
             let target_key: &str = mangled.as_deref().unwrap_or(name);
             if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
                 self.graph.set_call_target(call_node, target_sg);
-                // async 函数：切换 compute_fn 为 compute_async_call_launch（idx 39）
-                let is_async = if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
-                    if sg.has_suspend {
-                        self.graph.nodes[call_node.0 as usize].compute_fn = CF_ASYNC_CALL_LAUNCH;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                // is_async 由 compute_call_launch 运行时从 has_suspend 推导，
+                // 此处仅查 has_suspend 决定是否可标记尾调用。
+                let is_async = self.graph.subgraphs.get(target_sg.0 as usize)
+                    .is_some_and(|sg| sg.has_suspend);
                 // 尾调用标记：尾位置 + 同步函数 + 有 call_target → 运行时 switch_subgraph 帧复用
                 if self.in_tail_position && !is_async {
                     self.graph.set_tail_call(call_node);
@@ -4933,7 +4956,6 @@ impl<'a> IrBuilder<'a> {
                         compute_fn: CF_CALL_LAUNCH,
                     });
                     self.graph.set_call_target(call_node, target_sg);
-                    self.mark_async_call_if_needed(call_node, target_sg);
                     return call_node;
                 }
             }
@@ -4969,9 +4991,10 @@ impl<'a> IrBuilder<'a> {
                 let trait_name = self.expr_type_name(recv).unwrap_or("");
                 let method_idx = self.sema.get_trait_def(trait_name)
                     .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method))
-                    .map(|i| i as u16)
-                    .unwrap_or(0);
-                self.graph.set_vtable_call(call_node, method_idx);
+                    .map(|i| i as u16);
+                debug_assert!(method_idx.is_some(),
+                    "trait method '{}' not found in trait '{}' for vtable dispatch", method, trait_name);
+                self.graph.set_vtable_call(call_node, method_idx.unwrap_or(0));
                 return call_node;
             }
 
@@ -4981,7 +5004,6 @@ impl<'a> IrBuilder<'a> {
                     if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
                         if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
                             self.graph.set_call_target(call_node, target_sg);
-                            self.mark_async_call_if_needed(call_node, target_sg);
                             return call_node;
                         }
                     }
@@ -5002,7 +5024,6 @@ impl<'a> IrBuilder<'a> {
                         if let Some(&trait_idx) = self.sema.trait_def_index.get(trait_def.name.as_ref()) {
                             if let Some(&target_sg) = self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
                                 self.graph.set_call_target(call_node, target_sg);
-                                self.mark_async_call_if_needed(call_node, target_sg);
                                 return call_node;
                             }
                         }
@@ -5014,7 +5035,6 @@ impl<'a> IrBuilder<'a> {
             // 当方法名匹配顶层自由函数时，将 recv 作为第一个参数传递
             if let Some(&target_sg) = self.func_subgraphs.get(method) {
                 self.graph.set_call_target(call_node, target_sg);
-                self.mark_async_call_if_needed(call_node, target_sg);
                 return call_node;
             }
 
@@ -5088,17 +5108,6 @@ impl<'a> IrBuilder<'a> {
                 }))
             }
             _ => None, // 参数不匹配，走 Call 节点路径
-        }
-    }
-
-    /// 若目标子图含挂起点（async 函数），将 Call 节点的 compute_fn
-    /// 从 sync（idx 36）切换为 async（idx 39），使运行时走 async call 路径
-    /// （子帧启动 + AsyncHandle 写入 + 当前帧不挂起）。
-    fn mark_async_call_if_needed(&mut self, call_node: NodeId, target_sg: SubGraphId) {
-        if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
-            if sg.has_suspend {
-                self.graph.nodes[call_node.0 as usize].compute_fn = CF_ASYNC_CALL_LAUNCH;
-            }
         }
     }
 
@@ -6766,19 +6775,21 @@ fn check_int_range(v: i128, ty_name: &str, raw: &str, span: crate::ast::Ast::Spa
             }
         };
     }
-    match ty_name {
-        "i8" => try_int!(i8, I8),
-        "i16" => try_int!(i16, I16),
-        "i32" => try_int!(i32, I32),
-        "i64" => try_int!(i64, I64),
-        "i128" => Ok(ConstValue::I128(v)),
-        "u8" => try_int!(u8, U8),
-        "u16" => try_int!(u16, U16),
-        "u32" => try_int!(u32, U32),
-        "u64" => try_int!(u64, U64),
-        "u128" => try_int!(u128, U128),
-        "isize" => try_int!(isize, Isize),
-        "usize" => try_int!(usize, Usize),
+    // 单一真相源：通过 ValueTag::from_name 派生，消除字符串特判
+    let tag = crate::value::ValueTag::from_name(ty_name).unwrap_or(crate::value::ValueTag::I32);
+    match tag {
+        crate::value::ValueTag::I8 => try_int!(i8, I8),
+        crate::value::ValueTag::I16 => try_int!(i16, I16),
+        crate::value::ValueTag::I32 => try_int!(i32, I32),
+        crate::value::ValueTag::I64 => try_int!(i64, I64),
+        crate::value::ValueTag::I128 => Ok(ConstValue::I128(v)),
+        crate::value::ValueTag::U8 => try_int!(u8, U8),
+        crate::value::ValueTag::U16 => try_int!(u16, U16),
+        crate::value::ValueTag::U32 => try_int!(u32, U32),
+        crate::value::ValueTag::U64 => try_int!(u64, U64),
+        crate::value::ValueTag::U128 => try_int!(u128, U128),
+        crate::value::ValueTag::Isize => try_int!(isize, Isize),
+        crate::value::ValueTag::Usize => try_int!(usize, Usize),
         _ => try_int!(i32, I32),
     }
 }
@@ -7070,7 +7081,7 @@ fn bigint_to_u128(limbs: &[u64]) -> u128 {
 ///
 /// 不经 f64 中转，使用大整数运算实现精确转换（round-to-nearest-even）。
 /// 支持: [+-]digits[.digits][e[+-]digits]
-fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     // 1. 解析十进制格式
     let s = s.trim();
     let (sign, body) = if let Some(rest) = s.strip_prefix('-') {

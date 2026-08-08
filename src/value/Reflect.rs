@@ -351,6 +351,10 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
                     ValueTag::Usize => s.push_str(&a.get_usize(h).to_string()),
                     ValueTag::F32 => s.push_str(&a.get_f32(h).to_string()),
                     ValueTag::F64 => s.push_str(&a.get_f64(h).to_string()),
+                    ValueTag::I128 => s.push_str(&a.get_i128(h).to_string()),
+                    ValueTag::U128 => s.push_str(&a.get_u128(h).to_string()),
+                    ValueTag::F16 => s.push_str(&F16(a.get_f16(h)).to_f32().to_string()),
+                    ValueTag::F128 => s.push_str(&a.get_f128(h).to_f64().to_string()),
                     _ => s.push_str("<scalar>"),
                 }
             });

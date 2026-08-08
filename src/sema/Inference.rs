@@ -688,8 +688,10 @@ impl<'a> InferContext<'a> {
         let _ = is_newtype;
 
         // 解析构造器返回类型（GADT → return_type_node，普通 ADT → type_name 对应的 Adt）
+        // 走 InferContext 完整类型解析（type_from_ast），统一所有 TypeNode 变体处理，
+        // 消除简化版 resolve_type_node_to_handle 对复杂类型 fresh_type_var 兜底导致的类型丢失。
         let ctor_return_ty = if let Some(rtn) = return_type_node {
-            self.resolve_type_node_to_handle(rtn, ast)
+            self.type_from_ast(rtn, ast)
         } else {
             self.arena.make_adt(type_name, Box::new([]))
         };
@@ -721,41 +723,6 @@ impl<'a> InferContext<'a> {
     /// 从 sema_result 查找构造器定义（按名称）。
     fn find_ctor_def(&self, ctor_name: &str) -> Option<&CtorDefInfo> {
         self.sema_result.get_ctor_def(ctor_name)
-    }
-
-    /// 将 AST TypeNode 解析为 TypeHandle（简化版，用于 GADT）。
-    ///
-    /// 完整实现应调用 type_resolver 的 resolve_type_node_concrete，
-    /// 此处简化为基本类型映射，避免引入循环依赖。
-    fn resolve_type_node_to_handle(
-        &mut self,
-        type_ref: AstTypeRef,
-        ast: &AstArena<'_>,
-    ) -> TypeHandle {
-        let tn = &ast.ty(type_ref).node;
-        match tn {
-            TypeNode::SelfType => self
-                .current_self_type()
-                .unwrap_or_else(|| self.arena.fresh_type_var()),
-            TypeNode::Named { name } => {
-                // 内置标量 + str/null/void：派生自 BUILTIN_TABLE
-                if let Some(ct) = name_to_concrete(name) {
-                    self.arena.make(ct)
-                } else {
-                    // 其他命名类型 → 查 TypeBindingStack 或构造 Adt
-                    if let Some(ty) = self.lookup_type_binding(name) {
-                        ty
-                    } else {
-                        self.arena.make_adt((*name).into(), Box::new([]))
-                    }
-                }
-            }
-            TypeNode::RefType { inner } => {
-                let inner_ty = self.resolve_type_node_to_handle(*inner, ast);
-                self.arena.make_ref(inner_ty, false)
-            }
-            _ => self.arena.fresh_type_var(),
-        }
     }
 }
 
@@ -891,11 +858,7 @@ impl<'a> InferContext<'a> {
                     }
                     return self.arena.make_generic((*name).into(), args_box);
                 }
-                // Throw 特殊处理
-                if *name == "Throw" && args_box.len() == 2 {
-                    return self.arena.make_throw(args_box[0], args_box[1]);
-                }
-                // 内置泛型类型（Atomic/Async/Channel 等）构造专用 Ty 变体，
+                // 内置泛型类型（Throw/Atomic/Async/Channel 等）构造专用 Ty 变体，
                 // 不再走 Ty::Generic 路径——避免后续用字符串名匹配识别内置泛型。
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic((*name).into(), args_box);
@@ -913,7 +876,7 @@ impl<'a> InferContext<'a> {
                 if has_type_params {
                     return self.arena.make_adt((*name).into(), args_box);
                 }
-                // 兜底：构造 Generic（可能未定义，后续报错）
+                // 兜底：构造 Generic（可能未定义或前向引用，后续使用时报错）
                 self.arena.make_generic((*name).into(), args_box)
             }
             TypeNode::Nullable { inner } => {
@@ -1558,7 +1521,9 @@ impl<'a> InferContext<'a> {
                 let tv = self.arena.fresh_type_var();
                 let ty = self.arena.make_nullable(tv);
                 if let Some(exp) = expected {
-                    let _ = self.try_widen_unify(exp, ty);
+                    if let Err(e) = self.try_widen_unify(exp, ty) {
+                        self.add_error(&format!("null literal incompatible with expected type: {}", e));
+                    }
                 }
                 ty
             }
@@ -1670,9 +1635,13 @@ impl<'a> InferContext<'a> {
                         // Range 表达式 a..b / a..=b 返回 RangeIterator 类型
                         // （Range 本身是迭代器，For 循环通过 RangeIterator.next 静态分派）
                         let i64_ty = self.make_builtin(Ty::I64);
-                        let _ = self.try_widen_unify(i64_ty, left_ty);
+                        if let Err(e) = self.try_widen_unify(i64_ty, left_ty) {
+                            self.add_error(&format!("range operand must be integer: {}", e));
+                        }
                         let i64_ty = self.make_builtin(Ty::I64);
-                        let _ = self.try_widen_unify(i64_ty, right_ty);
+                        if let Err(e) = self.try_widen_unify(i64_ty, right_ty) {
+                            self.add_error(&format!("range operand must be integer: {}", e));
+                        }
                         self.arena.make_generic(
                             "RangeIterator".into(),
                             Box::new([]),
@@ -1687,7 +1656,9 @@ impl<'a> InferContext<'a> {
                         if let Ty::Throw(_) = self.arena.get(rl) {
                             let value_ty = self.arena.throw_parts(rl).0;
                             // unify rhs 到 value_ty，确保默认值类型兼容
-                            let _ = self.try_widen_unify(value_ty, right_ty);
+                            if let Err(e) = self.try_widen_unify(value_ty, right_ty) {
+                                self.add_error(&format!("?? default value incompatible with Throw value type: {}", e));
+                            }
                             return value_ty;
                         }
                         left_ty
@@ -1778,11 +1749,22 @@ impl<'a> InferContext<'a> {
                         }
                         return return_type;
                     }
-                    // 兜底：推断所有参数，返回 fresh var
+                    // 非 Fn 类型的 callee：报错并返回 Unknown
+                    let span = ast.expr(expr).span;
+                    let callee_name = self
+                        .arena
+                        .type_name(resolved_callee)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("{:?}", self.arena.get(resolved_callee)));
+                    self.add_error_at(
+                        &format!("cannot call non-function value of type '{}'", callee_name),
+                        span.line,
+                        span.column,
+                    );
                     for &a in args.iter() {
                         let _ = self.infer_expr(a, ast, env, None);
                     }
-                    return self.arena.fresh_type_var();
+                    return self.arena.make(Ty::Unknown);
                 }
 
                 // ModuleRef 调用：callee 是模块路径引用（如 "std.reflect.Reflect.format"），
@@ -1800,7 +1782,9 @@ impl<'a> InferContext<'a> {
                                 if params.len() == args.len() {
                                     for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                                         let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                                        let _ = self.try_widen_unify(param_ty, arg_ty);
+                                        if let Err(e) = self.try_widen_unify(param_ty, arg_ty) {
+                                            self.add_error(&format!("argument type incompatible with parameter type: {}", e));
+                                        }
                                     }
                                     return return_type;
                                 }
@@ -2114,12 +2098,16 @@ impl<'a> InferContext<'a> {
                 let rl = self.arena.resolve(left_ty);
                 if let Ty::Nullable(_) = self.arena.get(rl) {
                     let inner = self.arena.nullable_inner(rl);
-                    let _ = self.try_widen_unify(inner, right_ty);
+                    if let Err(e) = self.try_widen_unify(inner, right_ty) {
+                        self.add_error(&format!("?? default value incompatible with Nullable inner type: {}", e));
+                    }
                     inner
                 } else if let Ty::Throw(_) = self.arena.get(rl) {
                     // Throw<T,E> ?? rhs → 返回 T，与 Nullable 对称（Bug #28）
                     let value_ty = self.arena.throw_parts(rl).0;
-                    let _ = self.try_widen_unify(value_ty, right_ty);
+                    if let Err(e) = self.try_widen_unify(value_ty, right_ty) {
+                        self.add_error(&format!("?? default value incompatible with Throw value type: {}", e));
+                    }
                     value_ty
                 } else {
                     left_ty
@@ -2144,7 +2132,9 @@ impl<'a> InferContext<'a> {
                 let first_ty = self.infer_expr(elements[0], ast, env, expected_elem);
                 for &e in elements.iter().skip(1) {
                     let elem_ty = self.infer_expr(e, ast, env, expected_elem);
-                    let _ = self.try_widen_unify(first_ty, elem_ty);
+                    if let Err(e_err) = self.try_widen_unify(first_ty, elem_ty) {
+                        self.add_error(&format!("array element type mismatch: {}", e_err));
+                    }
                 }
                 self.arena.make_array(first_ty, Some(elements.len() as u64))
             }
@@ -2215,7 +2205,9 @@ impl<'a> InferContext<'a> {
                 };
                 let effective_body_ty = if let Some(rt) = return_type {
                     let annot_ty = self.type_from_ast(*rt, ast);
-                    let _ = self.try_widen_unify(annot_ty, body_ty);
+                    if let Err(e) = self.try_widen_unify(annot_ty, body_ty) {
+                        self.add_error(&format!("lambda body type incompatible with declared return type: {}", e));
+                    }
                     annot_ty
                 } else {
                     body_ty
@@ -2306,8 +2298,8 @@ impl<'a> InferContext<'a> {
                     );
                     let has_ok_arm = arms.iter().any(|arm| {
                         match &ast.pattern(arm.pattern).node {
-                            Pattern::Constructor { name, .. } => *name == "Ok",
-                            Pattern::Variable { name } => *name == "Ok",
+                            Pattern::Constructor { name, .. } => *name == crate::ir::Compute::CTOR_OK,
+                            Pattern::Variable { name } => *name == crate::ir::Compute::CTOR_OK,
                             _ => false,
                         }
                     });
@@ -2480,7 +2472,7 @@ impl<'a> InferContext<'a> {
                     .iter()
                     .map(|m| {
                         let return_type = match m.return_type {
-                            Some(rt) => self.resolve_type_node_to_handle(rt, ast),
+                            Some(rt) => self.type_from_ast(rt, ast),
                             None => self.arena.make(Ty::Void),
                         };
                         TraitMethodSig {
@@ -2620,11 +2612,7 @@ impl<'a> InferContext<'a> {
                     args.iter().map(|a| self.type_repr_to_handle(a)).collect();
                 let args_box: Box<[TypeHandle]> = new_args.into_boxed_slice();
 
-                // Throw 特殊处理
-                if name.as_ref() == "Throw" && args_box.len() == 2 {
-                    return self.arena.make_throw(args_box[0], args_box[1]);
-                }
-                // 内置泛型类型（Atomic/Async/Channel 等）构造专用 Ty 变体
+                // 内置泛型类型（Throw/Atomic/Async/Channel 等）构造专用 Ty 变体
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic(name.clone(), args_box);
                 }
@@ -2641,7 +2629,7 @@ impl<'a> InferContext<'a> {
                 if has_type_params {
                     return self.arena.make_adt(name.clone(), args_box);
                 }
-                // 兜底：构造 Generic
+                // 兜底：构造 Generic（可能未定义或前向引用，后续使用时报错）
                 self.arena.make_generic(name.clone(), args_box)
             }
             TypeRepr::Nullable(inner) => {

@@ -42,10 +42,10 @@ pub trait TypeOps: Send + Sync + 'static {
 // 手动实现。TypeDescriptor 静态常量不再生成（TypeDescriptor 已删除）。
 
 macro_rules! impl_scalar_ops {
-    // 内部分支：生成 read/write/equal/format/hash_val/clone_val 六个方法。
+    // 内部分支：生成 read/write/format/hash_val/clone_val 五个方法（不含 equal）。
     // 这些方法的职责就是操作裸指针指向的类型化内存，clippy 的
     // `not_unsafe_ptr_arg_deref` 在此为误报，统一 allow。
-    (@fns $ty:ty, $alloc:ident, $get:ident, [$v:ident => $fmt:expr]) => {
+    (@fns_core $ty:ty, $alloc:ident, $get:ident, [$v:ident => $fmt:expr]) => {
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
@@ -59,15 +59,6 @@ macro_rules! impl_scalar_ops {
             let $v: $ty = arena.$get(h);
             // SAFETY: ptr 指向可写的 $ty 内存，按非对齐方式写入。
             unsafe { std::ptr::write_unaligned(ptr as *mut $ty, $v) }
-        }
-        #[inline]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        fn equal(&self, a: *const u8, b: *const u8) -> bool {
-            // SAFETY: 两个指针均指向合法的 $ty 值。
-            unsafe {
-                std::ptr::read_unaligned(a as *const $ty)
-                    == std::ptr::read_unaligned(b as *const $ty)
-            }
         }
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -100,6 +91,22 @@ macro_rules! impl_scalar_ops {
             // SAFETY: 标量为值语义，clone 等价于 read。
             let $v: $ty = unsafe { std::ptr::read_unaligned(ptr as *const $ty) };
             arena.$alloc($v)
+        }
+    };
+
+    // 完整 @fns = @fns_core + 默认 equal（bit-pattern 比较）。
+    // f32/f64 的原生 == 已实现 IEEE 语义（NaN≠NaN，-0==+0）；
+    // 整数/bool/char 的 == 即值相等。f16 存储为 u16，需 IEEE 语义时走 coerce=f16 分支。
+    (@fns $ty:ty, $alloc:ident, $get:ident, [$v:ident => $fmt:expr]) => {
+        impl_scalar_ops!(@fns_core $ty, $alloc, $get, [$v => $fmt]);
+        #[inline]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        fn equal(&self, a: *const u8, b: *const u8) -> bool {
+            // SAFETY: 两个指针均指向合法的 $ty 值。
+            unsafe {
+                std::ptr::read_unaligned(a as *const $ty)
+                    == std::ptr::read_unaligned(b as *const $ty)
+            }
         }
     };
 
@@ -182,7 +189,25 @@ macro_rules! impl_scalar_ops {
     ) => {
         pub struct $ops;
         impl TypeOps for $ops {
-            impl_scalar_ops!(@fns $ty, $alloc, $get, [$v => $fmt]);
+            impl_scalar_ops!(@fns_core $ty, $alloc, $get, [$v => $fmt]);
+            #[inline]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            fn equal(&self, a: *const u8, b: *const u8) -> bool {
+                // IEEE 754 语义：NaN≠NaN，-0==+0（与 f32/f64/f128 的 equal 一致）。
+                // F16 存储为 u16 bit pattern，不能用 u16 == u16（会得到 NaN==NaN、-0≠+0）。
+                unsafe {
+                    let x = std::ptr::read_unaligned(a as *const u16);
+                    let y = std::ptr::read_unaligned(b as *const u16);
+                    // NaN 判定：exponent 全 1 (0x7C00) 且 mantissa 非零 (0x03FF)
+                    let x_nan = (x & 0x7C00) == 0x7C00 && (x & 0x03FF) != 0;
+                    let y_nan = (y & 0x7C00) == 0x7C00 && (y & 0x03FF) != 0;
+                    if x_nan || y_nan {
+                        return false;
+                    }
+                    // -0 == +0：两者 exponent 与 mantissa 均为零时视为相等
+                    x == y || (x | y) & 0x7FFF == 0
+                }
+            }
             #[inline]
             fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
                 let f: f32 = match v.tag() {
@@ -221,6 +246,14 @@ macro_rules! impl_scalar_ops {
             impl_scalar_ops!(@fns $ty, $alloc, $get, [$v => $fmt]);
             #[inline]
             fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
+                // i128/u128 精度超出 f64（53 位），用 F128::from_i128/from_u128 精确构造；
+                // F128 源恒等返回，无精度损失；其余经 f64（值在 f64 精度内，无损）。
+                match v.tag() {
+                    ValueTag::I128 => return arena.$alloc(F128::from_i128(arena.get_i128(v))),
+                    ValueTag::U128 => return arena.$alloc(F128::from_u128(arena.get_u128(v))),
+                    ValueTag::F128 => return v,
+                    _ => {}
+                }
                 let f: f64 = match v.tag() {
                     ValueTag::Bool => arena.get_bool(v) as u8 as f64,
                     ValueTag::Char => arena.get_char(v) as u64 as f64,
@@ -228,19 +261,18 @@ macro_rules! impl_scalar_ops {
                     ValueTag::I16 => arena.get_i16(v) as f64,
                     ValueTag::I32 => arena.get_i32(v) as f64,
                     ValueTag::I64 => arena.get_i64(v) as f64,
-                    ValueTag::I128 => arena.get_i128(v) as f64,
                     ValueTag::U8 => arena.get_u8(v) as f64,
                     ValueTag::U16 => arena.get_u16(v) as f64,
                     ValueTag::U32 => arena.get_u32(v) as f64,
                     ValueTag::U64 => arena.get_u64(v) as f64,
-                    ValueTag::U128 => arena.get_u128(v) as f64,
                     ValueTag::Isize => arena.get_isize(v) as f64,
                     ValueTag::Usize => arena.get_usize(v) as f64,
                     ValueTag::F16 => F16(arena.get_f16(v)).to_f32() as f64,
                     ValueTag::F32 => arena.get_f32(v) as f64,
                     ValueTag::F64 => arena.get_f64(v),
-                    ValueTag::F128 => arena.get_f128(v).to_f64(),
                     ValueTag::Null | ValueTag::Void | ValueTag::Ref => 0.0,
+                    // I128/U128/F128 已在上方 early return，不会到达
+                    ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => unreachable!(),
                 };
                 arena.$alloc(F128::from_f64(f))
             }
@@ -511,6 +543,13 @@ impl TypeOps for F128Ops {
     }
     #[inline]
     fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
+        // i128/u128 经 as f64 会丢精度，用 from_i128/from_u128 精确构造；F128 源恒等返回
+        match v.tag() {
+            ValueTag::I128 => return arena.alloc_f128(F128::from_i128(arena.get_i128(v))),
+            ValueTag::U128 => return arena.alloc_f128(F128::from_u128(arena.get_u128(v))),
+            ValueTag::F128 => return v,
+            _ => {}
+        }
         let f: f64 = match v.tag() {
             ValueTag::Bool => arena.get_bool(v) as u8 as f64,
             ValueTag::Char => arena.get_char(v) as u64 as f64,
@@ -518,28 +557,33 @@ impl TypeOps for F128Ops {
             ValueTag::I16 => arena.get_i16(v) as f64,
             ValueTag::I32 => arena.get_i32(v) as f64,
             ValueTag::I64 => arena.get_i64(v) as f64,
-            ValueTag::I128 => arena.get_i128(v) as f64,
             ValueTag::U8 => arena.get_u8(v) as f64,
             ValueTag::U16 => arena.get_u16(v) as f64,
             ValueTag::U32 => arena.get_u32(v) as f64,
             ValueTag::U64 => arena.get_u64(v) as f64,
-            ValueTag::U128 => arena.get_u128(v) as f64,
             ValueTag::Isize => arena.get_isize(v) as f64,
             ValueTag::Usize => arena.get_usize(v) as f64,
             ValueTag::F16 => F16(arena.get_f16(v)).to_f32() as f64,
             ValueTag::F32 => arena.get_f32(v) as f64,
             ValueTag::F64 => arena.get_f64(v),
-            ValueTag::F128 => arena.get_f128(v).to_f64(),
             ValueTag::Null | ValueTag::Void | ValueTag::Ref => 0.0,
+            ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => unreachable!(),
         };
         arena.alloc_f128(F128::from_f64(f))
     }
     #[inline]
     fn equal(&self, a: *const u8, b: *const u8) -> bool {
-        // SAFETY: 两指针均指向合法 F128。
+        // IEEE 754 语义：NaN≠NaN，-0==+0（与 f32/f64 的 equal 一致）
         unsafe {
-            std::ptr::read_unaligned(a as *const F128)
-                == std::ptr::read_unaligned(b as *const F128)
+            let x = std::ptr::read_unaligned(a as *const F128);
+            let y = std::ptr::read_unaligned(b as *const F128);
+            if x.is_nan() || y.is_nan() {
+                return false;
+            }
+            // -0 == +0：bit pattern 仅符号位不同时视为相等
+            let xb = u128::from_le_bytes(x.0);
+            let yb = u128::from_le_bytes(y.0);
+            xb == yb || (xb | yb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
         }
     }
     #[inline]

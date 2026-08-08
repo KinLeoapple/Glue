@@ -11,3 +11,7 @@
 
 pub mod ExternC;
 pub mod Ffi;
+
+/// 属性名常量（单点维护，消除字符串字面量散布）
+pub const ATTR_EXTERN: &str = "extern";
+pub const ATTR_C_INCLUDE: &str = "c_include";

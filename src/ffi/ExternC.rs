@@ -233,7 +233,7 @@ fn c_type_to_rust(c_type: &str) -> &'static str {
 /// emits a warning to avoid silently missing the attribute.
 fn is_extern_c(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
-        if a.name != "extern" {
+        if a.name != super::ATTR_EXTERN {
             return false;
         }
         if a.args.contains(&"C") {
@@ -250,7 +250,7 @@ fn is_extern_c(attrs: &[Attribute]) -> bool {
 fn collect_c_includes(attrs: &[Attribute]) -> Vec<String> {
     let mut includes = Vec::new();
     for attr in attrs {
-        if attr.name == "c_include" {
+        if attr.name == super::ATTR_C_INCLUDE {
             for arg in &attr.args {
                 let inc = arg.to_string();
                 if !includes.contains(&inc) {
