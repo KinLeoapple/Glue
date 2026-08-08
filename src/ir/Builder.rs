@@ -65,6 +65,11 @@ pub struct IrBuilder<'a> {
     /// compile_function 入口设 true，Return value 设 true，
     /// Block trailing 继承，If/Match 分支继承，参数/条件/赋值右侧设 false。
     pub in_tail_position: bool,
+    /// 尾递归转迭代上下文：Some 时 compile_call 拦截 self 调用为 WriteBack + Call(while_sg)。
+    /// None = 不在尾递归转迭代 body 编译中。
+    pub(crate) tail_rec_ctx: Option<TailRecCtx>,
+    /// 非尾递归转迭代上下文
+    pub(crate) non_tail_rec_ctx: Option<NonTailRecCtx>,
     /// 当前正在编译的单态化实例的类型参数映射（类型参数名 → TypeHandle）。
     /// 为空表示不在泛型实例上下文中（普通非泛型函数）。
     /// compile_cast_call 解析 target 类型参数时查此表替换为具体类型；
@@ -140,6 +145,47 @@ const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
     ("channel", BuiltinCtorLower::Channel),
 ];
 
+/// 尾递归转迭代上下文：compile_call 拦截 self 调用时使用。
+/// while_sg_id = 循环子图 id，self_name = 当前函数名，param_nodes = 参数节点列表。
+#[derive(Clone)]
+pub(crate) struct TailRecCtx {
+    while_sg_id: SubGraphId,
+    self_name: String,
+    param_nodes: Vec<NodeId>,
+}
+
+/// 非尾递归转迭代上下文：在 body_sg 编译中拦截自调用为 push + continue。
+#[derive(Clone)]
+pub(crate) struct NonTailRecCtx {
+    /// 函数自身名称
+    pub self_name: String,
+    /// 函数参数节点列表（编译续延时更新为当前栈帧的 param_cur 节点）
+    pub param_nodes: Vec<NodeId>,
+    /// 工作栈数组节点（函数子图中的局部变量）
+    pub stack_node: NodeId,
+    /// 栈指针节点（sp，函数子图中的局部变量）
+    pub sp_node: NodeId,
+    /// 结果变量节点（result，函数子图中的局部变量）
+    pub result_node: NodeId,
+    /// 所有非尾自调用的 ExprId（按遍历顺序）
+    pub call_sites: Vec<crate::ast::Ast::ExprId>,
+    /// 调用点 ExprId → 节点的映射。
+    /// 编译续延时，遇到映射中的 ExprId 则返回对应节点（result 或 saved）。
+    pub call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId>,
+    /// 截断标志：拦截第一个自调用后设为 true，后续自调用生成 void 常量。
+    pub truncated: bool,
+    /// 栈帧步长 = param_count + 1(state) + max_saved_count
+    pub stride: u32,
+    /// 函数参数数量
+    pub param_count: usize,
+    /// 最大保存值数量 = call_sites.len() - 1
+    pub max_saved: usize,
+    /// 当前编译的 state 号（0 = INIT）
+    pub current_state: u32,
+    /// 当前栈帧的 saved 节点列表（body_sg pop 阶段从栈帧读取）
+    pub saved_nodes: Vec<NodeId>,
+}
+
 impl<'a> IrBuilder<'a> {
     /// 创建构建器。
     pub fn new(sema: &'a crate::sema::Sema::SemaResult, type_arena: &'a crate::sema::Sema::TypeArena, module: &'a crate::ast::Ast::Module<'a>) -> Self {
@@ -164,6 +210,8 @@ impl<'a> IrBuilder<'a> {
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
+            tail_rec_ctx: None,
+            non_tail_rec_ctx: None,
             current_type_args: Vec::new(),
             current_instance_id: None,
             errors: Vec::new(),
@@ -972,11 +1020,17 @@ impl<'a> IrBuilder<'a> {
         // 条件不在尾位置：其值仅供 Gate 选择分支，而非直接返回。
         // 分支结果表达式则继承当前尾位置（if 表达式的值=选中分支的值）。
         let cond_node = self.compile_subexpr(cond);
+        // 保存 current_effect：分支编译（compile_branch_subgraph）不恢复 current_effect，
+        // else 分支中的副作用（如非尾递归拦截的 barrier）会泄漏到 Gate 的 effect 依赖，
+        // 导致 Gate 等待 barrier 就绪而无法在 base case 路径完成。
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
         let (then_sg, then_inputs) = self.compile_branch_subgraph(then_branch);
         let (else_sg, else_inputs) = match else_branch {
             Some(e) => self.compile_branch_subgraph(e),
             None => (self.compile_void_subgraph(), Vec::new()),
         };
+        self.current_effect = prev_effect;
         // Gate 依赖 cond_node（条件值）和 current_effect（effect 链前序副作用），
         // 确保 Gate 在前序语句（如 println）完成后才执行。
         let gate_inputs: Vec<NodeId> = match self.current_effect {
@@ -2191,6 +2245,785 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
+    /// 查询 analysis.memo 中当前函数的 TailRecToLoop 策略。
+    /// 仅 entry 模块有效（compiling_builtin == None 时调用方保证）。
+    fn lookup_tail_rec_info(
+        &self,
+        name: &str,
+        module: &crate::ast::Ast::Module,
+    ) -> Option<crate::pass::Analyzer::TailRecInfo> {
+        let report = self.analysis?;
+        let func_id = crate::pass::Analyzer::FuncId(
+            module.declarations.iter().position(|d| {
+                matches!(&d.node, crate::ast::Ast::Decl::FunDecl { name: n, .. } if *n == name)
+            })? as u32
+        );
+        report.memo.candidates.iter().find_map(|c| {
+            if c.func == func_id {
+                if let crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info } = &c.strategy {
+                    return Some(info.clone());
+                }
+            }
+            None
+        })
+    }
+
+    /// 查询 analysis.memo 中当前函数的 NonTailRecToLoop 策略。
+    /// 仅 entry 模块有效（compiling_builtin == None 时调用方保证）。
+    fn lookup_non_tail_rec_info(
+        &self,
+        name: &str,
+        module: &crate::ast::Ast::Module,
+    ) -> Option<crate::pass::Analyzer::NonTailRecInfo> {
+        let report = self.analysis?;
+        let func_id = crate::pass::Analyzer::FuncId(
+            module.declarations.iter().position(|d| {
+                matches!(&d.node, crate::ast::Ast::Decl::FunDecl { name: n, .. } if *n == name)
+            })? as u32
+        );
+        report.memo.candidates.iter().find_map(|c| {
+            if c.func == func_id {
+                if let crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { info } = &c.strategy {
+                    return Some(info.clone());
+                }
+            }
+            None
+        })
+    }
+
+    /// 尾递归转迭代：消费 TailRecInfo 构造 while_sg IR。
+    ///
+    /// 由 compile_function 在检测到 MemoStrategy::TailRecToLoop 时调用。
+    /// 参数节点已由 compile_function 创建并 bind_var，此方法构造循环结构。
+    ///
+    /// 结构：
+    /// - while_sg: cond = NOT(base_case 条件), Gate(cond) → body_sg / exit_sg
+    /// - body_sg: 编译原函数体（tail_rec_ctx 拦截尾调用为 WriteBack + Call(while_sg)）
+    /// - exit_sg: 编译 base_case 返回值
+    fn compile_tail_rec_to_loop(
+        &mut self,
+        name: &str,
+        body_expr: crate::ast::Ast::ExprId,
+        params: &[crate::ast::Ast::Param<'_>],
+        info: &crate::pass::Analyzer::TailRecInfo,
+    ) -> NodeId {
+        // 1. 收集参数节点（compile_function 已 bind_var）
+        let param_nodes: Vec<NodeId> = params
+            .iter()
+            .filter_map(|p| self.lookup_var(p.name))
+            .collect();
+
+        // 2. 占位注册 while_sg
+        let node_start = self.graph.nodes.len() as u32;
+        let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: while_sg_id,
+            node_range: (NodeId(node_start), NodeId(node_start)),
+            param_count: 0,
+            entry_node: NodeId(node_start),
+            return_node: NodeId(node_start),
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+        });
+
+        // 3. 构造循环条件 cond_node（在 while_sg node_range 内）
+        let cond_node = self.build_tail_rec_cond(&info.base_cases, &info.rec_branches);
+
+        // 4. 设置 tail_rec_ctx（compile_call 拦截 self 调用为 WriteBack + Call(while_sg)）
+        self.tail_rec_ctx = Some(TailRecCtx {
+            while_sg_id,
+            self_name: name.to_string(),
+            param_nodes,
+        });
+
+        // 5. 编译 body_sg：编译原函数体（LoopBody，完成后 reset_loop_iteration 自动回跳）
+        //    尾调用 self(args) 被 compile_call 拦截为 WriteBack（无 Call，无 tail_call）
+        //    base_case 路径也被编译，但 cond 保证不执行（DCE 可消除）
+        //    强制 in_tail_position = true：void 函数的 in_tail_position 默认为 false
+        //    （compile_function 第 5208 行 `!is_void_fn`），但尾递归转换的 body_sg 中
+        //    自调用必须在尾位置被拦截为 WriteBack，否则会生成真正的递归 Call 节点
+        //    导致死循环（循环条件基于初始参数值，参数永不更新）。
+        let prev_effect = self.current_effect;
+        let prev_tail = self.in_tail_position;
+        self.current_effect = None;
+        self.in_tail_position = true;
+        let body_sg = self.compile_loop_body_subgraph(body_expr, while_sg_id);
+        self.in_tail_position = prev_tail;
+        self.current_effect = prev_effect;
+
+        // 6. 清除 tail_rec_ctx
+        self.tail_rec_ctx = None;
+
+        // 7. 编译 exit_sg：编译 base_case 返回值
+        //    v1 支持单 base_case：直接编译返回值表达式
+        //    多 base_case 取第一个有条件的（cond 保证只有一个成立）
+        let exit_expr = info.base_cases
+            .iter()
+            .find(|(c, _)| c.is_some())
+            .or_else(|| info.base_cases.first())
+            .map(|(_, ret)| *ret)
+            .unwrap_or(body_expr);
+        let (exit_sg, exit_inputs) = self.compile_branch_subgraph(exit_expr);
+
+        // 8. Gate(cond): true → body_sg, false → exit_sg
+        let gate_inputs: Vec<NodeId> = match self.current_effect {
+            Some(eff) => vec![cond_node, eff],
+            None => vec![cond_node],
+        };
+        let gate_off = self.graph.inputs_pool.push(&gate_inputs);
+        let gate_node = self.graph.add_node(Node {
+            kind: NodeKind::Gate,
+            input_count: gate_inputs.len() as u8,
+            inputs_offset: gate_off,
+            compute_fn: CF_GATE_LAUNCH,
+        });
+        self.graph.set_gate_branches(
+            gate_node,
+            GateBranches {
+                condition_input: cond_node,
+                branches: vec![
+                    (true, body_sg, Vec::new()),
+                    (false, exit_sg, exit_inputs),
+                ],
+            },
+        );
+
+        // 9. 填充 while_sg 元数据
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[while_sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = gate_node;
+        sg.loop_kind = LoopKind::While;
+        sg.cond_node = Some(cond_node);
+
+        // 10. 创建 Call 节点启动 while_sg（与 register_while_subgraph + compile_recursive_call 一致）。
+        // while_sg 作为 same_function 子图帧运行，body_sg 完成后 reset_loop_iteration
+        // 读取 while_sg 的 loop_kind=While + cond_node 正确重置循环。
+        // 若直接返回 gate_node，while_sg 节点会在函数主子图帧中执行，
+        // reset_loop_iteration 读取函数主子图的 loop_kind=None → 循环重置失败。
+        let call_node = self.compile_recursive_call(while_sg_id);
+        call_node
+    }
+
+    /// 构造尾递归转迭代的循环条件。
+    /// 规则：
+    /// - 有 base_case with Some(cond)：cond = AND(NOT(base_cond_i))
+    /// - 无 base_case with Some(cond)：cond = OR(rec_cond_i)（德摩根实现）
+    /// - 两者都无：cond = Const(true)（不应发生）
+    fn build_tail_rec_cond(
+        &mut self,
+        base_cases: &[(Option<crate::ast::Ast::ExprId>, crate::ast::Ast::ExprId)],
+        rec_branches: &[(Option<crate::ast::Ast::ExprId>, Vec<crate::ast::Ast::ExprId>)],
+    ) -> NodeId {
+        let base_conds: Vec<crate::ast::Ast::ExprId> = base_cases
+            .iter()
+            .filter_map(|(c, _)| *c)
+            .collect();
+
+        if !base_conds.is_empty() {
+            // cond = AND(NOT(base_cond_i))
+            let mut negated_nodes: Vec<NodeId> = Vec::new();
+            for c in &base_conds {
+                let cond_node = self.compile_subexpr(*c);
+                let not_off = self.graph.inputs_pool.push(&[cond_node]);
+                negated_nodes.push(self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset: not_off,
+                    compute_fn: CF_NOT_BOOL,
+                }));
+            }
+            let mut result = negated_nodes[0];
+            for n in &negated_nodes[1..] {
+                let and_off = self.graph.inputs_pool.push(&[result, *n]);
+                result = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: and_off,
+                    compute_fn: CF_AND_BOOL,
+                });
+            }
+            result
+        } else {
+            // 无 base_case with Some(cond)：cond = OR(rec_cond_i) = NOT(AND(NOT(rec_cond_i)))
+            let rec_conds: Vec<crate::ast::Ast::ExprId> = rec_branches
+                .iter()
+                .filter_map(|(c, _)| *c)
+                .collect();
+            if rec_conds.is_empty() {
+                // 无条件递归（不应发生），cond = Const(true)
+                let off = self.graph.inputs_pool.push(&[]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset: off,
+                    compute_fn: CF_NOOP,
+                })
+            } else {
+                let mut negated: Vec<NodeId> = Vec::new();
+                for c in &rec_conds {
+                    let cn = self.compile_subexpr(*c);
+                    let not_off = self.graph.inputs_pool.push(&[cn]);
+                    negated.push(self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 1,
+                        inputs_offset: not_off,
+                        compute_fn: CF_NOT_BOOL,
+                    }));
+                }
+                let mut and_result = negated[0];
+                for n in &negated[1..] {
+                    let and_off = self.graph.inputs_pool.push(&[and_result, *n]);
+                    and_result = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: and_off,
+                        compute_fn: CF_AND_BOOL,
+                    });
+                }
+                let not_off = self.graph.inputs_pool.push(&[and_result]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset: not_off,
+                    compute_fn: CF_NOT_BOOL,
+                })
+            }
+        }
+    }
+
+    // ---- 非尾递归转迭代辅助方法 ----
+
+    /// 创建 i32 常量节点。
+    fn make_i32_const(&mut self, val: i32) -> NodeId {
+        let n = self.compile_const();
+        self.graph.const_values[n.0 as usize] = Some(ConstValue::I32(val));
+        n
+    }
+
+    /// 创建二元运算节点。
+    fn make_binop(&mut self, lhs: NodeId, rhs: NodeId, cf: ComputeFnId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[lhs, rhs]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 2,
+            inputs_offset: off,
+            compute_fn: cf,
+        })
+    }
+
+    /// 创建数组存储节点 arr[idx] = val。
+    fn make_array_store(&mut self, arr: NodeId, idx: NodeId, val: NodeId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[arr, idx, val]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 3,
+            inputs_offset: off,
+            compute_fn: CF_ARRAY_STORE,
+        })
+    }
+
+    /// 创建数组索引节点 arr[idx]。
+    fn make_array_index(&mut self, arr: NodeId, idx: NodeId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[arr, idx]);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 2,
+            inputs_offset: off,
+            compute_fn: CF_ARRAY_INDEX,
+        })
+    }
+
+    /// 创建 Continue 信号屏障节点（依赖 dep，触发 Continue 信号）。
+    fn make_continue_barrier(&mut self, dep: NodeId) -> NodeId {
+        let off = self.graph.inputs_pool.push(&[dep]);
+        let n = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 1,
+            inputs_offset: off,
+            compute_fn: CF_SEQ,
+        });
+        self.graph.set_control_signal(n, SignalKind::Continue);
+        n
+    }
+
+    /// 非尾递归转迭代：消费 NonTailRecInfo 构造"工作栈 + while 循环 + 状态机"IR。
+    ///
+    /// 由 compile_function 在检测到 MemoStrategy::NonTailRecToLoop 时调用。
+    /// 参数节点已由 compile_function 创建并 bind_var，此方法构造循环结构。
+    ///
+    /// 结构：
+    /// - 函数子图：param 节点 + 局部变量（stack, sp, result）+ 初始帧入栈 + Call(while_sg)
+    /// - while_sg: cond = sp > 0, Gate(cond) → body_sg / result_sg
+    /// - body_sg (LoopBody): pop 栈帧 → 读 param_cur/state/saved → Gate 链按 state 分派
+    /// - state_N_sg: 编译函数体（non_tail_rec_ctx 拦截自调用为 push + barrier(Continue)）
+    /// - result_sg: 返回 result_node
+    ///
+    /// 栈帧布局（步长 stride = param_count + 1 + max_saved）：
+    /// [param_0, ..., param_{P-1}, state, saved_0, ..., saved_{max_saved-1}]
+    fn compile_non_tail_rec_to_loop(
+        &mut self,
+        name: &str,
+        body_expr: crate::ast::Ast::ExprId,
+        params: &[crate::ast::Ast::Param<'_>],
+        info: &crate::pass::Analyzer::NonTailRecInfo,
+    ) -> NodeId {
+        let param_count = info.param_count;
+        let call_sites: Vec<crate::ast::Ast::ExprId> = info.call_sites.clone();
+        let num_call_sites = call_sites.len();
+        let max_saved = num_call_sites.saturating_sub(1);
+        let stride = (param_count + 1 + max_saved) as u32;
+
+        // 1. 收集参数节点（compile_function 已 bind_var）
+        let param_nodes: Vec<NodeId> = params
+            .iter()
+            .filter_map(|p| self.lookup_var(p.name))
+            .collect();
+
+        // 2. 创建局部变量：stack_node（空数组）、sp_node（0）、result_node（void）
+        let stack_off = self.graph.inputs_pool.push(&[]);
+        let stack_node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 0,
+            inputs_offset: stack_off,
+            compute_fn: CF_ARRAY_CONSTRUCT,
+        });
+        let sp_node = self.make_i32_const(0);
+        let result_node = self.compile_void_const();
+
+        // 3. 初始帧入栈：stack[0..P] = params, stack[P] = 0 (INIT), stack[P+1..] = 0; sp = 1
+        // 所有 array_store 必须链入 effect 链，确保 Call(while_sg) 在栈填充后执行。
+        let zero_init = self.make_i32_const(0);
+        let mut init_effect: Option<NodeId> = None;
+        for i in 0..param_count {
+            let idx = self.make_i32_const(i as i32);
+            let store = self.make_array_store(stack_node, idx, param_nodes[i]);
+            init_effect = Some(self.chain_effects(init_effect, store));
+        }
+        let state_zero_idx = self.make_i32_const(param_count as i32);
+        let state_zero_store = self.make_array_store(stack_node, state_zero_idx, zero_init);
+        init_effect = Some(self.chain_effects(init_effect, state_zero_store));
+        for i in 0..max_saved {
+            let idx = self.make_i32_const((param_count + 1 + i) as i32);
+            let store = self.make_array_store(stack_node, idx, zero_init);
+            init_effect = Some(self.chain_effects(init_effect, store));
+        }
+        let one_init = self.make_i32_const(1);
+        let sp_init_wb = self.compile_writeback_node(one_init, sp_node);
+        self.current_effect = Some(self.chain_effects(init_effect, sp_init_wb));
+
+        // 4. 占位注册 while_sg
+        let while_node_start = self.graph.nodes.len() as u32;
+        let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: while_sg_id,
+            node_range: (NodeId(while_node_start), NodeId(while_node_start)),
+            param_count: 0,
+            entry_node: NodeId(while_node_start),
+            return_node: NodeId(while_node_start),
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+        });
+
+        // 5. cond_node: sp > 0（在 while_sg node_range 内）
+        let zero_cond = self.make_i32_const(0);
+        let cond_node = self.make_binop(sp_node, zero_cond, CF_GT_I32);
+
+        // 保存 init effect 链（含 sp=1 WriteBack），body_sg 编译会重置 current_effect
+        let init_effect_chain = self.current_effect;
+
+        // 6. 编译 body_sg（LoopBody：pop + 读帧 + 状态分派）
+        let body_sg = self.compile_non_tail_rec_body_sg(
+            body_expr,
+            params,
+            name,
+            &call_sites,
+            while_sg_id,
+            stack_node,
+            sp_node,
+            result_node,
+            param_count,
+            max_saved,
+            stride,
+        );
+
+        // 恢复 init effect 链，使 Call(while_sg) 依赖 init 代码（含 sp=1 WriteBack）
+        self.current_effect = init_effect_chain;
+
+        // 7. 编译 result_sg（false 分支，返回 result_node）
+        let result_sg = {
+            let rs_start = self.graph.nodes.len() as u32;
+            let off = self.graph.inputs_pool.push(&[result_node]);
+            let passthrough = self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 1,
+                inputs_offset: off,
+                compute_fn: CF_SEQ,
+            });
+            let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+            self.graph.add_subgraph(SubGraph {
+                id: sg_id,
+                node_range: (NodeId(rs_start), NodeId(rs_start + 1)),
+                param_count: 0,
+                entry_node: NodeId(rs_start),
+                return_node: passthrough,
+                has_suspend: false,
+                event_source_decls: Vec::new(),
+                defer_table: Vec::new(),
+                loop_kind: LoopKind::None,
+                loop_parent_sg: None,
+                cond_node: None,
+                function_id: self.current_function_id,
+                iter_next_node: None,
+                upvalue_count: 0,
+                upvalue_outer_nodes: Vec::new(),
+            });
+            sg_id
+        };
+
+        // 8. Gate(cond): true → body_sg, false → result_sg
+        let gate_off = self.graph.inputs_pool.push(&[cond_node]);
+        let gate_node = self.graph.add_node(Node {
+            kind: NodeKind::Gate,
+            input_count: 1,
+            inputs_offset: gate_off,
+            compute_fn: CF_GATE_LAUNCH,
+        });
+        self.graph.set_gate_branches(
+            gate_node,
+            GateBranches {
+                condition_input: cond_node,
+                branches: vec![
+                    (true, body_sg, Vec::new()),
+                    (false, result_sg, Vec::new()),
+                ],
+            },
+        );
+
+        // 9. 填充 while_sg 元数据
+        let while_node_end = self.graph.nodes.len() as u32;
+        let while_sg = &mut self.graph.subgraphs[while_sg_id.0 as usize];
+        while_sg.node_range = (NodeId(while_node_start), NodeId(while_node_end));
+        while_sg.entry_node = NodeId(while_node_start);
+        while_sg.return_node = gate_node;
+        while_sg.loop_kind = LoopKind::While;
+        while_sg.cond_node = Some(cond_node);
+
+        // 10. 创建 Call 节点启动 while_sg
+        let call_node = self.compile_recursive_call(while_sg_id);
+        call_node
+    }
+
+    /// 编译非尾递归转迭代的 body_sg（LoopBody 子图）。
+    ///
+    /// 结构：
+    /// 1. Pop: sp = sp - 1 (WriteBack), 读取栈帧
+    /// 2. 读 param_cur[i] = stack[sp * stride + i]
+    /// 3. 读 state = stack[sp * stride + P]
+    /// 4. 读 saved[i] = stack[sp * stride + P + 1 + i]
+    /// 5. Gate 链按 state 分派到各 state_N_sg
+    fn compile_non_tail_rec_body_sg(
+        &mut self,
+        body_expr: crate::ast::Ast::ExprId,
+        params: &[crate::ast::Ast::Param<'_>],
+        self_name: &str,
+        call_sites: &[crate::ast::Ast::ExprId],
+        while_sg_id: SubGraphId,
+        stack_node: NodeId,
+        sp_node: NodeId,
+        result_node: NodeId,
+        param_count: usize,
+        max_saved: usize,
+        stride: u32,
+    ) -> SubGraphId {
+        let body_node_start = self.graph.nodes.len() as u32;
+        let prev_sg_start = self.current_sg_start;
+        self.current_sg_start = body_node_start;
+
+        // 压入循环上下文（Continue 信号回跳目标 = while_sg）
+        self.loop_stack.push(LoopContext {
+            sg: while_sg_id,
+            iter_node: None,
+            body_node_start,
+        });
+
+        // 记录编译前函数子图的 event_source_decls 长度（同 compile_loop_body_subgraph）
+        let prev_decl_count = self.current_function_sg
+            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
+            .map(|sg| sg.event_source_decls.len())
+            .unwrap_or(0);
+
+        // 1. Pop: sp = sp - 1 (WriteBack to sp_node)
+        let one_pop = self.make_i32_const(1);
+        let sp_minus_1 = self.make_binop(sp_node, one_pop, CF_SUB_I32);
+        let pop_wb = self.compile_writeback_node(sp_minus_1, sp_node);
+        self.current_effect = Some(pop_wb);
+
+        // 2. 读栈帧：frame_base = sp_minus_1 * stride
+        let stride_node = self.make_i32_const(stride as i32);
+        let frame_base = self.make_binop(sp_minus_1, stride_node, CF_MUL_I32);
+
+        // param_cur[i] = stack[frame_base + i]
+        let mut param_cur: Vec<NodeId> = Vec::with_capacity(param_count);
+        for i in 0..param_count {
+            let offset = self.make_i32_const(i as i32);
+            let idx = self.make_binop(frame_base, offset, CF_ADD_I32);
+            param_cur.push(self.make_array_index(stack_node, idx));
+        }
+
+        // state = stack[frame_base + param_count]
+        let state_offset = self.make_i32_const(param_count as i32);
+        let state_idx = self.make_binop(frame_base, state_offset, CF_ADD_I32);
+        let state_node = self.make_array_index(stack_node, state_idx);
+
+        // saved[i] = stack[frame_base + param_count + 1 + i]
+        let mut saved_nodes: Vec<NodeId> = Vec::with_capacity(max_saved);
+        for i in 0..max_saved {
+            let offset = self.make_i32_const((param_count + 1 + i) as i32);
+            let idx = self.make_binop(frame_base, offset, CF_ADD_I32);
+            saved_nodes.push(self.make_array_index(stack_node, idx));
+        }
+
+        // 将 param_cur / state_node / saved_nodes 链入 effect，
+        // 确保它们在 dispatch Gate 启动 state_N_sg 之前已就绪。
+        // 否则 Gate 仅依赖 cmp(state_node==i)，可能在 param_cur 尚未计算时
+        // 启动 state_N_sg，导致帧拷贝得到 void 参数值。
+        for &pc in &param_cur {
+            self.current_effect = Some(self.chain_effects(self.current_effect, pc));
+        }
+        self.current_effect = Some(self.chain_effects(self.current_effect, state_node));
+        for &sn in &saved_nodes {
+            self.current_effect = Some(self.chain_effects(self.current_effect, sn));
+        }
+        let frame_read_effect = self.current_effect;
+
+        // 3. 编译各 state_N_sg（每个 state 编译函数体，设置 non_tail_rec_ctx 拦截自调用）
+        let num_states = call_sites.len() + 1;
+        let mut state_sgs: Vec<SubGraphId> = Vec::with_capacity(num_states);
+
+        for state_idx in 0..num_states {
+            // 构建 call_result_map：
+            // state 0: 空（所有调用都是新鲜的）
+            // state N: call_sites[0..N-2] → saved[0..N-2], call_sites[N-1] → result_node
+            let mut call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId> =
+                rustc_hash::FxHashMap::default();
+            for i in 0..state_idx {
+                if i + 1 < state_idx {
+                    call_result_map.insert(call_sites[i], saved_nodes[i]);
+                } else {
+                    // i == state_idx - 1：最近完成的调用结果在 result_node
+                    call_result_map.insert(call_sites[i], result_node);
+                }
+            }
+
+            // 设置 non_tail_rec_ctx
+            self.non_tail_rec_ctx = Some(NonTailRecCtx {
+                self_name: self_name.to_string(),
+                param_nodes: param_cur.clone(),
+                stack_node,
+                sp_node,
+                result_node,
+                call_sites: call_sites.to_vec(),
+                call_result_map,
+                truncated: false,
+                stride,
+                param_count,
+                max_saved,
+                current_state: state_idx as u32,
+                saved_nodes: saved_nodes.clone(),
+            });
+
+            // 编译 state_N_sg
+            let sg_node_start = self.graph.nodes.len() as u32;
+            let prev_sg_start_inner = self.current_sg_start;
+            self.current_sg_start = sg_node_start;
+
+            self.enter_scope();
+            // 绑定参数名到 param_cur 节点（而非函数 param 节点）
+            for (i, param) in params.iter().enumerate() {
+                if i < param_cur.len() {
+                    self.bind_var(param.name, param_cur[i]);
+                }
+            }
+
+            let prev_effect_inner = self.current_effect;
+            let prev_tail = self.in_tail_position;
+            self.current_effect = None;
+            self.in_tail_position = false;
+            let body_node = self.compile_expr(body_expr);
+            self.in_tail_position = prev_tail;
+            self.current_effect = prev_effect_inner;
+
+            // 清除 non_tail_rec_ctx
+            let _was_truncated = self
+                .non_tail_rec_ctx
+                .as_ref()
+                .map_or(false, |c| c.truncated);
+            self.non_tail_rec_ctx = None;
+            self.exit_scope();
+            self.current_sg_start = prev_sg_start_inner;
+
+            // 始终 WriteBack body 结果到 result_node。
+            // 递归路径：barrier 的 Continue 信号在 WriteBack 执行前终止 state_sg，
+            //   WriteBack 不会执行。
+            // base case 路径：body 正常完成，WriteBack 将结果写入 result_node。
+            let return_node = self.compile_writeback_node(body_node, result_node);
+
+            let sg_node_end = self.graph.nodes.len() as u32;
+
+            // 迁移 event_source_decls（同 compile_branch_subgraph）
+            let state_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
+                if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
+                    func_sg.event_source_decls.drain(prev_decl_count..).collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let state_sg = SubGraphId(self.graph.subgraphs.len() as u32);
+            self.graph.add_subgraph(SubGraph {
+                id: state_sg,
+                node_range: (NodeId(sg_node_start), NodeId(sg_node_end)),
+                param_count: 0,
+                entry_node: NodeId(sg_node_start),
+                return_node,
+                has_suspend: false,
+                event_source_decls: state_decls,
+                defer_table: Vec::new(),
+                loop_kind: LoopKind::None,
+                loop_parent_sg: None,
+                cond_node: None,
+                function_id: self.current_function_id,
+                iter_next_node: None,
+                upvalue_count: 0,
+                upvalue_outer_nodes: Vec::new(),
+            });
+            state_sgs.push(state_sg);
+        }
+
+        // 4. 构建 Gate 链按 state 分派（从后往前构建 else 链）
+        let void_sg = self.compile_void_subgraph();
+        let mut false_sg = void_sg;
+        let mut dispatch_gate: NodeId = NodeId(u32::MAX); // 哨兵值，循环中必定被覆盖
+
+        // 重置 current_effect，避免 Gate 链依赖 state 编译残留的 effect
+        self.current_effect = None;
+
+        for i in (0..num_states).rev() {
+            let wrap_start = self.graph.nodes.len() as u32;
+
+            // cmp = state_node == i
+            let state_const = self.make_i32_const(i as i32);
+            let cmp = self.make_binop(state_node, state_const, CF_EQ_I32);
+            // 将 cmp 依赖于 frame_read_effect，确保 param_cur / saved_nodes 已就绪
+            // 后才启动 state_N_sg（否则帧拷贝得到 void 参数值）
+            let cmp_eff = self.chain_effects(frame_read_effect, cmp);
+
+            // Gate(cmp_eff): true → state_sgs[i], false → false_sg
+            let gate_inputs: Vec<NodeId> = vec![cmp_eff];
+            let gate_off = self.graph.inputs_pool.push(&gate_inputs);
+            let gate_node = self.graph.add_node(Node {
+                kind: NodeKind::Gate,
+                input_count: gate_inputs.len() as u8,
+                inputs_offset: gate_off,
+                compute_fn: CF_GATE_LAUNCH,
+            });
+            self.graph.set_gate_branches(
+                gate_node,
+                GateBranches {
+                    condition_input: cmp_eff,
+                    branches: vec![
+                        (true, state_sgs[i], Vec::new()),
+                        (false, false_sg, Vec::new()),
+                    ],
+                },
+            );
+
+            if i == 0 {
+                // 第一个 Gate 留在 body_sg
+                dispatch_gate = gate_node;
+            } else {
+                // 包装为子图，作为前一个 Gate 的 false 分支
+                let wrap_end = self.graph.nodes.len() as u32;
+                let wrap_sg = SubGraphId(self.graph.subgraphs.len() as u32);
+                self.graph.add_subgraph(SubGraph {
+                    id: wrap_sg,
+                    node_range: (NodeId(wrap_start), NodeId(wrap_end)),
+                    param_count: 0,
+                    entry_node: NodeId(wrap_start),
+                    return_node: gate_node,
+                    has_suspend: false,
+                    event_source_decls: Vec::new(),
+                    defer_table: Vec::new(),
+                    loop_kind: LoopKind::None,
+                    loop_parent_sg: None,
+                    cond_node: None,
+                    function_id: self.current_function_id,
+                    iter_next_node: None,
+                    upvalue_count: 0,
+                    upvalue_outer_nodes: Vec::new(),
+                });
+                false_sg = wrap_sg;
+            }
+        }
+
+        // 5. 弹出循环上下文，注册 body_sg
+        self.loop_stack.pop();
+        self.current_sg_start = prev_sg_start;
+
+        let body_node_end = self.graph.nodes.len() as u32;
+
+        // 迁移 body_sg 自身的 event_source_decls
+        let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
+            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
+                func_sg.event_source_decls.drain(prev_decl_count..).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let body_sg = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: body_sg,
+            node_range: (NodeId(body_node_start), NodeId(body_node_end)),
+            param_count: 0,
+            entry_node: NodeId(body_node_start),
+            return_node: dispatch_gate,
+            has_suspend: false,
+            event_source_decls: body_decls,
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::LoopBody,
+            loop_parent_sg: Some(while_sg_id),
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+        });
+        body_sg
+    }
+
     /// 注册 Loop 循环子图（无 condition，靠 Break 终止）。
     ///
     /// 结构（与 While 统一，cond 恒 true）：
@@ -2362,12 +3195,21 @@ impl<'a> IrBuilder<'a> {
             cond_node: NodeId,
             body_sg: SubGraphId,
             body_inputs: Vec<NodeId>,
+            // 该 arm 编译前的 current_effect，用于 Gate 构建。
+            // compile_branch_subgraph 不隔离 current_effect，后续 arm body 中
+            // 的副作用（如 non_tail_rec 拦截的 Continue barrier）会泄漏到
+            // 前序 arm 的 Gate 输入，导致前序 arm 永不执行（Bug #56）。
+            effect_before: Option<NodeId>,
         }
 
         let mut arm_data: Vec<ArmData> = Vec::with_capacity(n_arms);
 
         for (i, arm) in arms.iter().enumerate() {
             let wrap_start = self.graph.nodes.len() as u32;
+
+            // 保存当前 effect：此 arm 的 Gate 应仅依赖此前已完成的副作用，
+            // 不应依赖后续 arm body 编译产生的副作用。
+            let effect_before = self.current_effect;
 
             // scrutinee 来源：i==0 在父帧直接用 scrutinee_node；i>0 用 param 节点
             let scrutinee_in_frame = if i == 0 {
@@ -2407,6 +3249,7 @@ impl<'a> IrBuilder<'a> {
                 cond_node,
                 body_sg,
                 body_inputs,
+                effect_before,
             });
         }
 
@@ -2427,8 +3270,12 @@ impl<'a> IrBuilder<'a> {
                 None => (self.compile_void_subgraph(), Vec::new()),
             };
 
-            // Gate 依赖 pattern_node（条件值）和 current_effect（effect 链前序副作用）
-            let gate_inputs: Vec<NodeId> = match self.current_effect {
+            // Gate 依赖 pattern_node（条件值）和该 arm 编译前的 effect（前序副作用）。
+            // 使用 arm 级别的 effect_before 而非全局 current_effect：
+            // compile_branch_subgraph 不隔离 current_effect，后续 arm body 中的副作用
+            // （如 non_tail_rec 拦截的 Continue barrier）会泄漏到前序 arm 的 Gate，
+            // 导致前序 arm 永不执行（Bug #56）。
+            let gate_inputs: Vec<NodeId> = match ad.effect_before {
                 Some(eff) => vec![pattern_node, eff],
                 None => vec![pattern_node],
             };
@@ -3734,6 +4581,192 @@ impl<'a> IrBuilder<'a> {
             return call_node;
         }
 
+        // 尾递归转迭代拦截：当前在 TailRecToLoop body 编译中且 callee 是 self_name，
+        // 且在尾位置（避免参数中的递归调用被误拦截），
+        // 生成 WriteBack(参数, 实参) 替代 Call(self)。
+        // body_sg 是 LoopBody，完成后 reset_loop_iteration 自动回跳 while_sg 重新求值 cond。
+        if self.in_tail_position && self.tail_rec_ctx.is_some() {
+            // 尾递归拦截：生成 WriteBack(参数, 实参) 替代 Call(self)
+        }
+        if self.in_tail_position {
+            if let Some(ctx) = &self.tail_rec_ctx.clone() {
+                if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+                    if *name == ctx.self_name {
+                    // 编译所有实参表达式（先求值，再 WriteBack，避免参数间竞态）
+                    let arg_nodes: Vec<NodeId> = args
+                        .iter()
+                        .map(|&a| self.compile_subexpr(a))
+                        .collect();
+                    // 对每个参数执行 WriteBack（写回函数级参数节点）。
+                    // barrier 机制：第一个 WriteBack 依赖所有 arg_nodes，
+                    // 后续 WriteBack 链式依赖前一个 WriteBack。
+                    // 这确保所有实参表达式在任意 WriteBack 执行前完成求值，
+                    // 避免 a+b 读到已被 WriteBack 更新的 a 值。
+                    let mut last_wb: Option<NodeId> = None;
+                    for (i, &arg_node) in arg_nodes.iter().enumerate() {
+                        if i < ctx.param_nodes.len() {
+                            let mut wb_inputs = vec![arg_node];
+                            if i == 0 {
+                                // 第一个 WB：barrier，依赖所有其他 arg_nodes
+                                for &other in &arg_nodes[1..] {
+                                    wb_inputs.push(other);
+                                }
+                            } else if let Some(prev_wb) = last_wb {
+                                // 后续 WB：依赖前一个 WB（链式排序）
+                                wb_inputs.push(prev_wb);
+                            }
+                            let wb_off = self.graph.inputs_pool.push(&wb_inputs);
+                            let wb_node = self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: wb_inputs.len() as u8,
+                                inputs_offset: wb_off,
+                                compute_fn: CF_WRITEBACK,
+                            });
+                            self.graph.set_writeback_target(wb_node, ctx.param_nodes[i]);
+                            self.current_effect = Some(wb_node);
+                            last_wb = Some(wb_node);
+                        }
+                    }
+                    // 返回最后一个 WriteBack 节点（body_sg 完成后 reset_loop_iteration 自动回跳）
+                    return last_wb.unwrap_or_else(|| {
+                        let off = self.graph.inputs_pool.push(&[]);
+                        self.graph.add_node(Node {
+                            kind: NodeKind::Const,
+                            input_count: 0,
+                            inputs_offset: off,
+                            compute_fn: CF_NOOP,
+                        })
+                    });
+                    }
+                }
+            }
+        }
+
+        // 非尾递归转迭代拦截：非尾位置的自调用替换为 push 续延 + push 子任务 + barrier(Continue)
+        // 仅在 non_tail_rec_ctx 设置时拦截（compile_non_tail_rec_body_sg 的 state_N_sg 编译中）
+        if !self.in_tail_position && self.non_tail_rec_ctx.is_some() {
+            let ctx_clone = self.non_tail_rec_ctx.clone();
+            if let Some(ctx) = &ctx_clone {
+                if let crate::ast::Ast::Expr::Ident(callee_name) = &callee_expr.node {
+                    if *callee_name == ctx.self_name {
+                        // 1. 检查 call_result_map：如果当前调用已在映射中，返回映射的节点
+                        if let Some(&mapped) = ctx.call_result_map.get(&call_expr_id) {
+                            return mapped;
+                        }
+                        // 2. 如果已截断，返回 void 常量（不生成 Call 节点）
+                        if ctx.truncated {
+                            return self.compile_void_const();
+                        }
+                        // 3. 拦截：push 续延帧 + push 子任务帧 + barrier(Continue)
+
+                        // 保存 current_effect：compile_subexpr 可能修改它，
+                        // 需要在实参编译后恢复，确保 store 链从正确的 effect 开始。
+                        let saved_effect = self.current_effect;
+                        let arg_nodes: Vec<NodeId> = args
+                            .iter()
+                            .map(|&a| self.compile_subexpr(a))
+                            .collect();
+                        self.current_effect = saved_effect;
+
+                        let stride = ctx.stride;
+                        let param_count = ctx.param_count;
+                        let max_saved = ctx.max_saved;
+                        let current_state = ctx.current_state as usize;
+                        let stack_node = ctx.stack_node;
+                        let sp_node = ctx.sp_node;
+                        let result_node = ctx.result_node;
+
+                        // 计算栈索引：base_cont = sp * stride, base_task = (sp + 1) * stride
+                        // sp 已被 pop 递减（sp_node = original_sp - 1）
+                        // cont 写入 pop 释放的槽位（覆盖已消费的帧），task 写入下一个槽位
+                        // sp_new = sp + 2，pop 时 sp-1 先读 task（LIFO），再读 cont
+                        let one_const = self.make_i32_const(1);
+                        let sp_plus_1 = self.make_binop(sp_node, one_const, CF_ADD_I32);
+                        let two_const = self.make_i32_const(2);
+                        let sp_plus_2 = self.make_binop(sp_node, two_const, CF_ADD_I32);
+                        let stride_val = self.make_i32_const(stride as i32);
+                        let base_cont = self.make_binop(sp_node, stride_val, CF_MUL_I32);
+                        let base_task = self.make_binop(sp_plus_1, stride_val, CF_MUL_I32);
+
+                        // Push 续延帧（写入 pop 释放的槽位）
+                        // stack[base_cont + 0..P] = 当前参数（param_cur 节点）
+                        // 所有 store 必须通过 chain_effects 链入 effect 链，
+                        // 确保 barrier 在所有 store 完成后才触发 Continue。
+                        for i in 0..param_count {
+                            let offset = self.make_i32_const(i as i32);
+                            let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, ctx.param_nodes[i]);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+                        // stack[base_cont + P] = state_after（当前 state + 1）
+                        let state_after = self.make_i32_const((current_state + 1) as i32);
+                        let state_offset_cont = self.make_i32_const(param_count as i32);
+                        let state_idx_cont = self.make_binop(base_cont, state_offset_cont, CF_ADD_I32);
+                        let state_store_cont =
+                            self.make_array_store(stack_node, state_idx_cont, state_after);
+                        self.current_effect = Some(self.chain_effects(self.current_effect, state_store_cont));
+                        // stack[base_cont + P + 1..P + 1 + num_saved] = 保存值
+                        // 对于 state S：slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
+                        let zero_saved = self.make_i32_const(0);
+                        for j in 0..max_saved {
+                            let offset = self.make_i32_const((param_count + 1 + j) as i32);
+                            let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
+                            let val = if j < current_state {
+                                if j + 1 < current_state {
+                                    ctx.saved_nodes[j]
+                                } else {
+                                    // j == current_state - 1
+                                    result_node
+                                }
+                            } else {
+                                zero_saved
+                            };
+                            let store = self.make_array_store(stack_node, idx, val);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+
+                        // Push 子任务帧（栈顶，pop 时先读）
+                        // stack[base_task + 0..P] = 实参（arg_nodes）
+                        for i in 0..param_count {
+                            let offset = self.make_i32_const(i as i32);
+                            let idx = self.make_binop(base_task, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, arg_nodes[i]);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+                        // stack[base_task + P] = 0（INIT state）
+                        let state_offset_task = self.make_i32_const(param_count as i32);
+                        let state_idx_task = self.make_binop(base_task, state_offset_task, CF_ADD_I32);
+                        let state_store_task =
+                            self.make_array_store(stack_node, state_idx_task, zero_saved);
+                        self.current_effect = Some(self.chain_effects(self.current_effect, state_store_task));
+                        // stack[base_task + P + 1..P + 1 + max_saved] = 0
+                        for j in 0..max_saved {
+                            let offset = self.make_i32_const((param_count + 1 + j) as i32);
+                            let idx = self.make_binop(base_task, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, zero_saved);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+
+                        // WriteBack sp = sp + 2（链接 effect 确保在所有 store 之后执行）
+                        let sp_new = self.chain_effects(self.current_effect, sp_plus_2);
+                        let sp_wb = self.compile_writeback_node(sp_new, sp_node);
+                        self.current_effect = Some(sp_wb);
+
+                        // 创建 barrier 节点（Continue 信号，阻止后续表达式执行）
+                        let barrier = self.make_continue_barrier(sp_wb);
+                        self.current_effect = Some(barrier);
+
+                        // 设置截断标志
+                        if let Some(ctx) = &mut self.non_tail_rec_ctx {
+                            ctx.truncated = true;
+                        }
+
+                        return barrier;
+                    }
+                }
+            }
+        }
+
         // 普通函数调用
         // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
         let mut inputs = Vec::with_capacity(args.len() + 1);
@@ -4906,7 +5939,24 @@ impl<'a> IrBuilder<'a> {
         let return_node = {
             let prev_tail = self.in_tail_position;
             self.in_tail_position = !is_void_fn;
-            let r = self.compile_expr(body_expr);
+            // 尾递归转迭代：查 analysis.memo 是否标记当前函数为 TailRecToLoop
+            let tail_rec_info = if self.compiling_builtin.is_none() {
+                self.lookup_tail_rec_info(name, module)
+            } else {
+                None
+            };
+            let non_tail_rec_info = if self.compiling_builtin.is_none() && tail_rec_info.is_none() {
+                self.lookup_non_tail_rec_info(name, module)
+            } else {
+                None
+            };
+            let r = if let Some(info) = tail_rec_info {
+                self.compile_tail_rec_to_loop(name, body_expr, &params, &info)
+            } else if let Some(info) = non_tail_rec_info {
+                self.compile_non_tail_rec_to_loop(name, body_expr, &params, &info)
+            } else {
+                self.compile_expr(body_expr)
+            };
             self.in_tail_position = prev_tail;
             r
         };

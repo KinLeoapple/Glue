@@ -1,0 +1,39 @@
+// 尾递归转迭代最简测试
+fun simpleTail(n: i32): i32 {
+    if n == 0 { 42 } else { simpleTail(n - 1) }
+}
+
+fun whileTest(): i32 {
+    var i: i32 = 0
+    var sum: i32 = 0
+    while i < 5 {
+        sum = sum + i
+        i = i + 1
+    }
+    sum
+}
+
+// === 非尾递归转迭代测试 ===
+
+// 非尾递归 factorial（单递归点）：n * fact(n-1)
+fun fact(n: i32): i32 {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+
+// 非尾递归 fibonacci（双递归点）：fib(n-1) + fib(n-2)
+fun fib(n: i32): i32 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fun main(): void {
+    println("simpleTail(0) = {simpleTail(0)}")
+    println("simpleTail(5) = {simpleTail(5)}")
+    println("whileTest() = {whileTest()}")
+    println("fact(0) = {fact(0)}")
+    println("fact(1) = {fact(1)}")
+    println("fact(5) = {fact(5)}")
+    println("fact(10) = {fact(10)}")
+    println("fib(0) = {fib(0)}")
+    println("fib(1) = {fib(1)}")
+    println("fib(10) = {fib(10)}")
+}

@@ -1,7 +1,7 @@
 # Glue 引擎 Bug 修复追踪
 
 > 本文档由 `test-suite/` 测试套件发现，记录所有引擎 bug 的修复优先级与临时绕过方案。
-> 最后更新：2026-08-07（#1-#17 已修复；执行器审查 H1-H5、M1-M9、L1-L12 已修复；边缘测试 #18-#55 中 #18/#19/#20/#21/#22/#23/#24/#25/#26/#27/#28/#29/#30/#31/#33/#34/#35/#36/#37/#38/#39/#40/#41/#42/#43/#44/#45/#46/#47/#48/#49/#50/#51/#52/#53/#54/#55 已修复；P0/P1 审查修复 R1-R11 已完成）
+> 最后更新：2026-08-08（#1-#17 已修复；执行器审查 H1-H5、M1-M9、L1-L12 已修复；边缘测试 #18-#55 中 #18/#19/#20/#21/#22/#23/#24/#25/#26/#27/#28/#29/#30/#31/#33/#34/#35/#36/#37/#38/#39/#40/#41/#42/#43/#44/#45/#46/#47/#48/#49/#50/#51/#52/#53/#54/#55 已修复；P0/P1 审查修复 R1-R11 已完成；#56 match arm effect 泄漏已修复；#57 non_tail_rec_to_loop 破坏 defer LIFO 已修复）
 
 ---
 
@@ -115,6 +115,8 @@
 | P3 | #17 | 字符串插值中 `bool == bool` 表达式恒返回 true | 已修复 (2026-08-05) |
 | P3 | #36 | 不支持 `\uXXXX` 和 `\0` 字符串转义序列 | 已修复 (2026-08-07) |
 | P3 | #46 | 字符串字面量中 `{[...]}` 被当作字符串插值解析（`[X]` 视为数组字面量，X 报 undefined variable）；无 `{}` 转义机制 | 已修复 |
+| P0 | #56 | match arm 间 current_effect 泄漏导致递归 ADT 遍历返回 void | 已修复 (2026-08-08) |
+| P1 | #57 | non_tail_rec_to_loop 转换破坏 defer LIFO 语义（defer 仅执行一次，参数失效） | 已修复 (2026-08-08) |
 
 ---
 
@@ -1304,6 +1306,39 @@
 | 限制 | 说明 | 绕过方式 |
 |------|------|---------|
 | 闭包不支持显式返回类型标注 | `fun(n: i32): i32 { ... }` 解析错误 | 省略返回类型 `fun(n: i32) { ... }` |
+
+---
+
+---
+
+## Bug #56：match arm 间 current_effect 泄漏导致递归 ADT 遍历返回 void
+
+- **状态**：已修复 (2026-08-08)
+- **优先级**：P0（核心功能阻塞：递归 ADT 遍历完全失效）
+- **位置**：`src/ir/Builder.rs:3191-3281`（compile_match）
+- **现象**：对递归 ADT 类型（如 `List = | Nil | Cons(i32, List)`）进行 match 遍历的递归函数返回 void。即使 base case（`Nil => 0`）也不执行，`listLen(Nil)` 返回 void 而非 0。影响 9 个测试用例（adt、edge_adt、edge_generics、edge_match、edge_recursion、edge_stress、edge_traits、patterns、edge_defer 中的递归 defer 部分），共 45 个断言失败。
+- **根因**：`compile_match` 在第一阶段按顺序编译所有 arm 的 pattern + body（`compile_branch_subgraph`），但 `compile_branch_subgraph` 不隔离 `current_effect`。当某个 arm body 包含非尾递归自调用时，`non_tail_rec_to_loop` 拦截会设置 `current_effect` 为 Continue barrier 节点（`compile_call` 第 4632-4750 行）。此后构建 Gate 时（第二阶段从后往前），所有 arm 的 Gate 输入都使用被污染的全局 `current_effect`，导致前序 arm 的 Gate 依赖了后序 arm body 产生的 Continue barrier。运行时，即使前序 arm 的 pattern 匹配成功，其 Gate 因依赖另一个 arm 的 barrier 而无法执行，整个 match 返回 void。
+- **触发条件**：match 表达式中某个 arm body 包含非尾位置自调用（触发 `non_tail_rec_to_loop` 拦截），且该 arm 不是最后一个编译的 arm。典型场景：`match l { Nil => 0; Cons(_, t) => 1 + listLen(t) }`——Cons arm 的 `listLen(t)` 被拦截产生 Continue barrier，污染 Nil arm 的 Gate。
+- **修复**：在 `compile_match` 的 `ArmData` 结构中新增 `effect_before: Option<NodeId>` 字段，在每个 arm 编译前保存 `current_effect`。Gate 构建阶段使用 arm 级别的 `effect_before` 而非全局 `current_effect`，确保每个 arm 的 Gate 仅依赖该 arm 编译前已完成的副作用，不受后续 arm body 副作用的影响。
+  - [Builder.rs:3198-3202](file:///Users/haojunhuang/CLionProjects/Glue/src/ir/Builder.rs#L3198-L3202)：ArmData 新增 `effect_before` 字段
+  - [Builder.rs:3210-3212](file:///Users/haojunhuang/CLionProjects/Glue/src/ir/Builder.rs#L3210-L3212)：arm 编译前保存 `effect_before`
+  - [Builder.rs:3246-3252](file:///Users/haojunhuang/CLionProjects/Glue/src/ir/Builder.rs#L3246-L3252)：ArmData 初始化 `effect_before`
+  - [Builder.rs:3273-3281](file:///Users/haojunhuang/CLionProjects/Glue/src/ir/Builder.rs#L3273-L3281)：Gate 输入使用 `ad.effect_before` 替代 `self.current_effect`
+- **验证**：8/9 受影响测试通过（adt、edge_adt、edge_generics、edge_match、edge_recursion、edge_stress、edge_traits、patterns 全部 ALL PASSED）；edge_defer 剩 1 个失败为独立 bug（non_tail_rec_to_loop 工作栈模拟不支持 defer LIFO unwind，与本 bug 无关），见 Bug #57。34 功能测试无回归，Rust 单元测试通过。
+
+---
+
+## Bug #57：non_tail_rec_to_loop 转换破坏 defer LIFO 语义
+
+- **状态**：已修复 (2026-08-08)
+- **优先级**：P1（defer 语义正确性）
+- **位置**：`src/pass/Analyzer.rs:2850-2881`（memo_pass 非尾递归检测）
+- **现象**：含 defer 的非尾递归函数（如 `deferRecur(n)`）被 `non_tail_rec_to_loop` 转换为工作栈循环后，defer 仅在函数退出时执行一次，而非每次递归调用完成时执行（LIFO 顺序）。`recur_log` 输出 `'nullnull'` 而非预期的 `'0123'`。
+- **根因**：`non_tail_rec_to_loop` 将递归调用转为 while 循环（工作栈模拟），每次"递归调用"是循环的一轮迭代。但 defer 注册到函数主子图的 `defer_table`（`compile_stmt` Defer 分支通过 `current_function_sg` 注册），运行时仅在函数帧终止时执行一次（`Schedule.rs:928-933`）。工作栈模拟不创建/销毁递归帧，defer 无法在每轮迭代完成时触发。此外，defer body 引用的参数 `n` 在循环中已失效（`param_cur` 每轮覆盖），导致 `cast(n).to(str)` 读到 null。
+- **触发条件**：纯函数（purity 分析未检测到全局赋值副作用）+ 非尾递归 + 函数体含 defer 语句。典型场景：`fun deferRecur(n: i32): i32 { defer recur_log = recur_log + cast(n).to(str); if n <= 0 { 0 } else { n + deferRecur(n - 1) } }`。
+- **修复**：在 `memo_pass` 的非尾递归检测分支中，使用已有的 `has_defer` 函数检查函数体是否包含 defer。若含 defer，跳过 `NonTailRecToLoop` 转换，降级为 `Memoize` 策略（保持真递归调用，defer 在每次帧终止时正确执行）。
+  - [Analyzer.rs:2850-2863](file:///Users/haojunhuang/CLionProjects/Glue/src/pass/Analyzer.rs#L2850-L2863)：新增 `has_defer` 检查，含 defer 的函数降级为 Memoize
+- **验证**：edge_defer ALL PASSED（deferRecur 的 `recur_log == "0123"` 正确）。34 功能测试无回归，Rust 单元测试通过。
 
 ---
 

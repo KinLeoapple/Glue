@@ -2306,11 +2306,61 @@ pub struct MemoCandidate {
     pub strategy: MemoStrategy,
 }
 
+/// 尾递归参数变换信息：从函数体 AST 提取的 base case + 递归分支。
+/// Builder 层消费此信息构造 while_sg IR。
+#[derive(Debug, Clone, Default)]
+pub struct TailRecInfo {
+    /// 非递归终止分支：(条件表达式, 返回值表达式)
+    /// 条件为 None 表示 else 兜底分支（无条件终止）。
+    pub base_cases: Vec<(Option<ExprId>, ExprId)>,
+    /// 递归分支：(条件表达式, 实参列表)
+    /// 条件为 None 表示 else 兜底分支（无条件递归）。
+    pub rec_branches: Vec<(Option<ExprId>, Vec<ExprId>)>,
+}
+
+impl TailRecInfo {
+    /// 是否有效：至少一个 base case 和一个 rec branch
+    pub fn is_valid(&self) -> bool {
+        !self.base_cases.is_empty() && !self.rec_branches.is_empty()
+    }
+}
+
+/// 非尾递归转迭代信息：将非尾递归函数变换为"工作栈 + while 循环 + 状态机"IR。
+///
+/// 核心思路：函数体中的每个非尾自调用拆分为"push 续延 + push 子任务"，
+/// 调用返回后通过 state 号分派到对应续延，用 result 变量替换调用结果。
+///
+/// 例如 fib(n) = if n < 2 { n } else { fib(n-1) + fib(n-2) } 变换为：
+/// - state 0 (INIT): if n < 2 { result = n } else { push cont(1); push task(n-1); continue }
+/// - state 1 (AFTER fib(n-1)): left = result; push cont(2, left); push task(n-2); continue
+/// - state 2 (AFTER fib(n-2)): result = saved + result
+#[derive(Debug, Clone)]
+pub struct NonTailRecInfo {
+    /// 所有非尾自调用的 ExprId（按 AST 遍历顺序）。
+    /// Builder 用此列表分配 state 号：state 0 = INIT，state N = 第 N 个调用返回后。
+    pub call_sites: Vec<ExprId>,
+    /// 包含所有 call_sites 的续延表达式 ExprId。
+    /// Builder 对每个 state 重新编译此表达式，用 call_result_map 替换已完成的调用。
+    pub continuation_expr: ExprId,
+    /// base case：(条件, 返回值)。条件为 None 表示 else 兜底。
+    pub base_cases: Vec<(Option<ExprId>, ExprId)>,
+    /// 函数参数数量（用于构造栈帧）。
+    pub param_count: usize,
+}
+
+impl NonTailRecInfo {
+    pub fn is_valid(&self) -> bool {
+        !self.call_sites.is_empty() && !self.base_cases.is_empty()
+    }
+}
+
 /// 记忆化策略。
 #[derive(Debug, Clone)]
 pub enum MemoStrategy {
     /// 尾递归转循环，不缓存
-    TailRecToLoop,
+    TailRecToLoop { info: TailRecInfo },
+    /// 非尾递归转迭代（工作栈模拟），不缓存
+    NonTailRecToLoop { info: NonTailRecInfo },
     /// 记忆化缓存
     Memoize { cache_key: CacheKeySpec, capacity: MemoCapacity },
     /// 循环不变量外提
@@ -2781,10 +2831,54 @@ pub fn memo_pass(
             // 递归函数
             if cg.recursive.contains(&func) {
                 if is_tail_recursive(*body, arena, name) {
-                    plan.candidates.push(MemoCandidate {
-                        func,
-                        strategy: MemoStrategy::TailRecToLoop,
-                    });
+                    let info = extract_tail_rec_info(*body, arena, name);
+                    if info.is_valid() {
+                        plan.candidates.push(MemoCandidate {
+                            func,
+                            strategy: MemoStrategy::TailRecToLoop { info },
+                        });
+                    } else {
+                        let param_indices: Vec<u32> = (0..params.len() as u32).collect();
+                        plan.candidates.push(MemoCandidate {
+                            func,
+                            strategy: MemoStrategy::Memoize {
+                                cache_key: CacheKeySpec { param_indices },
+                                capacity: MemoCapacity::Unlimited,
+                            },
+                        });
+                    }
+                } else if has_non_tail_self_call(*body, arena, name) {
+                    // Tier B: 非尾递归转迭代（工作栈模拟）
+                    // defer 语义要求每次递归调用完成时执行 defer（LIFO），
+                    // 但工作栈模拟将递归转为循环，defer 只在函数退出时执行一次，
+                    // 且 defer body 引用的参数在循环中已失效。故含 defer 的函数跳过此转换。
+                    if has_defer(*body, arena) {
+                        let param_indices: Vec<u32> = (0..params.len() as u32).collect();
+                        plan.candidates.push(MemoCandidate {
+                            func,
+                            strategy: MemoStrategy::Memoize {
+                                cache_key: CacheKeySpec { param_indices },
+                                capacity: MemoCapacity::Unlimited,
+                            },
+                        });
+                    } else {
+                        let info = extract_non_tail_rec_info(*body, arena, name, params.len());
+                        if info.is_valid() {
+                            plan.candidates.push(MemoCandidate {
+                                func,
+                                strategy: MemoStrategy::NonTailRecToLoop { info },
+                            });
+                        } else {
+                            let param_indices: Vec<u32> = (0..params.len() as u32).collect();
+                            plan.candidates.push(MemoCandidate {
+                                func,
+                                strategy: MemoStrategy::Memoize {
+                                    cache_key: CacheKeySpec { param_indices },
+                                    capacity: MemoCapacity::Unlimited,
+                                },
+                            });
+                        }
+                    }
                 } else {
                     let param_indices: Vec<u32> = (0..params.len() as u32).collect();
                     plan.candidates.push(MemoCandidate {
@@ -2825,10 +2919,14 @@ pub fn memo_pass(
 
 /// 判定函数体是否为尾递归：函数体中至少有一条路径的尾位置是对自身的调用。
 fn is_tail_recursive(body: ExprId, arena: &AstArena, self_name: &str) -> bool {
-    has_tail_call(body, arena, self_name)
+    // v1 仅支持 if-else 尾递归（不含 Match），且所有自调用必须在尾位置。
+    // ack(m-1, ack(m, n-1)) 的内层 ack 是非尾位置自调用 → 拒绝。
+    // listMax 基于 Match 的尾递归条件提取复杂 → v1 跳过。
+    has_tail_call(body, arena, self_name) && !has_non_tail_self_call(body, arena, self_name)
 }
 
 /// 检查表达式的尾位置是否存在对 self_name 的调用。
+/// 仅递归 if-else 和 block trailing（v1 不支持 Match）。
 fn has_tail_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -2845,6 +2943,355 @@ fn has_tail_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
                 || else_branch.map_or(false, |e| has_tail_call(e, arena, self_name))
         }
         _ => false,
+    }
+}
+
+/// 检查函数体是否存在非尾位置的自调用（如 ack(m-1, ack(m, n-1)) 的内层 ack）。
+/// 非尾位置 = 作为参数、操作数、字段值等。
+/// 若存在此类调用，函数不是纯尾递归，不能安全转迭代。
+fn has_non_tail_self_call(body: ExprId, arena: &AstArena, self_name: &str) -> bool {
+    fn is_self_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
+        if let Expr::Call { callee, .. } = &arena.expr(expr_id).node {
+            if let Expr::Ident(name) = &arena.expr(*callee).node {
+                return *name == self_name;
+            }
+        }
+        false
+    }
+    /// 递归检查子表达式中是否存在非尾位置自调用。
+    /// `in_tail` 表示当前表达式是否在尾位置。
+    fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, in_tail: bool) -> bool {
+        let expr = &arena.expr(expr_id).node;
+        match expr {
+            Expr::Call { callee, args, .. } => {
+                let is_self = is_self_call(expr_id, arena, self_name);
+                if is_self && !in_tail {
+                    // 非尾位置的自调用 → 拒绝
+                    return true;
+                }
+                if is_self && in_tail {
+                    // 尾位置的自调用：检查参数中是否有非尾自调用
+                    return args.iter().any(|&a| check(a, arena, self_name, false));
+                }
+                // 非自调用：callee 和 args 都是非尾位置
+                check(*callee, arena, self_name, false)
+                    || args.iter().any(|&a| check(a, arena, self_name, false))
+            }
+            Expr::Block { stmts, trailing } => {
+                // stmts 中的表达式都不是尾位置
+                for s in stmts {
+                    if let Some(e) = stmt_tail_expr(*s, arena) {
+                        if check(e, arena, self_name, false) {
+                            return true;
+                        }
+                    }
+                }
+                trailing.map_or(false, |t| check(t, arena, self_name, in_tail))
+            }
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                check(*cond, arena, self_name, false)
+                    || check(*then_branch, arena, self_name, in_tail)
+                    || else_branch.map_or(false, |e| check(e, arena, self_name, in_tail))
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                // Match 本身不阻止，但 arm body 中的非尾自调用会被检测
+                check(*scrutinee, arena, self_name, false)
+                    || arms.iter().any(|arm| check(arm.body, arena, self_name, in_tail))
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                check(*lhs, arena, self_name, false)
+                    || check(*rhs, arena, self_name, false)
+            }
+            Expr::Unary { operand, .. } => check(*operand, arena, self_name, false),
+            Expr::ArrayLit { elements, fill } => {
+                elements.iter().any(|&e| check(e, arena, self_name, false))
+                    || fill.map_or(false, |(v, c)| {
+                        check(v, arena, self_name, false)
+                            || check(c, arena, self_name, false)
+                    })
+            }
+            Expr::RecordLit(fields) => {
+                fields.iter().any(|f| check(f.value, arena, self_name, false))
+            }
+            Expr::RecordExtend { base, updates } => {
+                check(*base, arena, self_name, false)
+                    || updates.iter().any(|f| check(f.value, arena, self_name, false))
+            }
+            Expr::MethodCall { recv, args, .. } => {
+                check(*recv, arena, self_name, false)
+                    || args.iter().any(|&a| check(a, arena, self_name, false))
+            }
+            Expr::FieldAccess { recv, .. } => check(*recv, arena, self_name, false),
+            Expr::Index { recv, index } => {
+                check(*recv, arena, self_name, false)
+                    || check(*index, arena, self_name, false)
+            }
+            Expr::Assign { target, value } => {
+                check(*target, arena, self_name, false)
+                    || check(*value, arena, self_name, false)
+            }
+            Expr::CompoundAssign { target, value, .. } => {
+                check(*target, arena, self_name, false)
+                    || check(*value, arena, self_name, false)
+            }
+            Expr::Elvis { lhs, rhs } => {
+                check(*lhs, arena, self_name, false)
+                    || check(*rhs, arena, self_name, false)
+            }
+            Expr::RefOf(e) | Expr::Deref(e) | Expr::Propagate(e) | Expr::NonNullAssert(e)
+            | Expr::Atomic(e) | Expr::Lazy(e) => check(*e, arena, self_name, false),
+            _ => false,
+        }
+    }
+    check(body, arena, self_name, true)
+}
+
+/// 获取语句中的表达式（用于非尾位置自调用检查）。
+fn stmt_tail_expr(stmt_id: crate::ast::Ast::StmtId, arena: &AstArena) -> Option<ExprId> {
+    match &arena.stmt(stmt_id).node {
+        crate::ast::Ast::Stmt::Expression { expr } => Some(*expr),
+        crate::ast::Ast::Stmt::Return { value } => *value,
+        crate::ast::Ast::Stmt::ValDecl { value, .. } => Some(*value),
+        crate::ast::Ast::Stmt::VarDecl { value, .. } => Some(*value),
+        crate::ast::Ast::Stmt::Assignment { value, .. } => Some(*value),
+        crate::ast::Ast::Stmt::FieldAssignment { value, .. } => Some(*value),
+        crate::ast::Ast::Stmt::CompoundAssignment { value, .. } => Some(*value),
+        _ => None,
+    }
+}
+
+/// 从尾递归函数体提取参数变换信息。
+///
+/// 遍历函数体的控制流分支，分类为 base case（非递归终止）和 rec branch（递归调用）。
+/// 支持的 AST 结构：
+/// - if cond { return base } else { return self(args) }
+/// - if cond1 { ... } else if cond2 { return self(args2) } else { return base }
+/// - match scrut { arm1 => return base, arm2 => return self(args) }
+/// - block { stmts; trailing_if_or_match }
+///
+/// 每个 base case 记录 (条件, 返回值)；每个 rec branch 记录 (条件, 实参列表)。
+/// 条件为 None 表示 else/match wildcard 兜底分支。
+fn extract_tail_rec_info(
+    body: ExprId,
+    arena: &AstArena,
+    self_name: &str,
+) -> TailRecInfo {
+    let mut info = TailRecInfo::default();
+    collect_tail_branches(body, arena, self_name, None, &mut info);
+    info
+}
+
+/// 递归收集控制流分支的 base case 和 rec branch。
+/// `cond` 是当前分支的继承条件（None 表示兜底/无条件）。
+fn collect_tail_branches(
+    expr_id: ExprId,
+    arena: &AstArena,
+    self_name: &str,
+    cond: Option<ExprId>,
+    info: &mut TailRecInfo,
+) {
+    let expr = &arena.expr(expr_id).node;
+    match expr {
+        // block：优先递归 trailing；trailing 为 None 时检查末尾 Return
+        Expr::Block { stmts, trailing } => {
+            if let Some(t) = trailing {
+                collect_tail_branches(*t, arena, self_name, cond, info);
+            } else if let Some(last) = stmts.last() {
+                if let Stmt::Return { value } = &arena.stmt(*last).node {
+                    if let Some(v) = value {
+                        collect_tail_branches(*v, arena, self_name, cond, info);
+                    } else {
+                        info.base_cases.push((cond, expr_id));
+                    }
+                }
+            }
+        }
+        // if：then 分支用 Some(cond)，else 分支用 None（兜底）
+        Expr::If { cond: if_cond, then_branch, else_branch, .. } => {
+            collect_tail_branches(*then_branch, arena, self_name, Some(*if_cond), info);
+            if let Some(eb) = else_branch {
+                collect_tail_branches(*eb, arena, self_name, None, info);
+            }
+        }
+        // match：每个 arm 单独分派（模式条件无法用 ExprId 表达，用 None）
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                collect_tail_branches(arm.body, arena, self_name, None, info);
+            }
+        }
+        // 尾调用：rec branch
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(name) = &arena.expr(*callee).node {
+                if *name == self_name {
+                    info.rec_branches.push((cond, args.clone()));
+                    return;
+                }
+            }
+            info.base_cases.push((cond, expr_id));
+        }
+        // 非尾调用表达式：base case
+        _ => {
+            info.base_cases.push((cond, expr_id));
+        }
+    }
+}
+
+// =========================================================================
+// 非尾递归转迭代：调用点提取 + 续延分析
+// =========================================================================
+
+/// 从非尾递归函数体提取调用点 + 续延信息。
+///
+/// 遍历函数体 AST，收集所有非尾位置的自调用 ExprId。
+/// continuation_expr = body（函数体本身），因为纯函数的条件重评估结果不变，
+/// Builder 对每个 state 重新编译 body，用 call_result_map 替换已完成的调用。
+fn extract_non_tail_rec_info(
+    body: ExprId,
+    arena: &AstArena,
+    self_name: &str,
+    param_count: usize,
+) -> NonTailRecInfo {
+    let mut call_sites = Vec::new();
+    let mut base_cases = Vec::new();
+
+    collect_non_tail_calls(body, arena, self_name, true, &mut call_sites, &mut base_cases);
+
+    NonTailRecInfo {
+        call_sites,
+        continuation_expr: body,
+        base_cases,
+        param_count,
+    }
+}
+
+/// 递归收集非尾位置的自调用 ExprId + base case。
+///
+/// `in_tail` 表示当前表达式是否在尾位置。
+/// - 尾位置的自调用是尾递归（Tier A 处理），不收集
+/// - 非尾位置的自调用收集到 call_sites
+/// - 非自调用的尾位置表达式收集为 base case
+fn collect_non_tail_calls(
+    expr_id: ExprId,
+    arena: &AstArena,
+    self_name: &str,
+    in_tail: bool,
+    call_sites: &mut Vec<ExprId>,
+    base_cases: &mut Vec<(Option<ExprId>, ExprId)>,
+) {
+    let expr = &arena.expr(expr_id).node;
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            let is_self = if let Expr::Ident(name) = &arena.expr(*callee).node {
+                *name == self_name
+            } else {
+                false
+            };
+            if is_self {
+                if in_tail {
+                    // 尾位置自调用：尾递归，不触发 Tier B
+                    base_cases.push((None, expr_id));
+                } else {
+                    // 非尾位置自调用：收集为 call_site
+                    call_sites.push(expr_id);
+                    // 检查参数中是否有更多自调用（如 ack(m-1, ack(m, n-1)) 的内层）
+                    for &a in args {
+                        collect_non_tail_calls(a, arena, self_name, false, call_sites, base_cases);
+                    }
+                }
+            } else {
+                collect_non_tail_calls(*callee, arena, self_name, false, call_sites, base_cases);
+                for &a in args {
+                    collect_non_tail_calls(a, arena, self_name, false, call_sites, base_cases);
+                }
+                if in_tail {
+                    base_cases.push((None, expr_id));
+                }
+            }
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            collect_non_tail_calls(*cond, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*then_branch, arena, self_name, in_tail, call_sites, base_cases);
+            if let Some(eb) = else_branch {
+                collect_non_tail_calls(*eb, arena, self_name, in_tail, call_sites, base_cases);
+            }
+        }
+        Expr::Block { stmts, trailing } => {
+            for s in stmts {
+                if let Some(e) = stmt_tail_expr(*s, arena) {
+                    collect_non_tail_calls(e, arena, self_name, false, call_sites, base_cases);
+                }
+            }
+            if let Some(t) = trailing {
+                collect_non_tail_calls(*t, arena, self_name, in_tail, call_sites, base_cases);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_non_tail_calls(*lhs, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*rhs, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_non_tail_calls(*operand, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_non_tail_calls(*scrutinee, arena, self_name, false, call_sites, base_cases);
+            for arm in arms {
+                collect_non_tail_calls(arm.body, arena, self_name, in_tail, call_sites, base_cases);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_non_tail_calls(*recv, arena, self_name, false, call_sites, base_cases);
+            for &a in args {
+                collect_non_tail_calls(a, arena, self_name, false, call_sites, base_cases);
+            }
+        }
+        Expr::FieldAccess { recv, .. } => {
+            collect_non_tail_calls(*recv, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::Index { recv, index } => {
+            collect_non_tail_calls(*recv, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*index, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::Elvis { lhs, rhs } => {
+            collect_non_tail_calls(*lhs, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*rhs, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::ArrayLit { elements, fill } => {
+            for &e in elements {
+                collect_non_tail_calls(e, arena, self_name, false, call_sites, base_cases);
+            }
+            if let Some((v, c)) = fill {
+                collect_non_tail_calls(*v, arena, self_name, false, call_sites, base_cases);
+                collect_non_tail_calls(*c, arena, self_name, false, call_sites, base_cases);
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for f in fields {
+                collect_non_tail_calls(f.value, arena, self_name, false, call_sites, base_cases);
+            }
+        }
+        Expr::RecordExtend { base, updates } => {
+            collect_non_tail_calls(*base, arena, self_name, false, call_sites, base_cases);
+            for f in updates {
+                collect_non_tail_calls(f.value, arena, self_name, false, call_sites, base_cases);
+            }
+        }
+        Expr::Assign { target, value } => {
+            collect_non_tail_calls(*target, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*value, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::CompoundAssign { target, value, .. } => {
+            collect_non_tail_calls(*target, arena, self_name, false, call_sites, base_cases);
+            collect_non_tail_calls(*value, arena, self_name, false, call_sites, base_cases);
+        }
+        Expr::RefOf(e) | Expr::Deref(e) | Expr::Propagate(e) | Expr::NonNullAssert(e)
+        | Expr::Atomic(e) | Expr::Lazy(e) => {
+            collect_non_tail_calls(*e, arena, self_name, false, call_sites, base_cases);
+        }
+        _ => {
+            if in_tail {
+                base_cases.push((None, expr_id));
+            }
+        }
     }
 }
 

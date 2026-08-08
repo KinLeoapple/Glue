@@ -2193,6 +2193,10 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId) -> Value {
     let graph = frame.graph.clone();
     // 静态绑定：有 call_target → 收集参数 + 设 pending_call
     if let Some(target_sg) = graph.call_targets[node.0 as usize] {
+        if std::env::var("GLUE_DEBUG_CALL").is_ok() {
+            eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
+                node, target_sg.0, frame.subgraph_id.0, frame.node_offset);
+        }
         let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
         let n = &graph.nodes[node.0 as usize];
         let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
@@ -2231,6 +2235,14 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId) -> Value {
     // 读条件值
     let cond_raw = frame.get_value_by_global(branches.condition_input);
     let cond = cond_raw.as_bool();
+
+    if std::env::var("GLUE_DEBUG_GATE").is_ok() {
+        let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
+        eprintln!("[GATE] node={:?} cond_raw={:?} cond={} frame.sg={} frame.offset={} sg.range=[{},{}) branches={:?}",
+            node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
+            sg.node_range.0 .0, sg.node_range.1 .0,
+            branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
+    }
 
     // 选分支
     let (target_sg, branch_inputs) = branches
@@ -3156,6 +3168,13 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId) -> Value {
     let target = graph.writeback_targets[node.0 as usize]
         .expect("WriteBack node missing target");
     let consumer_count = graph.downstreams[target.0 as usize].len() as u16;
+
+    if std::env::var("GLUE_DEBUG_WB").is_ok() {
+        let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
+        eprintln!("[WB] node={:?} target={:?} val={:?} val_node={:?} frame.sg={} frame.offset={} sg.range=[{},{}) sg.func_id={} vt_len={}",
+            node, target, val, val_node, frame.subgraph_id.0, frame.node_offset,
+            sg.node_range.0 .0, sg.node_range.1 .0, sg.function_id, frame.value_table.len());
+    }
 
     // 路径 0：写入当前帧（same_function 闭包调用场景）。
     // same_function 帧的值表扩展到父帧大小，target 可能在当前帧范围内。
