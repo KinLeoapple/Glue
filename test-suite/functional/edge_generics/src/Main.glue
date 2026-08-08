@@ -1,0 +1,222 @@
+// 边缘测试：泛型函数与泛型类型
+//   identity / gmax / array first / 2-类型参数 / 递归类型 / 嵌套泛型 / cast / 多态化 / while / record
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层
+//   Bug #21: i32 超范围字面量静默退出     → 大整数加显式类型后缀
+//   Bug #24: 分支内 await 卡住            → 本测试无 await
+//   闭包不支持显式返回类型标注            → 省略返回类型
+//   元组语法不支持                        → 使用 record 类型
+//
+// 新发现限制（见文件末尾注释 + 报告）：
+//   Limit-B (Bug #26 已修复): 同一 val 数组跨多个 while 循环复用时，后续循环现已正确读取数组元素
+
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 泛型类型（顶层定义）───
+type IntList = | Nil2 | Cons2(i32, IntList)
+type GList<T> = | GNil | GCons(T, GList<T>)
+type GPair<T, U> = GPair(first: T, second: U)
+type V2 = V2(x: i32, y: i32)
+
+// ─── 泛型函数（顶层定义）───
+
+// 1. identity
+fun identity<T>(x: T): T { x }
+
+// 2. gmax（if-as-expression）
+fun gmax<T>(a: T, b: T): T {
+    if a > b { a } else { b }
+}
+
+// 3. first：返回首元素或 null
+fun first<T>(arr: T[]): T? {
+    if arr.len() > 0 { arr[0] } else { null }
+}
+
+// 4. swap：2 类型参数
+fun swap<T, U>(p: GPair<T, U>): GPair<U, T> {
+    GPair(p.second, p.first)
+}
+
+// 5. 递归函数（顶层）
+fun ilen(l: IntList): i32 {
+    match l {
+        Nil2 => 0
+        Cons2(_, t) => 1 + ilen(t)
+    }
+}
+
+fun isum(l: IntList): i32 {
+    match l {
+        Nil2 => 0
+        Cons2(x, t) => x + isum(t)
+    }
+}
+
+fun glen<T>(l: GList<T>): i32 {
+    match l {
+        GNil => 0
+        GCons(_, t) => 1 + glen(t)
+    }
+}
+
+// 6. 嵌套泛型：泛型函数调用泛型函数
+fun doubleId<T>(x: T): T {
+    identity(identity(x))
+}
+
+fun gmax3<T>(a: T, b: T, c: T): T {
+    gmax(gmax(a, b), c)
+}
+
+// 7. 泛型 + cast
+fun toStr<T>(x: T): str {
+    cast(x).to(str)
+}
+
+fun main(): void {
+    println("=== Edge Generics ===")
+
+    println("--- Identity ---")
+    check(identity(42i32) == 42, "identity i32")
+    check(identity(1000000000000i64) == 1000000000000i64, "identity i64")
+    check(identity(3.14f64) == 3.14f64, "identity f64")
+    check(identity("hello") == "hello", "identity str")
+    check(identity(true) == true, "identity bool")
+
+    println("--- gmax ---")
+    check(gmax(3, 7) == 7, "gmax i32 a<b")
+    check(gmax(9, 2) == 9, "gmax i32 a>b")
+    check(gmax(5, 5) == 5, "gmax i32 equal")
+    check(gmax(1.5f64, 2.5f64) == 2.5f64, "gmax f64")
+
+    println("--- first ---")
+    val arr_i: i32[] = [10, 20, 30]
+    check(first(arr_i) == 10, "first i32 non-empty")
+    val arr_s: str[] = ["a", "b"]
+    check(first(arr_s) == "a", "first str non-empty")
+    val empty: i32[] = []
+    check(first(empty) == null, "first empty returns null")
+
+    println("--- swap ---")
+    val p1 = GPair(1i32, "x")
+    check(swap(p1) == GPair("x", 1i32), "swap int,str -> str,int")
+    val p2 = GPair(3.14f64, 99i64)
+    check(swap(p2).first == 99i64, "swap f64,i64 first")
+    check(swap(p2).second == 3.14f64, "swap f64,i64 second")
+
+    println("--- Recursive Types ---")
+    val ilist = Cons2(1i32, Cons2(2i32, Cons2(3i32, Nil2)))
+    check(ilen(ilist) == 3, "IntList length 3")
+    check(isum(ilist) == 6, "IntList sum 6")
+    check(ilen(Nil2) == 0, "IntList empty length")
+    val glist = GCons(1i32, GCons(2i32, GCons(3i32, GNil)))
+    check(glen(glist) == 3, "GList<i32> length 3")
+    val glist_s = GCons("a", GCons("b", GNil))
+    check(glen(glist_s) == 2, "GList<str> length 2")
+
+    println("--- Nested Generics ---")
+    check(doubleId(42i32) == 42, "doubleId i32")
+    check(doubleId("hi") == "hi", "doubleId str")
+    check(gmax3(1, 5, 3) == 5, "gmax3 i32")
+    check(gmax3(9, 2, 7) == 9, "gmax3 i32 max first")
+
+    println("--- Generic cast ---")
+    check(toStr(42i32) == "42", "toStr i32")
+    check(toStr(true) == "true", "toStr bool")
+
+    println("--- Monomorphization ---")
+    check(identity(1i8) == 1i8, "mono identity i8")
+    check(identity(255u8) == 255u8, "mono identity u8")
+    check(identity(1000i16) == 1000i16, "mono identity i16")
+    check(identity(65535u16) == 65535u16, "mono identity u16")
+    check(toStr(127i8) == "127", "mono toStr i8")
+
+    println("--- Generic in while loop ---")
+    // Bug #26 已修复：跨循环复用同一 val 数组现在正确工作（不再读取陈旧值）。
+    var wsum: i32 = 0
+    var wi: i32 = 0
+    val warr = [1, 2, 3, 4, 5]
+    while wi < warr.len() {
+        wsum = wsum + identity(warr[wi])
+        wi = wi + 1
+    }
+    check(wsum == 15, "identity in while loop sum")
+    var gmax_lit_sum: i32 = 0
+    var gli: i32 = 0
+    while gli < 3 {
+        gmax_lit_sum = gmax_lit_sum + gmax(10, 20)
+        gli = gli + 1
+    }
+    check(gmax_lit_sum == 60, "gmax literals in while loop")
+    var wsum2: i32 = 0
+    var wi3: i32 = 0
+    while wi3 < warr.len() {
+        wsum2 = wsum2 + warr[wi3]
+        wi3 = wi3 + 1
+    }
+    check(wsum2 == 15, "simple array sum with reused array")
+    var wif: i32 = 0
+    var wif_i: i32 = 0
+    while wif_i < 5 {
+        if wif_i > wif { wif = wif_i }
+        wif_i = wif_i + 1
+    }
+    check(wif == 4, "if-statement max with loop counter (no array)")
+    var concat_str: str = ""
+    var si: i32 = 0
+    val sarr = [1, 2, 3, 4, 5]
+    while si < sarr.len() {
+        concat_str = concat_str + toStr(sarr[si])
+        si = si + 1
+    }
+    check(concat_str == "12345", "toStr fresh array in while loop")
+    var wmax: i32 = 0
+    var wi2: i32 = 0
+    val warr3 = [1, 2, 3, 4, 5]
+    while wi2 < warr3.len() {
+        wmax = gmax(wmax, warr3[wi2])
+        wi2 = wi2 + 1
+    }
+    check(wmax == 5, "gmax var feedback with fresh array")
+
+    println("--- Generic with records ---")
+    val rp = GPair(V2(1, 2), V2(3, 4))
+    check(swap(rp).first == V2(3, 4), "swap record pair first")
+    check(swap(rp).second == V2(1, 2), "swap record pair second")
+
+    summary()
+}
+
+// ─── 新发现限制汇总 ───
+//
+// Limit-B (Bug #26 已修复): 同一 val 数组跨多个 while 循环复用时，后续循环读取数组元素得到陈旧值
+//   现象(已修复): 第一个 while 循环遍历 val 数组正常工作；同一函数中后续的 while 循环
+//         再次遍历同一数组时，arr[loopVar] 读取到陈旧/错误值，导致结果不正确。
+//         该问题与是否调用泛型函数无关（直接 arr[i] 求和也失败），纯粹是数组复用问题。
+//   根因: while 循环的 body 帧在第一个循环完成后未完全重置 effect 链节点和值表状态，
+//         第二个循环复用数组时，数组索引节点的值表残留上一轮的陈旧值（与 Bug #3/M4 同类，
+//         但发生在顺序循环而非嵌套循环场景）。
+//   修复: Subgraph.rs 的 switch_subgraph 中 value_table.reset_all() + effect 链节点
+//         pending_inputs 重置机制，确保第二轮循环重新求值数组索引节点。现已可直接复用
+//         同一 val 数组跨多个 while 循环，无需独立数组声明绕过。

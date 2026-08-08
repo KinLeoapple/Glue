@@ -1,0 +1,83 @@
+// Benchmark lite 7: 综合工作负载
+// 对标强化版，降低规模
+
+import builtin.io.Console.{println}
+
+type Expr =
+    | ENum(i64)
+    | EAdd(Expr, Expr)
+    | EMul(Expr, Expr)
+    | ESub(Expr, Expr)
+
+type Tree =
+    | Leaf
+    | Node(i64, Tree, Tree)
+
+fun evalExpr(e: Expr): i64 {
+    match e {
+        ENum(n) => n
+        EAdd(a, b) => evalExpr(a) + evalExpr(b)
+        EMul(a, b) => evalExpr(a) * evalExpr(b)
+        ESub(a, b) => evalExpr(a) - evalExpr(b)
+    }
+}
+
+fun buildExpr(depth: i32): Expr {
+    if depth <= 0 { return ENum(1) }
+    val inner = buildExpr(depth - 1)
+    EAdd(EMul(ENum(2), inner), ESub(inner, ENum(1)))
+}
+
+fun tInsert(t: Tree, v: i64): Tree {
+    match t {
+        Leaf => Node(v, Leaf, Leaf)
+        Node(n, lo, hi) => {
+            if v < n { Node(n, tInsert(lo, v), hi) }
+            else if v > n { Node(n, lo, tInsert(hi, v)) }
+            else { t }
+        }
+    }
+}
+
+fun tSum(t: Tree): i64 {
+    match t {
+        Leaf => 0
+        Node(n, lo, hi) => n + tSum(lo) + tSum(hi)
+    }
+}
+
+fun tHeight(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(_, lo, hi) => {
+            val lh = tHeight(lo)
+            val rh = tHeight(hi)
+            1 + (if lh > rh { lh } else { rh })
+        }
+    }
+}
+
+fun main(): void {
+    // 表达式求值 100 次（buildExpr(8)）
+    var exprSum: i64 = 0
+    var i: i32 = 0
+    while i < 100 {
+        val e = buildExpr(8)
+        exprSum = (exprSum + evalExpr(e)) % 1073741824
+        i = i + 1
+    }
+    println(exprSum)
+
+    // BST 插入 1000 节点 + 遍历
+    var tree = Leaf
+    var k: i64 = 0
+    while k < 1000 {
+        val v = (k * 7919 + 1) % 100000
+        tree = tInsert(tree, v)
+        k = k + 1
+    }
+    println(tHeight(tree))
+    println(tSum(tree))
+
+    println("mixed: done")
+}

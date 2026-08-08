@@ -1,0 +1,225 @@
+// 功能验证：ADT 代数数据类型（枚举/带数据构造器/泛型 Option/递归类型/模式匹配/相等不等）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 简单枚举
+type Color = | Red | Green | Blue
+
+// 带数据构造器
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+    | Triangle(f64, f64, f64)
+
+// 泛型 Option
+type Opt<T> = | None | Some(T)
+
+// 递归列表
+type Lst<T> = | Nil | Cons(T, Lst<T>)
+
+// 嵌套 ADT
+type Boxed<T> = | Empty | Box(T)
+type Nested = Nested(Boxed<i32>)
+
+// 多构造器枚举
+type Digit = | D0 | D1 | D2 | D3 | D4 | D5 | D6 | D7 | D8 | D9
+
+// ADT 在 record 字段中
+type Holder = Holder(opt: Opt<i32>)
+
+fun colorName(c: Color): str {
+    match c {
+        Red => "red"
+        Green => "green"
+        Blue => "blue"
+    }
+}
+
+fun shapeArea(s: Shape): f64 {
+    match s {
+        Circle(r) => 3.14159 * r * r
+        Rect(w, h) => w * h
+        Triangle(a, b, c) => (a + b + c) / 2.0
+    }
+}
+
+fun optMap<T, U>(o: Opt<T>, f: (T) -> U): Opt<U> {
+    match o {
+        None => None
+        Some(x) => Some(f(x))
+    }
+}
+
+fun optIsSome<T>(o: Opt<T>): bool {
+    match o {
+        Some(_) => true
+        None => false
+    }
+}
+
+fun lstLen<T>(l: Lst<T>): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + lstLen(t)
+    }
+}
+
+fun lstSum(l: Lst<i32>): i32 {
+    match l {
+        Nil => 0
+        Cons(x, t) => x + lstSum(t)
+    }
+}
+
+fun main(): void {
+    println("=== ADT ===")
+
+    // 枚举
+    check(colorName(Red) == "red", "color Red")
+    check(colorName(Green) == "green", "color Green")
+    check(colorName(Blue) == "blue", "color Blue")
+
+    // 枚举相等与不等（已修复 P1 #1：enum != 不再始终返回 false）
+    check(Red == Red, "enum equality same")
+    check(Red != Green, "enum inequality (!=)")
+    check(Red != Blue, "enum inequality Red!=Blue")
+    check(!(Red != Red), "enum equality via !(!=)")
+
+    // 带数据构造器
+    check(shapeArea(Circle(2.0f64)) == 3.14159 * 2.0 * 2.0, "circle area")
+    check(shapeArea(Rect(3.0f64, 4.0f64)) == 12.0f64, "rect area")
+
+    // 泛型 Option（使用类型化字面量帮助推断）
+    val some = Some(42i32)
+    check(optMap(some, fun(x: i32) { x + 1 }) == Some(43i32), "optMap Some")
+    check(optIsSome(some) == true, "isSome true")
+    check(optIsSome(None) == false, "isSome None")
+
+    // optMap None（在函数调用上下文中类型可推断）
+    check(optMap(Some(10i32), fun(x: i32) { x * 2 }) == Some(20i32), "optMap Some 10")
+
+    // 递归列表（使用类型化字面量）
+    val list = Cons(1i32, Cons(2i32, Cons(3i32, Nil)))
+    check(lstLen(list) == 3, "list length")
+    check(lstSum(list) == 6, "list sum")
+
+    // 空列表（在函数调用上下文中类型可推断）
+    check(lstLen(Nil) == 0, "empty list length")
+    check(lstSum(Nil) == 0, "empty list sum")
+
+    // 单元素列表
+    val single = Cons(99i32, Nil)
+    check(lstLen(single) == 1, "single list length")
+    check(lstSum(single) == 99, "single list sum")
+
+    // 字符串列表
+    val strs = Cons("a", Cons("b", Nil))
+    check(lstLen(strs) == 2, "string list length")
+
+    // match 表达式返回值
+    fun describe(o: Opt<i32>): str {
+        match o {
+            Some(n) if n > 10 => "big"
+            Some(_) => "small"
+            None => "none"
+        }
+    }
+    check(describe(Some(5i32)) == "small", "describe small")
+    check(describe(Some(50i32)) == "big", "describe big")
+    check(describe(None) == "none", "describe none")
+
+    // ─── ADT 边缘测试 ───
+
+    // 递归 ADT 深度（10 层 Cons，从末尾向前构建）
+    var deep_list: Lst<i32> = Cons(9i32, Cons(8i32, Cons(7i32, Cons(6i32, Cons(5i32, Cons(4i32, Cons(3i32, Cons(2i32, Cons(1i32, Cons(0i32, Nil))))))))))
+    check(lstLen(deep_list) == 10, "10-deep recursive ADT")
+    check(lstSum(deep_list) == 45, "10-deep list sum 0+1+...+9")
+
+    // 多构造器枚举（10 个，类型已顶层定义）
+    fun digitVal(d: Digit): i32 {
+        match d {
+            D0 => 0
+            D1 => 1
+            D2 => 2
+            D3 => 3
+            D4 => 4
+            D5 => 5
+            D6 => 6
+            D7 => 7
+            D8 => 8
+            D9 => 9
+        }
+    }
+    check(digitVal(D0) == 0, "10-variant enum D0")
+    check(digitVal(D5) == 5, "10-variant enum D5")
+    check(digitVal(D9) == 9, "10-variant enum D9")
+    check(D0 != D1, "10-variant enum inequality")
+    check(D5 == D5, "10-variant enum equality")
+
+    // 嵌套 ADT（类型已顶层定义）
+    fun extract(n: Nested): i32 {
+        match n {
+            Nested(Empty) => -1
+            Nested(Box(v)) => v
+        }
+    }
+    check(extract(Nested(Empty)) == -1, "nested ADT Empty")
+    check(extract(Nested(Box(42))) == 42, "nested ADT Box")
+
+    // 泛型 ADT 多类型实例化
+    val opt_i32 = Some(42i32)
+    val opt_str = Some("hello")
+    check(optIsSome(opt_i32) == true, "Opt<i32> isSome")
+    check(optIsSome(opt_str) == true, "Opt<str> isSome")
+
+    // ADT 数组
+    val shape_arr: Shape[] = [Circle(1.0f64), Rect(2.0f64, 3.0f64), Triangle(3.0f64, 4.0f64, 5.0f64)]
+    check(shapeArea(shape_arr[0]) == 3.14159, "ADT array Circle area")
+    check(shapeArea(shape_arr[1]) == 6.0f64, "ADT array Rect area")
+
+    // ADT 相等性
+    check(Circle(1.0f64) == Circle(1.0f64), "ADT equality same")
+    check(Circle(1.0f64) != Circle(2.0f64), "ADT inequality different")
+    check(Rect(1.0f64, 2.0f64) != Rect(1.0f64, 3.0f64), "ADT inequality partial")
+    check(Red == Red, "enum equality self")
+    check(Red != Green, "enum inequality different")
+
+    // ADT match 返回不同类型字面量
+    fun defaultVal(o: Opt<i32>): i32 {
+        match o {
+            Some(v) => v
+            None => 0
+        }
+    }
+    check(defaultVal(Some(99i32)) == 99, "ADT match Some returns value")
+    check(defaultVal(None) == 0, "ADT match None returns default")
+
+    // ADT 在 record 字段中（类型已顶层定义）
+    fun holderVal(h: Holder): i32 {
+        match h.opt {
+            Some(v) => v
+            None => -1
+        }
+    }
+    check(holderVal(Holder(Some(7i32))) == 7, "ADT in record Some")
+    check(holderVal(Holder(None)) == -1, "ADT in record None")
+
+    summary()
+}

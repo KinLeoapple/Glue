@@ -3,6 +3,7 @@
 // 强化：5万→100万调用，新增 4 层柯里化、带状态闭包
 // 注意：当前 closure upvalue 写入有预存 bug，仅用只读 upvalue 模式
 
+import builtin.io.Console.{println}
 fun makeAdder(x: i64): (i64) -> i64 {
     fun(y: i64) { x + y }
 }
@@ -41,7 +42,7 @@ fun mapAdd(arr: i64[], delta: i64): i64[] {
     var out: i64[] = []
     var i: i32 = 0
     while i < cast(arr.len()).to(i32) {
-        out = out.push(adder(arr[cast(i).to(usize)]))
+        out = out ++ [adder(arr[cast(i).to(usize)])]
         i = i + 1
     }
     out
@@ -51,13 +52,13 @@ fun buildArray(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(cast(i).to(i64))
+        arr = arr ++ [cast(i).to(i64)]
         i = i + 1
     }
     arr
 }
 
-fun main() {
+fun main(): void {
     // ---- 柯里化加法:1000000 次单层闭包调用 ----
     val add5 = makeAdder(5)
     var currySum: i64 = 0
@@ -102,7 +103,7 @@ fun main() {
         val mapped = mapAdd(arr, cast(n).to(i64))
         // 求和验证
         var s: i64 = 0
-        for x in mapped {
+        for x in mapped.iter() {
             s = s + x
         }
         mapSum = (mapSum + s) % 1073741824

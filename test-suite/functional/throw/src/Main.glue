@@ -1,0 +1,159 @@
+// 功能验证：Throw 错误处理（throw/Ok/match/? 传播/错误子类型/defer）
+var failures: i32 = 0
+var deferLog: str = ""
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 基本 Throw
+fun safeDiv(a: i32, b: i32): Throw<i32, Error> {
+    if b == 0 { throw Error("division by zero") }
+    Ok(a / b)
+}
+
+// ? 传播链
+fun chainDiv(a: i32, b: i32, c: i32): Throw<i32, Error> {
+    val r1 = safeDiv(a, b)?
+    val r2 = safeDiv(r1, c)?
+    Ok(r2)
+}
+
+// 错误子类型
+type NotFound: Err = NotFound(msg: str)
+type Timeout: Err = Timeout(msg: str)
+
+fun lookup(id: i32): Throw<str, Error> {
+    if id < 0 { throw NotFound("negative id") }
+    if id == 0 { throw Timeout("timed out") }
+    Ok("user-" + cast(id).to(str))
+}
+
+// 返回 Error 消息
+fun errMsg(e: Error): str {
+    match e {
+        Error(m) => m
+    }
+}
+
+fun main(): void {
+    println("=== Throw ===")
+
+    // Ok 路径
+    match safeDiv(10, 2) {
+        Ok(v) => check(v == 5, "safeDiv 10/2 = 5")
+        Error(_) => check(false, "safeDiv 10/2 should succeed")
+    }
+
+    // Error 路径
+    match safeDiv(10, 0) {
+        Ok(_) => check(false, "safeDiv 10/0 should fail")
+        Error(e) => check(true, "safeDiv 10/0 throws")
+    }
+
+    // ? 传播成功
+    match chainDiv(100, 5, 2) {
+        Ok(v) => check(v == 10, "chainDiv 100/5/2 = 10")
+        Error(_) => check(false, "chainDiv should succeed")
+    }
+
+    // ? 传播失败
+    match chainDiv(100, 0, 2) {
+        Ok(_) => check(false, "chainDiv should fail on b=0")
+        Error(_) => check(true, "chainDiv fails on b=0")
+    }
+
+    // 错误子类型：NotFound
+    match lookup(-1) {
+        Ok(_) => check(false, "lookup(-1) should fail")
+        Error(e) => check(true, "lookup(-1) throws NotFound")
+    }
+
+    // 错误子类型：Timeout
+    match lookup(0) {
+        Ok(_) => check(false, "lookup(0) should fail")
+        Error(_) => check(true, "lookup(0) throws Timeout")
+    }
+
+    // 成功路径
+    match lookup(42) {
+        Ok(v) => check(v == "user-42", "lookup(42) success")
+        Error(_) => check(false, "lookup(42) should succeed")
+    }
+
+    // Throw 值相等
+    val ok1 = Ok(5)
+    val ok2 = Ok(5)
+    check(ok1 == ok2, "Ok value equality")
+
+    val err1 = Error("msg")
+    check(true, "Error constructed")
+
+    // 间接调用
+    fun doubleOrThrow(n: i32): Throw<i32, Error> {
+        if n > 100 { throw Error("too big") }
+        Ok(n * 2)
+    }
+    match doubleOrThrow(50) {
+        Ok(v) => check(v == 100, "double 50 = 100")
+        Error(_) => check(false, "double 50 should succeed")
+    }
+    match doubleOrThrow(200) {
+        Ok(_) => check(false, "double 200 should fail")
+        Error(_) => check(true, "double 200 throws")
+    }
+
+    // defer LIFO 顺序（已修复 P0 #10）
+    deferLog = ""
+    fun lifo(): void {
+        defer deferLog = deferLog + "A"
+        defer deferLog = deferLog + "B"
+        deferLog = deferLog + "body|"
+    }
+    lifo()
+    check(deferLog == "body|BA", "defer LIFO order")
+
+    // defer 单个
+    deferLog = ""
+    fun singleDefer(): void {
+        defer deferLog = deferLog + "cleanup"
+        deferLog = deferLog + "before|"
+    }
+    singleDefer()
+    check(deferLog == "before|cleanup", "single defer executes")
+
+    // defer 无 body 影响
+    deferLog = ""
+    fun noDefer(): void {
+        deferLog = deferLog + "only"
+    }
+    noDefer()
+    check(deferLog == "only", "no defer just runs body")
+
+    // defer 多个顺序
+    deferLog = ""
+    fun multiDefer(): void {
+        defer deferLog = deferLog + "1"
+        defer deferLog = deferLog + "2"
+        defer deferLog = deferLog + "3"
+        deferLog = deferLog + "0"
+    }
+    multiDefer()
+    check(deferLog == "0321", "multiple defers LIFO")
+
+    summary()
+}

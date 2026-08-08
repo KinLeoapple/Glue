@@ -1,0 +1,307 @@
+// 大胆数组边缘测试：深嵌套/多元素类型/数组作参数返回/数组相等/数组与 nullable/递归构建
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #19: 嵌套函数递归 → 递归函数放顶层
+//   Bug #21: 超范围字面量静默退出 → 已修复（现报编译错误）
+//   Bug #34: arr[i] = x 空操作 → 已修复（现支持原地修改）
+//   Bug #37: while 条件调用用户函数 hang → 用内联条件
+//   Bug #38: &&/|| 不短路 → 不依赖短路副作用
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 顶层递归函数：用数组构建 range（避开 Bug #19 嵌套递归）
+fun rangeArr(n: i32): i32[] {
+    if n <= 0 {
+        []
+    } else {
+        rangeArr(n - 1) ++ [n - 1]
+    }
+}
+
+// 顶层函数：数组求和（数组作参数，i32 作返回）
+fun sumArr(arr: i32[]): i32 {
+    var s: i32 = 0
+    var i: i32 = 0
+    while i < arr.len() {
+        s = s + arr[i]
+        i = i + 1
+    }
+    s
+}
+
+// 顶层函数：数组作参数 + 数组作返回（map double）
+fun mapDouble(arr: i32[]): i32[] {
+    var out: i32[] = []
+    var i: i32 = 0
+    while i < arr.len() {
+        out = out ++ [arr[i] * 2]
+        i = i + 1
+    }
+    out
+}
+
+// 顶层函数：数组反转（用 ++ 重建）
+fun reverseArr(arr: i32[]): i32[] {
+    var out: i32[] = []
+    var i: i32 = arr.len() - 1
+    while i >= 0 {
+        out = out ++ [arr[i]]
+        i = i - 1
+    }
+    out
+}
+
+fun main(): void {
+    println("=== Edge Arrays ===")
+
+    // ─── 1. 多元素类型数组 ───
+    println("--- Element Type Diversity ---")
+    val bools = [true, false, true]
+    check(bools.len() == 3, "bool array len 3")
+    check(bools[0] == true, "bool arr[0] = true")
+    check(bools[1] == false, "bool arr[1] = false")
+    check(bools[2] == true, "bool arr[2] = true")
+
+    val chars = ['a', 'b', 'c', 'd']
+    check(chars.len() == 4, "char array len 4")
+    check(chars[0] == 'a', "char arr[0] = a")
+    check(chars[3] == 'd', "char arr[3] = d")
+    check(cast(chars[2]).to(i32) == 99, "char arr[2] to i32 = 99 (c)")
+
+    val floats = [1.5f64, 2.5f64, 3.5f64]
+    check(floats.len() == 3, "f64 array len 3")
+    check(floats[0] == 1.5f64, "f64 arr[0] = 1.5")
+    check(floats[1] + floats[2] == 6.0f64, "f64 arr[1]+arr[2] = 6.0")
+
+    val u8s = [0u8, 128u8, 255u8]
+    check(u8s.len() == 3, "u8 array len 3")
+    check(u8s[0] == 0u8, "u8 arr[0] = 0")
+    check(u8s[2] == 255u8, "u8 arr[2] = 255")
+
+    val i64s = [1000000000i64, 2000000000i64]
+    check(i64s.len() == 2, "i64 array len 2")
+    check(i64s[0] + i64s[1] == 3000000000i64, "i64 arr sum = 3 billion")
+
+    // ─── 2. 4 层嵌套数组 ───
+    println("--- 4-Layer Nested Array ---")
+    val deep4 = [[[[1, 2], [3, 4]], [[5, 6], [7, 8]]], [[[9, 10], [11, 12]], [[13, 14], [15, 16]]]]
+    check(deep4[0][0][0][0] == 1, "4-deep [0][0][0][0] = 1")
+    check(deep4[0][0][1][1] == 4, "4-deep [0][0][1][1] = 4")
+    check(deep4[0][1][0][0] == 5, "4-deep [0][1][0][0] = 5")
+    check(deep4[1][0][1][0] == 11, "4-deep [1][0][1][0] = 11")
+    check(deep4[1][1][1][1] == 16, "4-deep [1][1][1][1] = 16")
+
+    // ─── 3. 数组作函数参数与返回值 ───
+    println("--- Array as Param/Return ---")
+    val r5 = rangeArr(5)
+    check(r5.len() == 5, "rangeArr(5) len 5")
+    check(r5[0] == 0, "rangeArr(5)[0] = 0")
+    check(r5[4] == 4, "rangeArr(5)[4] = 4")
+    check(rangeArr(0).len() == 0, "rangeArr(0) empty")
+    check(rangeArr(1)[0] == 0, "rangeArr(1)[0] = 0")
+
+    check(sumArr([10, 20, 30, 40]) == 100, "sumArr literal = 100")
+    check(sumArr([]) == 0, "sumArr empty = 0")
+    check(sumArr(r5) == 10, "sumArr(rangeArr(5)) = 0+1+2+3+4 = 10")
+    check(sumArr(rangeArr(10)) == 45, "sumArr(rangeArr(10)) = 45")
+
+    val doubled = mapDouble([1, 2, 3, 4, 5])
+    check(doubled.len() == 5, "mapDouble len 5")
+    check(doubled[0] == 2, "mapDouble[0] = 2")
+    check(doubled[4] == 10, "mapDouble[4] = 10")
+    check(sumArr(doubled) == 30, "sumArr(mapDouble) = 2+4+6+8+10 = 30")
+
+    val rev = reverseArr([1, 2, 3, 4, 5])
+    check(rev.len() == 5, "reverseArr len 5")
+    check(rev[0] == 5, "reverseArr[0] = 5")
+    check(rev[4] == 1, "reverseArr[4] = 1")
+    check(reverseArr([]).len() == 0, "reverseArr empty = 0")
+    check(reverseArr([42])[0] == 42, "reverseArr single = 42")
+
+    // 链式组合：rangeArr(4) = [0,1,2,3], mapDouble = [0,2,4,6], sum = 0+2+4+6 = 12
+    check(sumArr(mapDouble(rangeArr(4))) == 12, "compose: sum(map(range(4))) = 12")
+
+    // ─── 4. 数组相等性（深度比较）───
+    println("--- Array Equality ---")
+    check([1, 2, 3] == [1, 2, 3], "equal arrays")
+    check([1, 2, 3] != [1, 2, 4], "differ in last elem")
+    check([1, 2] != [1, 2, 3], "differ in length")
+    check([1, 2, 3] != [1, 3, 2], "differ in order")
+    check([] == [], "empty arrays equal")
+    check(["a", "b"] == ["a", "b"], "equal string arrays")
+    check(["a"] != ["b"], "differ string arrays")
+    check([true, false] == [true, false], "equal bool arrays")
+    check([true] != [false], "differ bool arrays")
+
+    // ─── 5. 数组拼接不可变性（深拷贝）───
+    println("--- Concat Immutability ---")
+    val orig = [1, 2, 3]
+    val concatted = orig ++ [4]
+    check(orig.len() == 3, "concat: original len unchanged")
+    check(orig[2] == 3, "concat: original last elem")
+    check(concatted.len() == 4, "concat: new array len 4")
+    // 多次拼接同一原数组
+    val c1 = orig ++ [10]
+    val c2 = orig ++ [20]
+    check(c1[3] == 10, "concat orig++[10]")
+    check(c2[3] == 20, "concat orig++[20]")
+    check(orig.len() == 3, "concat: orig unchanged after two concats")
+
+    // ─── 6. 数组与 nullable（限制：i32?[] 类型注解不支持，用推断）───
+    println("--- Array & Nullable ---")
+    // Limit-B: 显式类型 `i32?[]`（nullable 元素数组）导致 parse error: expected '='。
+    //   推测 `?[]` 组合在类型解析中有歧义（i32 ? [] vs i32? []）。
+    // 绕过：省略类型注解，让推断处理
+    val opt_arr = [1i32, null, 3i32]
+    check(opt_arr.len() == 3, "nullable i32 array len 3")
+    check(opt_arr[0] == 1i32, "nullable arr[0] = 1")
+    check(opt_arr[1] == null, "nullable arr[1] = null")
+    check(opt_arr[2] == 3i32, "nullable arr[2] = 3")
+    // ?? 合并 nullable 元素
+    check((opt_arr[1] ?? 99i32) == 99, "nullable arr[1] ?? 99 = 99")
+    check((opt_arr[0] ?? 99i32) == 1, "nullable arr[0] ?? 99 = 1")
+
+    val all_null = [null, null]
+    check(all_null.len() == 2, "all-null array len 2")
+    check(all_null[0] == null, "all-null arr[0]")
+    check(all_null[1] == null, "all-null arr[1]")
+
+    // ─── 7. 数组中的 record ───
+    println("--- Record Arrays ---")
+    type Pt = Pt(x: i32, y: i32)
+    val pts = [Pt(1, 2), Pt(3, 4), Pt(5, 6)]
+    check(pts.len() == 3, "record array len 3")
+    check(pts[0].x == 1, "record arr[0].x")
+    check(pts[2].y == 6, "record arr[2].y")
+    // record 数组相等
+    check(pts == [Pt(1, 2), Pt(3, 4), Pt(5, 6)], "record array equality")
+    check(pts != [Pt(1, 2), Pt(3, 4), Pt(5, 99)], "record array inequality")
+    // record 数组拼接
+    val more_pts = pts ++ [Pt(7, 8)]
+    check(more_pts[3] == Pt(7, 8), "record arr concat [3]")
+    check(more_pts.len() == 4, "record arr concat len")
+
+    // ─── 8. 大胆：数组的数组（矩阵）运算 ───
+    println("--- Matrix (Array of Arrays) ---")
+    val mat = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    check(mat.len() == 3, "matrix rows = 3")
+    check(mat[0].len() == 3, "matrix row 0 len = 3")
+    check(mat[1][1] == 5, "matrix [1][1] = 5 (center)")
+    // 行求和
+    var row_sum: i32 = 0
+    var ri: i32 = 0
+    while ri < mat[1].len() {
+        row_sum = row_sum + mat[1][ri]
+        ri = ri + 1
+    }
+    check(row_sum == 15, "matrix row 1 sum = 4+5+6 = 15")
+    // 列求和（列 0）
+    var col_sum: i32 = 0
+    var ci: i32 = 0
+    while ci < mat.len() {
+        col_sum = col_sum + mat[ci][0]
+        ci = ci + 1
+    }
+    check(col_sum == 12, "matrix col 0 sum = 1+4+7 = 12")
+
+    // ─── 9. 大胆：数组元素作为函数参数 ───
+    println("--- Array Elem as Argument ---")
+    fun double(x: i32): i32 { x * 2 }
+    val arg_arr = [10, 20, 30]
+    check(double(arg_arr[0]) == 20, "double(arr[0])")
+    check(double(arg_arr[2]) == 60, "double(arr[2])")
+    check(double(arg_arr[0]) + double(arg_arr[1]) == 60, "double(arr[0])+double(arr[1])")
+
+    // ─── 10. 大胆：数组拼接链（递归构建）───
+    println("--- Recursive Array Build ---")
+    val r10 = rangeArr(10)
+    check(r10.len() == 10, "rangeArr(10) len 10")
+    check(r10[0] == 0, "rangeArr(10)[0] = 0")
+    check(r10[9] == 9, "rangeArr(10)[9] = 9")
+    check(sumArr(r10) == 45, "sumArr(rangeArr(10)) = 45")
+    // 反转 range
+    val rev10 = reverseArr(r10)
+    check(rev10[0] == 9, "reverseArr(rangeArr(10))[0] = 9")
+    check(rev10[9] == 0, "reverseArr(rangeArr(10))[9] = 0")
+
+    // ─── 11. 大胆：空数组边界 ───
+    println("--- Empty Array Edges ---")
+    val e1: i32[] = []
+    val e2: i32[] = []
+    check(e1 == e2, "two empty arrays equal")
+    check(e1.len() == 0, "empty len 0")
+    check((e1 ++ [1]).len() == 1, "empty ++ [1] len 1")
+    check((e1 ++ e1).len() == 0, "empty ++ empty len 0")
+    check(sumArr(e1) == 0, "sumArr empty = 0")
+
+    // ─── 12. 大胆：数组元素运算与索引混合 ───
+    println("--- Mixed Index & Arithmetic ---")
+    val nums = [10, 20, 30, 40, 50]
+    check(nums[0] + nums[1] == 30, "arr[0]+arr[1]")
+    check(nums[4] - nums[0] == 40, "arr[4]-arr[0]")
+    check(nums[2] * 2 == 60, "arr[2]*2")
+    check((nums[0] + nums[4]) / 2 == 30, "avg of first+last")
+    // 索引计算
+    val mid = nums.len() / 2
+    check(nums[mid] == 30, "middle elem via len/2")
+
+    // ─── 13. 大胆：长数组拼接（50 元素）───
+    println("--- 50-Element Build ---")
+    var long_arr: i32[] = []
+    var li: i32 = 0
+    while li < 50 {
+        long_arr = long_arr ++ [li * li]
+        li = li + 1
+    }
+    check(long_arr.len() == 50, "50-elem array len")
+    check(long_arr[0] == 0, "50-elem [0] = 0^2")
+    check(long_arr[7] == 49, "50-elem [7] = 7^2 = 49")
+    check(long_arr[49] == 2401, "50-elem [49] = 49^2 = 2401")
+    // 平方和 0^2+1^2+...+49^2 = 49*50*99/6 = 40425
+    check(sumArr(long_arr) == 40425, "sum of squares 0..49 = 40425")
+
+    // ─── 14. 大胆：数组 in match 表达式 ───
+    println("--- Array in Match ---")
+    fun classifyArr(arr: i32[]): str {
+        match arr.len() {
+            0 => "empty"
+            1 => "single"
+            n if n < 5 => "small"
+            _ => "large"
+        }
+    }
+    check(classifyArr([]) == "empty", "classify empty")
+    check(classifyArr([1]) == "single", "classify single")
+    check(classifyArr([1, 2, 3]) == "small", "classify small (3)")
+    check(classifyArr([1, 2, 3, 4]) == "small", "classify small (4)")
+    check(classifyArr([1, 2, 3, 4, 5]) == "large", "classify large (5)")
+
+    // ─── 15. 大胆：嵌套数组拼接 ───
+    println("--- Nested Array Concat ---")
+    val na1 = [[1, 2], [3, 4]]
+    val na2 = [[5, 6]]
+    val na3 = na1 ++ na2
+    check(na3.len() == 3, "nested array concat len 3")
+    check(na3[0] == [1, 2], "nested concat [0]")
+    check(na3[2] == [5, 6], "nested concat [2]")
+    check(na3[2][1] == 6, "nested concat [2][1]")
+
+    summary()
+}

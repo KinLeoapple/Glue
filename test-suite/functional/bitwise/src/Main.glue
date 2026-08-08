@@ -1,0 +1,138 @@
+// 功能验证：位运算（AND/OR/XOR/NOT/移位/优先级/位操作）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Bitwise ===")
+
+    // 基本位运算（== 优先级高于位运算，需加括号）
+    check((0xFF & 0x0F) == 0x0F, "AND")
+    check((0xF0 | 0x0F) == 0xFF, "OR")
+    check((0xFF ^ 0x0F) == 0xF0, "XOR")
+    check((0xAA ^ 0xFF) == 0x55, "XOR all-ones = NOT")
+
+    // 移位
+    check((1 << 4) == 16, "left shift")
+    check((256 >> 4) == 16, "right shift")
+    check((1 << 0) == 1, "shift by zero")
+
+    // 运算符优先级
+    check((1 + 2 << 3) == 24, "precedence: + before <<")
+    check((0xFF & 0x0F | 0xF0) == 0xFF, "precedence: & before |")
+
+    // XOR 交换
+    var a: i32 = 42
+    var b: i32 = 99
+    a = a ^ b
+    b = a ^ b
+    a = a ^ b
+    check(a == 99, "XOR swap a")
+    check(b == 42, "XOR swap b")
+
+    // 位提取
+    val v: i32 = 0x12345678
+    check(((v >> 0) & 0xFF) == 0x78, "extract byte 0")
+    check(((v >> 8) & 0xFF) == 0x56, "extract byte 1")
+    check(((v >> 16) & 0xFF) == 0x34, "extract byte 2")
+    check(((v >> 24) & 0xFF) == 0x12, "extract byte 3")
+
+    // 位组装
+    val assembled: i32 = (0x12 << 24) | (0x34 << 16) | (0x56 << 8) | 0x78
+    check(assembled == 0x12345678, "bit assembly")
+
+    // u8 位运算
+    val u: u8 = 0xFF
+    check((u & 0x0F) == 0x0F, "u8 AND")
+    check((u | 0x00) == 0xFF, "u8 OR")
+
+    // 有符号右移
+    val si: i32 = -16
+    check((si >> 2) == -4, "arithmetic right shift negative")
+
+    // 按位取反
+    val z: i32 = 0
+    check((~z) == -1, "NOT zero = -1")
+
+    // 字面量
+    check(0b1010 == 10, "binary literal")
+    check(0o777 == 511, "octal literal")
+
+    // ─── 位运算边缘测试 ───
+
+    // 全 0 / 全 1 边界
+    val all_zero: i32 = 0
+    check((all_zero & 0xFF) == 0, "AND with zero clears all")
+    check((all_zero | 0xFF) == 0xFF, "OR with zero keeps operand")
+    check((all_zero ^ 0xFF) == 0xFF, "XOR with zero = identity")
+    val all_ones: i32 = -1
+    check((all_ones & 0xFF) == 0xFF, "AND with all-ones = identity")
+    check((all_ones | 0x00) == all_ones, "OR with all-ones = all-ones")
+    check((all_ones ^ 0xFF) == -256, "XOR with all-ones = NOT")
+
+    // 移位边界
+    check((1 << 0) == 1, "shift by 0 is identity")
+    check((1 << 31) == -2147483648, "shift 1<<31 = i32 MIN (sign bit)")
+    check((0xFF >> 0) == 0xFF, "right shift by 0")
+    check((0 << 31) == 0, "shift zero by 31")
+    val min_i32: i32 = -2147483648
+    check((min_i32 >> 1) == -1073741824, "arithmetic right shift of i32 MIN")
+    check((min_i32 >> 31) == -1, "arithmetic right shift i32 MIN by 31 = -1")
+
+    // XOR 自身清零
+    val xv: i32 = 0x12345678
+    check((xv ^ xv) == 0, "XOR self = 0")
+    check((xv & xv) == xv, "AND self = self")
+    check((xv | xv) == xv, "OR self = self")
+
+    // XOR with -1 (all ones) = NOT
+    check((0x12345678 ^ -1) == (~0x12345678), "XOR -1 equals NOT")
+    check((0 ^ -1) == -1, "0 XOR -1 = -1")
+    check((0xFF ^ -1) == -256, "0xFF XOR -1 = NOT(0xFF)")
+
+    // 位组装与拆解 roundtrip（值在 i32 范围内）
+    val packed: i32 = (0x12 << 24) | (0x34 << 16) | (0x56 << 8) | 0x78
+    check(((packed >> 24) & 0xFF) == 0x12, "extract byte 3 from packed")
+    check(((packed >> 16) & 0xFF) == 0x34, "extract byte 2 from packed")
+    check(((packed >> 8) & 0xFF) == 0x56, "extract byte 1 from packed")
+    check(((packed >> 0) & 0xFF) == 0x78, "extract byte 0 from packed")
+
+    // 链式位运算
+    val chain_v: i32 = 0xF0
+    val chained = chain_v | 0x0F & 0x03
+    check(chained == 0xF3, "precedence: & before | in chain")
+
+    // 位移组合
+    check(((0x01 << 4) | (0x01 << 3)) == 0x18, "combined shifts OR")
+    check(((0xFF << 4) & 0xF0) == 0xF0, "shift then mask")
+
+    // NOT 边界
+    check((~0) == -1, "NOT 0 = -1")
+    check((~(-1)) == 0, "NOT -1 = 0")
+    check((~0x00FF) == -256, "NOT 0xFF = -256")
+
+    // 位反转模式（互补模式）
+    val ab: i32 = 0xA5A5
+    val ba: i32 = 0x5A5A
+    check((ab ^ ba) == 0xFFFF, "complement patterns XOR = all-ones (16-bit)")
+    check((ab & ba) == 0, "complement patterns AND = 0")
+    check((ab | ba) == 0xFFFF, "complement patterns OR = all-ones (16-bit)")
+
+    summary()
+}

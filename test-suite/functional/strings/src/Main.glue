@@ -1,0 +1,173 @@
+// 功能验证：字符串（长度/索引/拼接/插值/转义/unicode）
+// 注意：非 ASCII 字符串的索引存在 bug，本测试仅使用 ASCII 索引
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Strings ===")
+
+    // 长度
+    check("hello".len() == 5, "ASCII length")
+    check("".len() == 0, "empty length")
+    check("你好世界".len() == 4, "unicode length 4 chars")
+
+    // ASCII 索引
+    check("hello"[0] == 'h', "index first")
+    check("hello"[4] == 'o', "index last")
+
+    // 拼接
+    check("hello" + " " + "world" == "hello world", "concat")
+    check("" + "abc" == "abc", "concat with empty left")
+    check("abc" + "" == "abc", "concat with empty right")
+
+    // 字符串插值
+    val name = "Glue"
+    check("Hello, {name}!" == "Hello, Glue!", "interpolation str")
+    val n = 42
+    check("n = {n}" == "n = 42", "interpolation int")
+
+    // 转义
+    check("tab\there" == "tab\there", "tab escape")
+    check("line1\nline2" == "line1\nline2", "newline escape")
+    check("quote\"here" == "quote\"here", "quote escape")
+
+    // unicode 长度
+    check("héllo".len() == 5, "unicode length 5")
+    check("héllo你好".len() == 7, "unicode length 7")
+
+    // unicode 字符索引（Bug #15：非 ASCII 字符串索引显示为 U+XXXX 转义）
+    check("héllo"[1] == 'é', "unicode index 1 returns é char")
+    check("héllo你好"[5] == '你', "unicode index 5 returns 你 char")
+    check("héllo你好"[6] == '好', "unicode index 6 returns 好 char")
+    check("你好"[0] == '你', "unicode index 0 on CJK string")
+
+    // 字符串比较
+    check("abc" == "abc", "string equality")
+    check("abc" != "abd", "string inequality")
+
+    // 字符串拼接构建
+    val parts = "a" + "b" + "c" + "d" + "e"
+    check(parts == "abcde", "chained concat")
+    check(parts.len() == 5, "chained concat length")
+
+    // 空字符串
+    check("".len() == 0, "empty string length")
+    check("" + "x" == "x", "empty + x")
+
+    // str + int 混合拼接
+    check("" + 6 == "6", "empty + int")
+    check("result=" + 42 == "result=42", "str + int")
+    check("count: " + 0 == "count: 0", "str + zero")
+    check(6 + "" == "6", "int + str")
+    check(42 + " items" == "42 items", "int + str suffix")
+
+    // str + bool 混合拼接
+    check("flag=" + true == "flag=true", "str + bool")
+    check(false + "" == "false", "bool + str")
+
+    // str + 浮点混合拼接
+    check("pi=" + 3.14 == "pi=3.14", "str + f64")
+    check(2.5 + "kg" == "2.5kg", "f64 + str")
+    check("zero=" + 0.0 == "zero=0", "str + f64 zero")
+
+    // 字符串插值中嵌入比较表达式（Bug #17：bool == bool 恒返回 true）
+    check("{true == false}" == "false", "interp bool == bool false")
+    check("{true == true}" == "true", "interp bool == bool true")
+    check("{5 == 10}" == "false", "interp int == int")
+    check("{5 == 5}" == "true", "interp int == int equal")
+    check("d: {5 == 10}" == "d: false", "interp int == int with prefix")
+    check("r: {true == false}" == "r: false", "interp bool == bool with prefix")
+
+    // ─── 字符串边缘测试 ───
+
+    // 4 字节 UTF-8（emoji，码点 > 0xFFFF）
+    val emoji = "😀"
+    check(emoji.len() == 1, "emoji length 1 (1 codepoint)")
+    val mixed_emoji = "a😀b"
+    check(mixed_emoji.len() == 3, "mixed ASCII+emoji length 3")
+    check(mixed_emoji[0] == 'a', "mixed emoji [0] = a")
+    check(mixed_emoji[1] == '😀', "mixed emoji [1] = 😀")
+    check(mixed_emoji[2] == 'b', "mixed emoji [2] = b")
+
+    // 多种 emoji 组合
+    val emojis = "🎉🎊🎈"
+    check(emojis.len() == 3, "3 emojis length 3")
+    check(emojis[0] == '🎉', "emoji [0] = 🎉")
+    check(emojis[2] == '🎈', "emoji [2] = 🎈")
+
+    // 混合脚本（ASCII + 拉丁 + CJK + emoji）
+    val mixed_script = "Hello世界🌍"
+    check(mixed_script.len() == 8, "mixed script length 8")
+    check(mixed_script[0] == 'H', "mixed script [0]")
+    check(mixed_script[5] == '世', "mixed script [5] = 世")
+    check(mixed_script[6] == '界', "mixed script [6] = 界")
+    check(mixed_script[7] == '🌍', "mixed script [7] = 🌍")
+
+    // 长字符串（迭代构建）
+    var long_str: str = ""
+    var si: i32 = 0
+    while si < 100 {
+        long_str = long_str + "x"
+        si = si + 1
+    }
+    check(long_str.len() == 100, "100-char string length")
+    check(long_str[0] == 'x', "100-char [0]")
+    check(long_str[99] == 'x', "100-char [99]")
+
+    // 长字符串拼接
+    var concat_long: str = ""
+    var ci: i32 = 0
+    while ci < 50 {
+        concat_long = concat_long + "ab"
+        ci = ci + 1
+    }
+    check(concat_long.len() == 100, "50x 'ab' = 100 chars")
+
+    // 插值中嵌入复杂表达式
+    val a_val: i32 = 10
+    val b_val: i32 = 20
+    check("{a_val + b_val}" == "30", "interp arithmetic expression")
+    check("{a_val * b_val + 5}" == "205", "interp complex arithmetic")
+    check("result: {a_val > 5}" == "result: true", "interp comparison")
+    check("{a_val == 10 && b_val == 20}" == "true", "interp logical and")
+
+    // 插值嵌套（插值中包含函数调用结果）
+    fun doubleIt(n: i32): i32 { n * 2 }
+    check("{doubleIt(21)}" == "42", "interp function call")
+
+    // 空字符串边缘
+    check("".len() == 0, "empty length")
+    check("" + "" == "", "empty + empty")
+    check("".len() + "".len() == 0, "empty lengths sum")
+
+    // 特殊字符组合（\t \n \\ \" = 4 chars）
+    val special = "\t\n\\\""
+    check(special.len() == 4, "special escapes length 4")
+    check(special[0] == '\t', "special [0] = tab")
+    check(special[1] == '\n', "special [1] = newline")
+
+    // 字符串比较边界
+    check("a" < "b", "string lexicographic less")
+    check("abc" < "abd", "string prefix comparison")
+    check("abc" < "abcd", "string shorter prefix less")
+    check("Z" < "a", "uppercase before lowercase (ASCII)")
+
+    summary()
+}

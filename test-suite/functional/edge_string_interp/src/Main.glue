@@ -1,0 +1,222 @@
+// ── 边缘字符串插值测试：大胆探测插值表达式边界 ──
+// 目标：探测字符串插值 "{expr}" 中各种表达式类型的行为，
+//       包括算术、比较、方法调用、记录字段、nullable、嵌套插值、
+//       特殊字符、空值、bool/char/f64 格式化等。
+// 已知约束：
+//   Bug #17: 字符串插值中 bool == bool 恒返回 true（已修复）
+//   Bug #46: {[]} 被当作数组字面量解析（无转义机制）
+//   Bug #16: str + int 拼接（已修复，底层为插值）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Point = Point(x: i32, y: i32)
+type Shape = | Circle(f64) | Rect(f64, f64)
+
+fun main(): void {
+    println("=== Edge String Interp ===")
+
+    // ─── 1. 基础整数插值 ───
+    println("--- Basic Integer ---")
+    val n: i32 = 42
+    check("{n}" == "42", "simple int")
+    check("val={n}" == "val=42", "prefix int")
+    check("{n}end" == "42end", "suffix int")
+    check("a{n}b" == "a42b", "infix int")
+    check("{0}" == "0", "literal zero")
+    check("{999}" == "999", "literal 999")
+
+    // ─── 2. 算术表达式插值 ───
+    println("--- Arithmetic Expr ---")
+    check("{1 + 2}" == "3", "1+2")
+    check("{10 * 10}" == "100", "10*10")
+    check("{100 / 7}" == "14", "100/7 int div")
+    check("{100 % 7}" == "2", "100%7")
+    val a: i32 = 5
+    val b: i32 = 3
+    check("{a + b}" == "8", "var add")
+    check("{a * b}" == "15", "var mul")
+    check("{a - b}" == "2", "var sub")
+
+    // ─── 3. 浮点数插值 ───
+    println("--- Float Interp ---")
+    val pi: f64 = 3.141592653589793
+    check("{pi}" == "3.141592653589793", "f64 pi")
+    val f: f64 = 2.5
+    check("{f}" == "2.5", "f64 2.5")
+    check("{0.0}" == "0", "f64 zero")
+    val negf: f64 = 0.0 - 1.5  // Bug #55: 0 - 1.5 (int-float) returns 0; use 0.0
+    check("{negf}" == "-1.5", "f64 negative")
+
+    // ─── 4. bool 插值 ───
+    println("--- Bool Interp ---")
+    check("{true}" == "true", "true literal")
+    check("{false}" == "false", "false literal")
+    val t: bool = true
+    val f2: bool = false
+    check("{t}" == "true", "true var")
+    check("{f2}" == "false", "false var")
+    check("{1 == 1}" == "true", "1==1 in interp")
+    check("{1 != 2}" == "true", "1!=2 in interp")
+    check("{1 == 2}" == "false", "1==2 in interp")
+
+    // ─── 5. 字符串插值（嵌套）───
+    println("--- Nested String ---")
+    val s: str = "world"
+    check("hello {s}" == "hello world", "str in interp")
+    check("{s}!" == "world!", "str prefix")
+    check("a{s}b" == "aworldb", "str infix")
+    // Bug #54: {\"str\"} escaped quotes inside interp braces cause parse error
+    val quoted_str = "quoted"
+    check("{quoted_str}" == "quoted", "quoted str via var in interp")
+
+    // ─── 6. char 插值 ───
+    println("--- Char Interp ---")
+    val c: char = 'X'
+    check("{c}" == "X", "char X")
+    check("char={c}" == "char=X", "char with prefix")
+    check("{'A'}" == "A", "char literal A")
+
+    // ─── 7. 记录字段插值 ───
+    println("--- Record Field ---")
+    val p = Point(3, 4)
+    check("{p.x}" == "3", "record field x")
+    check("{p.y}" == "4", "record field y")
+    check("({p.x},{p.y})" == "(3,4)", "record point format")
+    check("{p.x + p.y}" == "7", "record field arithmetic")
+
+    // ─── 8. nullable 插值 ───
+    println("--- Nullable Interp ---")
+    val opt: i32? = 42
+    val nul: i32? = null
+    check("{opt}" == "42", "nullable some")
+    check("{nul}" == "null", "nullable null")
+    val optstr: str? = "hello"
+    val nulstr: str? = null
+    check("{optstr}" == "hello", "nullable str some")
+    check("{nulstr}" == "null", "nullable str null")
+
+    // ─── 9. 方法调用插值 ───
+    println("--- Method Call ---")
+    val arr = [10, 20, 30]
+    check("{arr.len()}" == "3", "arr.len() in interp")
+    val s2 = "hello"
+    check("{s2}" == "hello", "str in interp")
+
+    // ─── 10. 多表达式插值 ───
+    println("--- Multi-Expr ---")
+    val x: i32 = 10
+    val y: i32 = 20
+    check("{x}+{y}={x + y}" == "10+20=30", "multi expr")
+    check("({x},{y})" == "(10,20)", "multi var")
+    check("{x}{y}" == "1020", "adjacent vars")
+
+    // ─── 11. ADT 插值 ───
+    println("--- ADT Interp ---")
+    val circ = Circle(2.0f64)
+    val rect = Rect(3.0f64, 4.0f64)
+    // ADT 的字符串表示可能是类型名或内部格式
+    val circ_str = "{circ}"
+    val rect_str = "{rect}"
+    println("  INFO: Circle(2.0) = '{circ_str}'")
+    println("  INFO: Rect(3.0,4.0) = '{rect_str}'")
+    check(circ_str == "Circle(_: 2)", "Circle str format")
+    check(rect_str == "Rect(_: 3, _: 4)", "Rect str format")
+
+    // ─── 12. 复杂表达式插值 ───
+    println("--- Complex Expr ---")
+    check("{(1 + 2) * 3}" == "9", "paren expr")
+    // Bug #46: {[...]} in string interp is parsed as array literal, skip inline array.len()
+    val arr12 = [1, 2, 3]
+    check("{arr12.len()}" == "3", "array len via var in interp")
+    check("{1 < 2}" == "true", "comparison in interp")
+    check("{2 > 3}" == "false", "false comparison in interp")
+
+    // ─── 13. 空字符串与特殊值 ───
+    println("--- Empty & Special ---")
+    val empty_s: str = ""
+    check("{empty_s}" == "", "empty string var in interp")
+    check("[]" == "[]", "literal brackets (no interp)")
+
+    // ─── 14. i64 / u64 大数插值 ───
+    println("--- Large Integer ---")
+    val big: i64 = 9999999999i64
+    check("{big}" == "9999999999", "i64 large")
+    val ubig: u64 = 18446744073709551615u64
+    check("{ubig}" == "18446744073709551615", "u64 max")
+
+    // ─── 15. 三重嵌套插值 ───
+    println("--- Triple Nested ---")
+    val inner: str = "deep"
+    val middle: str = "a{inner}b"
+    val outer: str = "x{middle}y"
+    check(middle == "adeepb", "middle level interp")
+    check(outer == "xadeepby", "outer level interp")
+
+    // ─── 16. 表达式链 ───
+    println("--- Expression Chain ---")
+    val nums = [1, 2, 3, 4, 5]
+    var total: i32 = 0
+    var i: i32 = 0
+    while i < nums.len() {
+        total = total + nums[i]
+        i = i + 1
+    }
+    check("sum={total} count={nums.len()}" == "sum=15 count=5", "loop result interp")
+    check("avg={total / nums.len()}" == "avg=3", "division result interp")
+
+    // ─── 17. 负数插值 ───
+    println("--- Negative Number ---")
+    val neg: i32 = 0 - 42
+    check("{neg}" == "-42", "negative i32 via 0-42")
+
+    // ─── 18. 条件表达式插值 ───
+    println("--- Conditional ---")
+    val cond: bool = 5 > 3
+    check("{cond}" == "true", "bool cond true")
+    val lt_result: bool = 5 < 3
+    check("{lt_result}" == "false", "bool cond false")
+
+    // ─── 19. 字符串拼接 vs 插值对比 ───
+    println("--- Concat vs Interp ---")
+    val name: str = "Alice"
+    val age: i32 = 30
+    val via_interp = "{name} is {age}"
+    val via_concat = name + " is " + cast(age).to(str)
+    check(via_interp == via_concat, "interp equals concat")
+    check(via_interp == "Alice is 30", "interp result correct")
+
+    // ─── 20. Unicode 插值 ───
+    println("--- Unicode ---")
+    val unicode_s: str = "你好世界"
+    check("{unicode_s}" == "你好世界", "unicode CJK")
+    val emoji_s: str = "hello"
+    check("{emoji_s}" == "hello", "unicode plain")
+
+    // ─── 21. Bug #55 探测：混合 int-float 算术 ───
+    println("--- Bug #55: Mixed int-float ---")
+    val mixed_sub = 0 - 1.5
+    val same_sub = 0.0 - 1.5
+    val expected_neg: f64 = 0.0 - 1.5
+    println("  INFO: 0 - 1.5 = {mixed_sub} (Bug #55: expect -1.5)")
+    check(same_sub == expected_neg, "0.0 - 1.5 = -1.5 (same-type OK)")
+    check(mixed_sub == expected_neg, "Bug #55: 0 - 1.5 should be -1.5")
+
+    summary()
+}

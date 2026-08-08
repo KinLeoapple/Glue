@@ -1,0 +1,407 @@
+// ── 边缘循环测试：大胆探测 while/for/break/continue/nested 边界 ──
+// 目标：探测嵌套循环、break/continue 语义、循环与副作用交互、
+//       循环内 throw/defer/return、循环条件复杂性、空循环体。
+// 已知约束（避免 hang）：
+//   Bug #30: &&/|| 在 while 条件导致 event loop stuck → 不在条件中用 &&/||
+//   Bug #37: while 条件调用用户函数导致 hang → 条件用内联比较
+//   Bug #38: &&/|| 不短路 → 不依赖短路副作用
+//   Bug #34: arr[i] = x 空操作 → 已修复（现支持原地修改）
+//   Bug #45: 嵌套 if-else 尾调用 → 循环内避免嵌套 if-else return
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 顶层辅助函数
+fun rangeSum(n: i32): i32 {
+    var s: i32 = 0
+    var i: i32 = 0
+    while i < n {
+        s = s + i
+        i = i + 1
+    }
+    s
+}
+
+fun buildArr(n: i32): i32[] {
+    var out: i32[] = []
+    var i: i32 = 0
+    while i < n {
+        out = out ++ [i * i]
+        i = i + 1
+    }
+    out
+}
+
+fun main(): void {
+    println("=== Edge Loop ===")
+
+    // ─── 1. 基础 while 累加 ───
+    println("--- Basic While Sum ---")
+    check(rangeSum(0) == 0, "rangeSum(0) = 0")
+    check(rangeSum(1) == 0, "rangeSum(1) = 0")
+    check(rangeSum(5) == 10, "rangeSum(5) = 10")
+    check(rangeSum(10) == 45, "rangeSum(10) = 45")
+    check(rangeSum(100) == 4950, "rangeSum(100) = 4950")
+
+    // ─── 2. while + break ───
+    println("--- While + break ---")
+    var break_sum: i32 = 0
+    var break_i: i32 = 0
+    while break_i < 100 {
+        if break_i == 5 { break }
+        break_sum = break_sum + break_i
+        break_i = break_i + 1
+    }
+    check(break_sum == 10, "break at 5: sum=0+1+2+3+4=10")
+    check(break_i == 5, "break_i stopped at 5")
+
+    // ─── 3. while + continue ───
+    println("--- While + continue ---")
+    var cont_sum: i32 = 0
+    var cont_i: i32 = 0
+    while cont_i < 10 {
+        cont_i = cont_i + 1
+        if cont_i == 3 { continue }
+        if cont_i == 7 { continue }
+        cont_sum = cont_sum + cont_i
+    }
+    // sum = 1+2+4+5+6+8+9+10 = 45 (skip 3 and 7)
+    check(cont_sum == 45, "continue skip 3,7: sum=45")
+    check(cont_i == 10, "cont_i reached 10")
+
+    // ─── 4. while false（零次循环）───
+    println("--- While False (zero iter) ---")
+    var zero_count: i32 = 0
+    while false {
+        zero_count = zero_count + 1
+    }
+    check(zero_count == 0, "while false: 0 iterations")
+
+    // ─── 5. while true + break（单次）───
+    println("--- While True + break ---")
+    var wt_count: i32 = 0
+    var wt_done: bool = false
+    while true {
+        wt_count = wt_count + 1
+        if wt_count == 1 { wt_done = true; break }
+    }
+    check(wt_count == 1, "while true breaks at 1")
+    check(wt_done, "while true sets done flag")
+
+    // ─── 6. 双层嵌套 while ───
+    println("--- Nested While (2-level) ---")
+    var nested_sum: i32 = 0
+    var outer: i32 = 0
+    while outer < 3 {
+        var inner: i32 = 0
+        while inner < 3 {
+            nested_sum = nested_sum + outer * 3 + inner
+            inner = inner + 1
+        }
+        outer = outer + 1
+    }
+    // sum = (0+1+2)+(3+4+5)+(6+7+8) = 3+12+21 = 36
+    check(nested_sum == 36, "2-level nested sum=36")
+    check(outer == 3, "outer reached 3")
+
+    // ─── 7. 三层嵌套 while ───
+    println("--- Nested While (3-level) ---")
+    var deep_sum: i32 = 0
+    var a: i32 = 0
+    while a < 3 {
+        var b: i32 = 0
+        while b < 3 {
+            var c: i32 = 0
+            while c < 3 {
+                deep_sum = deep_sum + a * 9 + b * 3 + c
+                c = c + 1
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    // sum of 0..26 = 27*13 = 351
+    check(deep_sum == 351, "3-level nested sum=351")
+
+    // ─── 8. break 只跳出内层循环 ───
+    println("--- break Only Inner Loop ---")
+    var break_outer_count: i32 = 0
+    var break_inner_count: i32 = 0
+    var bo: i32 = 0
+    while bo < 3 {
+        break_outer_count = break_outer_count + 1
+        var bi: i32 = 0
+        while bi < 10 {
+            break_inner_count = break_inner_count + 1
+            if bi == 2 { break }
+            bi = bi + 1
+        }
+        bo = bo + 1
+    }
+    check(break_outer_count == 3, "outer ran 3 times")
+    // inner runs 3 times (bi=0,1,2 then break) per outer
+    check(break_inner_count == 9, "inner ran 3*3=9 times (break at bi==2)")
+
+    // ─── 9. for-in 基础迭代 ───
+    println("--- For-In Basic ---")
+    var for_sum: i32 = 0
+    for n in [1, 2, 3, 4, 5].iter() {
+        for_sum = for_sum + n
+    }
+    check(for_sum == 15, "for-in sum=15")
+
+    // ─── 10. for-in 空数组 ───
+    println("--- For-In Empty ---")
+    var empty_for_count: i32 = 0
+    val empty_arr: i32[] = []
+    for n in empty_arr.iter() {
+        empty_for_count = empty_for_count + 1
+    }
+    check(empty_for_count == 0, "for-in empty: 0 iterations")
+
+    // ─── 11. for-in + break ───
+    println("--- For-In + break ---")
+    var for_break_sum: i32 = 0
+    for n in [10, 20, 30, 40, 50].iter() {
+        if n == 30 { break }
+        for_break_sum = for_break_sum + n
+    }
+    check(for_break_sum == 30, "for-in break at 30: sum=10+20=30")
+
+    // ─── 12. for-in + continue ───
+    println("--- For-In + continue ---")
+    var for_cont_sum: i32 = 0
+    for n in [1, 2, 3, 4, 5].iter() {
+        if n == 3 { continue }
+        for_cont_sum = for_cont_sum + n
+    }
+    check(for_cont_sum == 12, "for-in continue skip 3: sum=1+2+4+5=12")
+
+    // ─── 13. for-in 嵌套 ───
+    println("--- Nested For-In ---")
+    var nested_for_sum: i32 = 0
+    for x in [1, 2, 3].iter() {
+        for y in [10, 20].iter() {
+            nested_for_sum = nested_for_sum + x * y
+        }
+    }
+    // (10+20) + (20+40) + (30+60) = 30+60+90 = 180
+    check(nested_for_sum == 180, "nested for-in sum=180")
+
+    // ─── 14. 循环构建数组（while + ++）───
+    println("--- Loop Build Array ---")
+    val arr5 = buildArr(5)
+    check(arr5.len() == 5, "buildArr(5) len=5")
+    check(arr5[0] == 0, "buildArr(5)[0]=0")
+    check(arr5[4] == 16, "buildArr(5)[4]=16")
+    val arr0 = buildArr(0)
+    check(arr0.len() == 0, "buildArr(0) len=0")
+
+    // ─── 15. 循环内修改全局 ───
+    println("--- Loop Modify Global ---")
+    var g_counter: i32 = 0
+    var gi: i32 = 0
+    while gi < 5 {
+        g_counter = g_counter + 10
+        gi = gi + 1
+    }
+    check(g_counter == 50, "global modified in loop=50")
+
+    // ─── 16. 大循环（1000 次）───
+    println("--- Large Loop (1000) ---")
+    var big_sum: i32 = 0
+    var bi2: i32 = 0
+    while bi2 < 1000 {
+        big_sum = big_sum + bi2
+        bi2 = bi2 + 1
+    }
+    check(big_sum == 499500, "1000-iter sum=499500")
+    check(bi2 == 1000, "big loop i=1000")
+
+    // ─── 17. 循环内 early return ───
+    println("--- Loop + Early Return ---")
+    fun findFirst(arr: i32[], target: i32): i32 {
+        var result: i32 = 0 - 1  // Bug #53: -1 after while returns void; use 0 - 1
+        var found: bool = false
+        var i: i32 = 0
+        while i < arr.len() {
+            if arr[i] == target { result = i; found = true; break }
+            i = i + 1
+        }
+        result
+    }
+    check(findFirst([10, 20, 30, 40], 30) == 2, "findFirst 30 = index 2")
+    check(findFirst([10, 20, 30, 40], 99) == 0 - 1, "findFirst 99 = -1")
+    check(findFirst([], 5) == 0 - 1, "findFirst empty = -1")
+    check(findFirst([42], 42) == 0, "findFirst single = 0")
+
+    // ─── 18. while 条件用 <= ───
+    println("--- While with <= ---")
+    var le_sum: i32 = 0
+    var le_i: i32 = 0
+    while le_i <= 5 {
+        le_sum = le_sum + le_i
+        le_i = le_i + 1
+    }
+    check(le_sum == 15, "while i<=5 sum=0+1+2+3+4+5=15")
+
+    // ─── 19. while 递减 ───
+    println("--- While Decrement ---")
+    var dec_sum: i32 = 0
+    var dec: i32 = 10
+    while dec > 0 {
+        dec_sum = dec_sum + dec
+        dec = dec - 1
+    }
+    check(dec_sum == 55, "decrement 10..1 sum=55")
+    check(dec == 0, "dec reached 0")
+
+    // ─── 20. for-in 迭代字符串数组 ───
+    println("--- For-In String Array ---")
+    var str_concat: str = ""
+    for s in ["a", "b", "c", "d"].iter() {
+        str_concat = str_concat + s
+    }
+    check(str_concat == "abcd", "for-in string concat=abcd")
+
+    // ─── 21. for-in 迭代 record 数组 ───
+    println("--- For-In Record Array ---")
+    type Pt = Pt(x: i32, y: i32)
+    var pt_sum_x: i32 = 0
+    for p in [Pt(1, 2), Pt(3, 4), Pt(5, 6)].iter() {
+        pt_sum_x = pt_sum_x + p.x
+    }
+    check(pt_sum_x == 9, "for-in record sum_x=1+3+5=9")
+
+    // ─── 22. 双重 break（标量标志位模拟 goto）───
+    println("--- Double Break via Flag ---")
+    var db_found: bool = false
+    var db_outer: i32 = 0
+    while db_outer < 5 {
+        var db_inner: i32 = 0
+        while db_inner < 5 {
+            if db_outer * 5 + db_inner == 12 { db_found = true; break }
+            db_inner = db_inner + 1
+        }
+        if db_found { break }
+        db_outer = db_outer + 1
+    }
+    check(db_found, "double break found target")
+    check(db_outer == 2, "outer stopped at 2 (row of 12)")
+
+    // ─── 23. 循环 + match ───
+    println("--- Loop + Match ---")
+    var match_sum: i32 = 0
+    var mi: i32 = 0
+    while mi < 10 {
+        val r = match mi {
+            0 => 100
+            _ => mi
+        }
+        match_sum = match_sum + r
+        mi = mi + 1
+    }
+    // 100 + 1+2+3+4+5+6+7+8+9 = 100 + 45 = 145
+    check(match_sum == 145, "loop+match sum=145")
+
+    // ─── 24. 空循环体（while with semicolon-style）───
+    println("--- Empty Loop Body ---")
+    var empty_body_i: i32 = 0
+    while empty_body_i < 5 {
+        empty_body_i = empty_body_i + 1
+    }
+    check(empty_body_i == 5, "minimal body loop reaches 5")
+
+    // ─── 25. 5 层嵌套循环（压力）───
+    println("--- 5-Level Nested Loop ---")
+    var five_sum: i32 = 0
+    var l1: i32 = 0
+    while l1 < 2 {
+        var l2: i32 = 0
+        while l2 < 2 {
+            var l3: i32 = 0
+            while l3 < 2 {
+                var l4: i32 = 0
+                while l4 < 2 {
+                    var l5: i32 = 0
+                    while l5 < 2 {
+                        five_sum = five_sum + 1
+                        l5 = l5 + 1
+                    }
+                    l4 = l4 + 1
+                }
+                l3 = l3 + 1
+            }
+            l2 = l2 + 1
+        }
+        l1 = l1 + 1
+    }
+    check(five_sum == 32, "5-level 2^5=32 iterations")
+
+    // ─── 26. Bug #53 探测：负字面量作为循环后尾表达式 ───
+    println("--- Bug #53: Negative Literal After Loop ---")
+    fun whileNeg(): i32 { var i: i32 = 0; while i < 1 { i = i + 1 }; -1 }
+    fun whilePos(): i32 { var i: i32 = 0; while i < 1 { i = i + 1 }; 42 }
+    fun whileZero(): i32 { var i: i32 = 0; while i < 1 { i = i + 1 }; 0 }
+    fun whileSubExpr(): i32 { var i: i32 = 0; while i < 1 { i = i + 1 }; 0 - 1 }
+    val wn = whileNeg()
+    println("  INFO: whileNeg() = {wn} (expect -1, Bug #53)")
+    check(wn == 0 - 1, "Bug #53: whileNeg returns -1")
+    check(whilePos() == 42, "whilePos returns 42 (control)")
+    check(whileZero() == 0, "whileZero returns 0 (control)")
+    check(whileSubExpr() == 0 - 1, "whileSubExpr 0-1 returns -1 (workaround)")
+
+    // ─── 27. 多累加器循环 ───
+    println("--- Multi-Accumulator Loop ---")
+    var sum_even: i32 = 0
+    var sum_odd: i32 = 0
+    var mi2: i32 = 0
+    while mi2 < 10 {
+        if mi2 == 0 { sum_even = sum_even + mi2 }
+        if mi2 != 0 {
+            if mi2 - (mi2 / 2) * 2 == 0 { sum_even = sum_even + mi2 }
+            if mi2 - (mi2 / 2) * 2 != 0 { sum_odd = sum_odd + mi2 }
+        }
+        mi2 = mi2 + 1
+    }
+    // even: 0+2+4+6+8=20, odd: 1+3+5+7+9=25
+    check(sum_even == 20, "sum even 0+2+4+6+8=20")
+    check(sum_odd == 25, "sum odd 1+3+5+7+9=25")
+
+    // ─── 28. 循环构建嵌套数组 ───
+    println("--- Loop Build Nested Array ---")
+    var matrix: i32[][] = []
+    var ri: i32 = 0
+    while ri < 3 {
+        var row: i32[] = []
+        var ci: i32 = 0
+        while ci < 3 {
+            row = row ++ [ri * 3 + ci]
+            ci = ci + 1
+        }
+        matrix = matrix ++ [row]
+        ri = ri + 1
+    }
+    check(matrix.len() == 3, "matrix rows=3")
+    check(matrix[0][0] == 0, "matrix[0][0]=0")
+    check(matrix[1][2] == 5, "matrix[1][2]=5")
+    check(matrix[2][2] == 8, "matrix[2][2]=8")
+
+    summary()
+}

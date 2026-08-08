@@ -1,0 +1,55 @@
+// 极小规模 lookup：测量函数调用+变量查找开销
+import builtin.io.Console.{println}
+
+fun computeLevel3(seed: i64, outer_a: i64, outer_b: i64, outer_c: i64): i64 {
+    val a: i64 = seed + 1
+    val b: i64 = seed + 2
+    val c: i64 = seed + 3
+    val d: i64 = seed + 4
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 10 {
+        val t: i64 = (a + b + c + d + outer_a + outer_b + outer_c + i) % 1024
+        acc = (acc + t) % 1048576
+        i = i + 1
+    }
+    acc
+}
+
+fun computeLevel2(seed: i64, outer_a: i64, outer_b: i64): i64 {
+    val a: i64 = seed + 10
+    val b: i64 = seed + 20
+    val c: i64 = seed + 30
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 10 {
+        acc = (acc + computeLevel3(seed + i, a, b, c) + outer_a + outer_b) % 1073741824
+        i = i + 1
+    }
+    acc
+}
+
+fun compute(seed: i64): i64 {
+    val a: i64 = seed + 1
+    val b: i64 = seed + 2
+    val c: i64 = seed + 3
+    val d: i64 = seed + 4
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 20 {
+        val t: i64 = (a + b + c + d + i) % 1024
+        acc = (acc + t) % 1048576
+        i = i + 1
+    }
+    acc + computeLevel2(seed, a, b)
+}
+
+fun main(): void {
+    var total: i64 = 0
+    var k: i64 = 0
+    while k < 100 {
+        total = (total + compute(k)) % 1073741824
+        k = k + 1
+    }
+    println(total)
+}

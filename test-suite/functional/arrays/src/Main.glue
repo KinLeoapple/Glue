@@ -1,0 +1,210 @@
+// 功能验证：数组（构造/索引/拼接/深拷贝/嵌套/字符串数组/变量索引迭代/.len()/for-in 迭代）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Arrays ===")
+
+    // 构造与索引（字面量索引）
+    val arr = [1, 2, 3, 4, 5]
+    check(arr[0] == 1, "index 0")
+    check(arr[1] == 2, "index 1")
+    check(arr[2] == 3, "index 2")
+    check(arr[3] == 4, "index 3")
+    check(arr[4] == 5, "index last")
+
+    // 拼接
+    val a = [1, 2]
+    val b = [3, 4]
+    val c = a ++ b
+    check(c[0] == 1, "concat elem 0")
+    check(c[1] == 2, "concat elem 1")
+    check(c[2] == 3, "concat elem 2")
+    check(c[3] == 4, "concat elem 3")
+
+    // append one
+    val d = [1, 2, 3]
+    val e = d ++ [4]
+    check(e[0] == 1, "append one elem 0")
+    check(e[3] == 4, "append one elem 3")
+
+    // 深拷贝语义：原数组不受拼接影响
+    val orig = [1, 2, 3]
+    val combined = orig ++ [99]
+    check(orig[0] == 1, "deep copy original unchanged")
+    check(orig[2] == 3, "deep copy original last elem")
+    check(combined[3] == 99, "combined has new elem")
+
+    // 链式拼接
+    val chained = [1] ++ [2] ++ [3] ++ [4]
+    check(chained[0] == 1, "chained concat elem 0")
+    check(chained[1] == 2, "chained concat elem 1")
+    check(chained[2] == 3, "chained concat elem 2")
+    check(chained[3] == 4, "chained concat elem 3")
+
+    // 字符串数组
+    val strs = ["hello", "world"]
+    check(strs[0] == "hello", "string array elem 0")
+    check(strs[1] == "world", "string array elem 1")
+
+    // 嵌套数组
+    val nested = [[1, 2], [3, 4]]
+    check(nested[0][0] == 1, "nested [0][0]")
+    check(nested[0][1] == 2, "nested [0][1]")
+    check(nested[1][0] == 3, "nested [1][0]")
+    check(nested[1][1] == 4, "nested [1][1]")
+
+    // 空数组拼接
+    val empty: i32[] = []
+    val fromEmpty = empty ++ [1, 2, 3]
+    check(fromEmpty[0] == 1, "empty ++ non-empty elem 0")
+    check(fromEmpty[2] == 3, "empty ++ non-empty elem 2")
+
+    val toEmpty = [1, 2, 3] ++ empty
+    check(toEmpty[0] == 1, "non-empty ++ empty elem 0")
+    check(toEmpty[2] == 3, "non-empty ++ empty elem 2")
+
+    // 数组拼接不可变性
+    val left = [1, 2]
+    val right = [3, 4]
+    val merged = left ++ right
+    check(left[0] == 1, "concat original left unchanged")
+    check(left[1] == 2, "concat original left elem 1")
+    check(right[0] == 3, "concat original right unchanged")
+    check(right[1] == 4, "concat original right elem 1")
+
+    // while 迭代求和（使用变量索引，已修复 P0 #3）
+    val iter_arr = [10, 20, 30, 40]
+    var sum: i32 = 0
+    var i: i32 = 0
+    while i < 4 {
+        sum = sum + iter_arr[i]
+        i = i + 1
+    }
+    check(sum == 100, "while iteration sum with variable index")
+
+    // .len() 方法（已修复 P0 #4）
+    val len_arr = [1, 2, 3]
+    check(len_arr.len() == 3, "len() returns array length")
+    val empty_len: i32[] = []
+    check(empty_len.len() == 0, "len() on empty array")
+    val big_arr = [10, 20, 30, 40, 50, 60]
+    check(big_arr.len() == 6, "len() on 6-element array")
+
+    // while + len() 动态边界迭代
+    var len_sum: i32 = 0
+    var len_i: i32 = 0
+    while len_i < len_arr.len() {
+        len_sum = len_sum + len_arr[len_i]
+        len_i = len_i + 1
+    }
+    check(len_sum == 6, "while iteration with dynamic len() bound")
+
+    // for-in arr.iter() 迭代
+    var for_sum: i32 = 0
+    for n in big_arr.iter() {
+        for_sum = for_sum + n
+    }
+    check(for_sum == 210, "for-in arr.iter() sum")
+
+    // for-in 空数组迭代
+    var empty_for_sum: i32 = 0
+    for n in empty_len.iter() {
+        empty_for_sum = empty_for_sum + n
+    }
+    check(empty_for_sum == 0, "for-in empty array iter")
+
+    // for-in 字符串数组迭代
+    val str_arr = ["a", "b", "c"]
+    var concat = ""
+    for s in str_arr.iter() {
+        concat = concat + s
+    }
+    check(concat == "abc", "for-in str array concat")
+
+    // ─── 数组边缘测试 ───
+
+    // 大数组（100 元素）
+    var big_arr_100: i32[] = []
+    var bi: i32 = 0
+    while bi < 100 {
+        big_arr_100 = big_arr_100 ++ [bi]
+        bi = bi + 1
+    }
+    check(big_arr_100.len() == 100, "100-element array length")
+    check(big_arr_100[0] == 0, "100-elem [0]")
+    check(big_arr_100[99] == 99, "100-elem [99]")
+    var big_sum: i32 = 0
+    var si2: i32 = 0
+    while si2 < big_arr_100.len() {
+        big_sum = big_sum + big_arr_100[si2]
+        si2 = si2 + 1
+    }
+    check(big_sum == 4950, "100-elem sum 0..99 = 4950")
+
+    // 三层嵌套数组
+    val nested3 = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+    check(nested3[0][0][0] == 1, "3-deep nested [0][0][0]")
+    check(nested3[0][1][1] == 4, "3-deep nested [0][1][1]")
+    check(nested3[1][0][0] == 5, "3-deep nested [1][0][0]")
+    check(nested3[1][1][1] == 8, "3-deep nested [1][1][1]")
+
+    // record 数组
+    type Pt3 = Pt3(x: i32, y: i32)
+    val pt_arr = [Pt3(1, 2), Pt3(3, 4), Pt3(5, 6)]
+    check(pt_arr[0].x == 1, "record array [0].x")
+    check(pt_arr[1].y == 4, "record array [1].y")
+    check(pt_arr[2].x == 5, "record array [2].x")
+
+    // record 数组拼接
+    val more_pts = pt_arr ++ [Pt3(7, 8)]
+    check(more_pts[3].x == 7, "record array concat [3].x")
+    check(more_pts[3].y == 8, "record array concat [3].y")
+    check(more_pts.len() == 4, "record array concat len")
+
+    // 长拼接链（10 次拼接）
+    var chain_arr: i32[] = []
+    var ci2: i32 = 0
+    while ci2 < 10 {
+        chain_arr = chain_arr ++ [ci2 * 10]
+        ci2 = ci2 + 1
+    }
+    check(chain_arr.len() == 10, "10-concat chain length")
+    check(chain_arr[0] == 0, "10-concat [0]")
+    check(chain_arr[9] == 90, "10-concat [9]")
+
+    // 空数组边界
+    val empty2: i32[] = []
+    check(empty2.len() == 0, "empty array len")
+    val from_empty2 = empty2 ++ empty2
+    check(from_empty2.len() == 0, "empty ++ empty = empty")
+
+    // 数组索引边界（首尾）
+    val edge_arr = [100, 200, 300]
+    check(edge_arr[0] == 100, "first elem")
+    check(edge_arr[edge_arr.len() - 1] == 300, "last elem via len()-1")
+
+    // 数组元素运算
+    val calc_arr = [10, 20, 30]
+    check(calc_arr[0] + calc_arr[1] + calc_arr[2] == 60, "array elem arithmetic")
+    check(calc_arr[2] - calc_arr[0] == 20, "array elem subtraction")
+
+    summary()
+}

@@ -1,0 +1,388 @@
+// 大胆边缘测试：递归（直接自递归/相互递归/尾递归 TCO/深栈探测/Ackermann 双递归/递归数据结构）
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 所有递归函数放顶层
+//   Bug #21: i32 超范围字面量静默退出     → 大整数加显式类型后缀或用 i64
+//   Bug #22: 有符号 MIN / -1 已修复（wrapping 语义）
+//   Bug #37: while 条件不调用用户函数     → while 条件只用比较
+//   Bug #39: 递归数组后 inline concat 失效 → 本测试不依赖数组 inline concat
+//
+// 探测目标：栈深度极限、TCO 实际上限、相互递归环、Ackermann 增长
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 顶层递归函数（Bug #19 绕过：全部顶层）───
+
+// 直接自递归：阶乘（i64 避免溢出）
+fun fact(n: i64): i64 {
+    if n <= 1i64 { 1i64 } else { n * fact(n - 1i64) }
+}
+
+// 尾递归阶乘（带累加器）
+fun factTail(n: i64, acc: i64): i64 {
+    if n <= 1i64 { acc } else { factTail(n - 1i64, n * acc) }
+}
+
+// 经典 Fibonacci（双分支递归）
+fun fib(n: i32): i32 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+// 尾递归 Fibonacci（双累加器）
+fun fibTail(n: i32, a: i32, b: i32): i32 {
+    if n <= 0 { a } else { fibTail(n - 1, b, a + b) }
+}
+
+// 相互递归：isEven / isOdd（顶层函数）
+fun isEven(n: i32): bool {
+    if n == 0 { true } else { isOdd(n - 1) }
+}
+fun isOdd(n: i32): bool {
+    if n == 0 { false } else { isEven(n - 1) }
+}
+
+// 相互递归环（3 函数：A→B→C→A）
+fun callA(n: i32): i32 {
+    if n <= 0 { 100 } else { callB(n - 1) }
+}
+fun callB(n: i32): i32 {
+    if n <= 0 { 200 } else { callC(n - 1) }
+}
+fun callC(n: i32): i32 {
+    if n <= 0 { 300 } else { callA(n - 1) }
+}
+
+// Ackermann（经典双递归，增长极快，用小输入）
+fun ack(m: i32, n: i32): i32 {
+    if m == 0 {
+        n + 1
+    } else {
+        if n == 0 {
+            ack(m - 1, 1)
+        } else {
+            ack(m - 1, ack(m, n - 1))
+        }
+    }
+}
+
+// 累加求和（尾递归）
+fun sumTo(n: i32, acc: i32): i32 {
+    if n <= 0 { acc } else { sumTo(n - 1, acc + n) }
+}
+
+// 倒数（尾递归，探测 TCO 深度）
+fun countDown(n: i32, acc: i32): i32 {
+    if n <= 0 { acc } else { countDown(n - 1, acc + 1) }
+}
+
+// 非尾递归求和（探测非 TCO 栈深度）
+fun sumNonTail(n: i32): i32 {
+    if n <= 0 { 0 } else { n + sumNonTail(n - 1) }
+}
+
+// 递归构建列表（ADT）
+type IntList = | Nil | Cons(i32, IntList)
+
+fun buildList(n: i32): IntList {
+    if n <= 0 { Nil } else { Cons(n, buildList(n - 1)) }
+}
+
+fun listLen(l: IntList): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + listLen(t)
+    }
+}
+
+fun listSum(l: IntList): i32 {
+    match l {
+        Nil => 0
+        Cons(h, t) => h + listSum(t)
+    }
+}
+
+fun listMax(l: IntList, cur: i32): i32 {
+    match l {
+        Nil => cur
+        Cons(h, t) => if h > cur { listMax(t, h) } else { listMax(t, cur) }
+    }
+}
+
+// 递归返回 newtype
+type Meters = Meters(f64)
+fun metersAdd(a: Meters, b: Meters): Meters {
+    match a {
+        Meters(x) => match b {
+            Meters(y) => Meters(x + y)
+        }
+    }
+}
+
+// 递归返回 record
+type Pt = Pt(x: i32, y: i32)
+fun ptAdd(a: Pt, b: Pt): Pt {
+    Pt(a.x + b.x, a.y + b.y)
+}
+
+// 字符串递归（构建重复字符串）
+fun repeatStr(s: str, n: i32, acc: str): str {
+    if n <= 0 { acc } else { repeatStr(s, n - 1, acc + s) }
+}
+
+// 最大公约数（欧几里得算法，尾递归）
+fun gcd(a: i32, b: i32): i32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+// 幂运算（递归）
+// Bug #45 绕过：嵌套 if-else 内层 else 分支结果整体丢失（无论是否尾调用），
+//   改用线性递归（单层 if-else），避免嵌套 if-else。exp ≤ 20，深度可接受。
+fun powRec(base: i64, exp: i32): i64 {
+    if exp == 0i32 { 1i64 } else { base * powRec(base, exp - 1) }
+}
+
+// Collatz 序列长度（尾递归）
+fun collatzStep(n: i32): i32 {
+    if n % 2 == 0 { n / 2 } else { 3 * n + 1 }
+}
+fun collatzLen(n: i32, acc: i32): i32 {
+    if n == 1 { acc } else { collatzLen(collatzStep(n), acc + 1) }
+}
+
+fun main(): void {
+    println("=== Edge Recursion ===")
+
+    // ─── 1. 直接自递归：阶乘 ───
+    println("--- Direct Recursion: Factorial ---")
+    check(fact(0i64) == 1i64, "fact(0) = 1")
+    check(fact(1i64) == 1i64, "fact(1) = 1")
+    check(fact(5i64) == 120i64, "fact(5) = 120")
+    check(fact(10i64) == 3628800i64, "fact(10) = 3628800")
+    check(fact(20i64) == 2432902008176640000i64, "fact(20) = 20!")
+
+    // ─── 2. 尾递归阶乘（带累加器）───
+    println("--- Tail Recursion: Factorial with Accumulator ---")
+    check(factTail(0i64, 1i64) == 1i64, "factTail(0,1) = 1")
+    check(factTail(5i64, 1i64) == 120i64, "factTail(5,1) = 120")
+    check(factTail(10i64, 1i64) == 3628800i64, "factTail(10,1) = 3628800")
+    check(factTail(20i64, 1i64) == 2432902008176640000i64, "factTail(20,1) = 20!")
+
+    // ─── 3. 经典 Fibonacci（双分支）───
+    println("--- Classic Fibonacci (dual-branch) ---")
+    check(fib(0) == 0, "fib(0) = 0")
+    check(fib(1) == 1, "fib(1) = 1")
+    check(fib(2) == 1, "fib(2) = 1")
+    check(fib(10) == 55, "fib(10) = 55")
+    check(fib(20) == 6765, "fib(20) = 6765")
+    check(fib(25) == 75025, "fib(25) = 75025")
+
+    // ─── 4. 尾递归 Fibonacci（双累加器）───
+    println("--- Tail Recursion: Fibonacci ---")
+    check(fibTail(0, 0, 1) == 0, "fibTail(0) = 0")
+    check(fibTail(1, 0, 1) == 1, "fibTail(1) = 1")
+    check(fibTail(10, 0, 1) == 55, "fibTail(10) = 55")
+    check(fibTail(20, 0, 1) == 6765, "fibTail(20) = 6765")
+    check(fibTail(30, 0, 1) == 832040, "fibTail(30) = 832040")
+
+    // ─── 5. 相互递归：isEven / isOdd ───
+    println("--- Mutual Recursion: isEven / isOdd ---")
+    check(isEven(0), "isEven(0) = true")
+    check(!isEven(1), "isEven(1) = false")
+    check(isEven(10), "isEven(10) = true")
+    check(!isEven(11), "isEven(11) = false")
+    check(isOdd(1), "isOdd(1) = true")
+    check(!isOdd(2), "isOdd(2) = false")
+    check(isOdd(99), "isOdd(99) = true")
+    check(isEven(100), "isEven(100) = true")
+
+    // ─── 6. 相互递归环（3 函数 A→B→C→A）───
+    println("--- Mutual Recursion Cycle (3 functions) ---")
+    check(callA(0) == 100, "callA(0) = 100 (base A)")
+    check(callA(1) == 200, "callA(1) = 200 (A->B base)")
+    check(callA(2) == 300, "callA(2) = 300 (A->B->C base)")
+    check(callA(3) == 100, "callA(3) = 100 (A->B->C->A base)")
+    check(callA(6) == 100, "callA(6) = 100 (full cycle x2)")
+    check(callB(0) == 200, "callB(0) = 200 (base B)")
+    check(callC(0) == 300, "callC(0) = 300 (base C)")
+    check(callB(3) == 200, "callB(3) = 200 (B->C->A->B base)")
+
+    // ─── 7. Ackermann（经典双递归）───
+    println("--- Ackermann (double recursion) ---")
+    check(ack(0, 0) == 1, "ack(0,0) = 1")
+    check(ack(0, 5) == 6, "ack(0,5) = 6")
+    check(ack(1, 0) == 2, "ack(1,0) = 2")
+    check(ack(1, 5) == 7, "ack(1,5) = 7")
+    check(ack(2, 0) == 3, "ack(2,0) = 3")
+    check(ack(2, 3) == 9, "ack(2,3) = 9")
+    check(ack(2, 5) == 13, "ack(2,5) = 13")
+    check(ack(3, 0) == 5, "ack(3,0) = 5")
+    check(ack(3, 1) == 13, "ack(3,1) = 13")
+    check(ack(3, 2) == 29, "ack(3,2) = 29")
+    check(ack(3, 3) == 61, "ack(3,3) = 61")
+    check(ack(3, 4) == 125, "ack(3,4) = 125")
+
+    // ─── 8. 尾递归深度探测（TCO 上限）───
+    println("--- Tail Recursion Depth Probe (TCO) ---")
+    check(countDown(1000, 0) == 1000, "countDown(1000) = 1000")
+    check(countDown(10000, 0) == 10000, "countDown(10000) = 10000")
+    check(countDown(100000, 0) == 100000, "countDown(100000) = 100000")
+    check(countDown(1000000, 0) == 1000000, "countDown(1000000) = 1M (TCO)")
+    check(sumTo(1000, 0) == 500500, "sumTo(1000) = 500500")
+    check(sumTo(10000, 0) == 50005000, "sumTo(10000) = 50005000")
+
+    // ─── 9. 非尾递归深度探测（栈深度极限）───
+    println("--- Non-tail Recursion Depth Probe (stack limit) ---")
+    check(sumNonTail(10) == 55, "sumNonTail(10) = 55")
+    check(sumNonTail(100) == 5050, "sumNonTail(100) = 5050")
+    check(sumNonTail(500) == 125250, "sumNonTail(500) = 125250")
+    // 探测更深的非尾递归（可能栈溢出或被引擎限制）
+    println("  INFO: probing deeper non-tail recursion...")
+    val deep1k = sumNonTail(1000)
+    println("  INFO: sumNonTail(1000) = {deep1k} (expect 500500)")
+    check(deep1k == 500500, "sumNonTail(1000) = 500500")
+
+    // ─── 10. 递归构建 ADT 列表 ───
+    println("--- Recursive ADT List Construction ---")
+    val l0 = buildList(0)
+    check(l0 == Nil, "buildList(0) = Nil")
+    check(listLen(l0) == 0, "listLen(Nil) = 0")
+    check(listSum(l0) == 0, "listSum(Nil) = 0")
+
+    val l1 = buildList(1)
+    check(listLen(l1) == 1, "buildList(1) len = 1")
+    check(listSum(l1) == 1, "buildList(1) sum = 1")
+
+    val l5 = buildList(5)
+    check(listLen(l5) == 5, "buildList(5) len = 5")
+    check(listSum(l5) == 15, "buildList(5) sum = 5+4+3+2+1 = 15")
+    check(listMax(l5, 0) == 5, "buildList(5) max = 5")
+
+    val l10 = buildList(10)
+    check(listLen(l10) == 10, "buildList(10) len = 10")
+    check(listSum(l10) == 55, "buildList(10) sum = 55")
+    check(listMax(l10, 0) == 10, "buildList(10) max = 10")
+
+    // ─── 11. 递归返回 newtype ───
+    println("--- Recursion Returning Newtype ---")
+    val m1 = Meters(1.5f64)
+    val m2 = Meters(2.5f64)
+    val m3 = metersAdd(m1, m2)
+    check(m3 == Meters(4.0f64), "metersAdd(1.5, 2.5) = 4.0")
+    val m4 = metersAdd(metersAdd(m1, m2), Meters(1.0f64))
+    check(m4 == Meters(5.0f64), "chained metersAdd = 5.0")
+
+    // ─── 12. 递归返回 record ───
+    println("--- Recursion Returning Record ---")
+    val p1 = Pt(1, 2)
+    val p2 = Pt(3, 4)
+    val p3 = ptAdd(p1, p2)
+    check(p3 == Pt(4, 6), "ptAdd((1,2),(3,4)) = (4,6)")
+    val p4 = ptAdd(ptAdd(p1, p2), Pt(10, 10))
+    check(p4 == Pt(14, 16), "chained ptAdd = (14,16)")
+
+    // ─── 13. 字符串递归 ───
+    println("--- String Recursion ---")
+    check(repeatStr("ab", 0, "") == "", "repeatStr(ab,0) = empty")
+    check(repeatStr("ab", 1, "") == "ab", "repeatStr(ab,1) = ab")
+    check(repeatStr("ab", 3, "") == "ababab", "repeatStr(ab,3) = ababab")
+    check(repeatStr("x", 5, "") == "xxxxx", "repeatStr(x,5) = xxxxx")
+    check(repeatStr("abc", 4, "") == "abcabcabcabc", "repeatStr(abc,4) = 4x abc")
+
+    // ─── 14. GCD（欧几里得，尾递归）───
+    println("--- GCD (Euclidean, tail recursion) ---")
+    check(gcd(12, 8) == 4, "gcd(12,8) = 4")
+    check(gcd(48, 18) == 6, "gcd(48,18) = 6")
+    check(gcd(7, 13) == 1, "gcd(7,13) = 1 (coprime)")
+    check(gcd(100, 10) == 10, "gcd(100,10) = 10")
+    check(gcd(17, 5) == 1, "gcd(17,5) = 1")
+    check(gcd(60, 48) == 12, "gcd(60,48) = 12")
+
+    // ─── 15. 快速幂（递归）─── Bug #45 探测
+    println("--- Fast Power (recursion) ---")
+    check(powRec(2i64, 0) == 1i64, "powRec(2,0) = 1")
+    check(powRec(2i64, 1) == 2i64, "powRec(2,1) = 2")
+    // Bug #45 探测：powRec(2,10) 应为 1024，实际返回错误值
+    // 逐级探测定位失败点
+    println("  INFO: powRec(2,2) = {powRec(2i64, 2)} (expect 4)")
+    println("  INFO: powRec(2,3) = {powRec(2i64, 3)} (expect 8)")
+    println("  INFO: powRec(2,4) = {powRec(2i64, 4)} (expect 16)")
+    println("  INFO: powRec(2,5) = {powRec(2i64, 5)} (expect 32)")
+    println("  INFO: powRec(2,10) = {powRec(2i64, 10)} (expect 1024)")
+    println("  INFO: powRec(3,5) = {powRec(3i64, 5)} (expect 243)")
+    val pr2_10 = powRec(2i64, 10)
+    val pr2_20 = powRec(2i64, 20)
+    val pr3_5 = powRec(3i64, 5)
+    val pr10_9 = powRec(10i64, 9)
+    println("  INFO: powRec(2,20) = {pr2_20} (expect 1048576)")
+    println("  INFO: powRec(10,9) = {pr10_9} (expect 1e9)")
+    check(pr2_10 == 1024i64, "powRec(2,10) = 1024 (Bug #45 probe)")
+    check(pr2_20 == 1048576i64, "powRec(2,20) = 1048576 (Bug #45)")
+    check(pr3_5 == 243i64, "powRec(3,5) = 243 (Bug #45)")
+    check(pr10_9 == 1000000000i64, "powRec(10,9) = 1e9 (Bug #45)")
+
+    // ─── 16. 递归边界条件 ───
+    println("--- Recursion Boundary Conditions ---")
+    check(fact(0i64) == 1i64, "fact(0) base case = 1")
+    check(fact(1i64) == 1i64, "fact(1) base case = 1")
+    check(fib(0) == 0, "fib(0) base case = 0")
+    check(fib(1) == 1, "fib(1) base case = 1")
+    check(ack(0, 0) == 1, "ack(0,0) base case = 1")
+    check(gcd(0, 5) == 5, "gcd(0,5) = 5 (a=0 base)")
+    check(gcd(5, 0) == 5, "gcd(5,0) = 5 (b=0 base)")
+
+    // ─── 17. 递归 + match 组合（Collatz 序列）───
+    println("--- Recursion + Match (Collatz) ---")
+    check(collatzLen(1, 1) == 1, "collatzLen(1) = 1 (base)")
+    check(collatzLen(2, 1) == 2, "collatzLen(2) = 2 (2->1)")
+    check(collatzLen(6, 1) == 9, "collatzLen(6) = 9 (6->3->10->5->16->8->4->2->1)")
+    check(collatzLen(27, 1) == 112, "collatzLen(27) = 112 (long chain)")
+
+    // ─── 18. 递归嵌套调用（递归结果作为递归参数）───
+    println("--- Nested Recursive Calls (result as argument) ---")
+    check(fib(fib(5)) == 5, "fib(fib(5)) = fib(5) = 5")
+    check(fib(fib(6)) == 21, "fib(fib(6)) = fib(8) = 21")
+    // fact(fact(3)-1) = fact(6-1) = fact(5) = 120
+    check(fact(fact(3i64) - 1i64) == 120i64, "fact(fact(3)-1) = fact(5) = 120")
+
+    // ─── 19. 递归与 cast 组合 ───
+    println("--- Recursion + Cast Combination ---")
+    val fib_cast_i = cast(fib(10)).to(i64)
+    check(fib_cast_i == 55i64, "cast(fib(10)).to(i64) = 55")
+    val fib_cast_f = cast(fib(10)).to(f64)
+    check(fib_cast_f == 55.0f64, "cast(fib(10)).to(f64) = 55.0")
+    val fact_cast = cast(fact(5i64)).to(i32)
+    check(fact_cast == 120, "cast(fact(5)).to(i32) = 120")
+
+    // ─── 20. 大胆：递归结果累积到外部 var ───
+    println("--- Recursion Accumulating to Outer var ---")
+    var acc_sum: i32 = 0
+    var ai: i32 = 0
+    while ai < 5 {
+        acc_sum = acc_sum + fib(ai)
+        ai = ai + 1
+    }
+    check(acc_sum == 7, "sum fib(0..4) = 0+1+1+2+3 = 7")
+    // 递归结果在 if 表达式中
+    val conditional_fib = if fib(10) > 50 { fib(5) } else { fib(7) }
+    check(conditional_fib == 5, "fib(10)>50 -> fib(5) = 5")
+
+    summary()
+}

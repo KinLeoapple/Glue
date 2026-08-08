@@ -1,0 +1,233 @@
+// 大胆字符串边缘测试：Unicode 边界/转义序列/嵌套插值/长字符串/比较矩阵
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #15: 非 ASCII char 字面量已修复，可使用 'é' '你' '😀'
+//   Bug #17: 字符串插值中 bool==bool 已修复
+//   Bug #21: 超范围字面量静默退出 → 所有字面量加显式类型后缀
+//
+// 探测目标：
+//   - 组合字符（combining marks）的字素簇边界
+//   - 4 字节 UTF-8（emoji、辅助平面字符）索引
+//   - 嵌套字符串插值
+//   - 转义序列边界（\0 \r \uXXXX \u{XXXX}）
+//   - 字符串比较的 Unicode 序
+//   - 超长插值（多段）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Edge Strings ===")
+
+    // ─── 1. 4 字节 UTF-8（emoji 与辅助平面）───
+    println("--- 4-byte UTF-8 (Astral Plane) ---")
+    val emoji_str = "😀😁😂"
+    check(emoji_str.len() == 3, "3 emojis len 3")
+    check(emoji_str[0] == '😀', "emoji [0] = 😀")
+    check(emoji_str[1] == '😁', "emoji [1] = 😁")
+    check(emoji_str[2] == '😂', "emoji [2] = 😂")
+
+    // emoji + ASCII 混合索引
+    val mixed4 = "a😀b"
+    check(mixed4.len() == 3, "ascii+emoji len 3")
+    check(mixed4[0] == 'a', "mixed4 [0] = a")
+    check(mixed4[1] == '😀', "mixed4 [1] = 😀")
+    check(mixed4[2] == 'b', "mixed4 [2] = b")
+
+    // 辅助平面字符（数学符号 𝕏 = U+1D54F，4 字节 UTF-8）
+    val math_sym = "𝕏"
+    check(math_sym.len() == 1, "math symbol 𝕏 len 1")
+    check(math_sym[0] == '𝕏', "math symbol [0] = 𝕏")
+
+    // ─── 2. 组合字符（combining marks）限制记录 ───
+    println("--- Combining Marks (Limitation) ---")
+    // 限制：Glue 不支持 \uXXXX 转义序列，无法在源码中构造组合字符序列。
+    // 试 `val s = "e\u0301"` 会导致 parse error: expected expression。
+    // 预组合形式（如 é = U+00E9）可直接输入，len == 1。
+    val precomposed: str = "é"
+    check(precomposed.len() == 1, "precomposed é len 1")
+    // 无法测试分解形式（e + U+0301），因为 \u 转义不支持。
+    // 若需组合字符，必须在源文件中直接输入组合字符（编辑器层面）。
+
+    // ─── 3. 嵌套字符串插值 ───
+    println("--- Nested Interpolation ---")
+    val x: i32 = 42
+    val inner = "x={x}"
+    // 外层插值引用含插值的字符串变量
+    check("outer: {inner}" == "outer: x=42", "nested interpolation via var")
+    // 插值中嵌入字符串字面量（含插值）
+    // 大胆：直接嵌套字面量插值
+    val label = "result"
+    val val_str = "100"
+    check("{label}: {val_str}" == "result: 100", "two interpolations")
+    // 插值中嵌入算术 + 函数调用
+    val computed = "{x * 2 + 1}"
+    check(computed == "85", "interp arithmetic 42*2+1=85")
+
+    // ─── 4. 转义序列边界 ───
+    println("--- Escape Sequences ---")
+    // \r 回车
+    val cr_str = "a\rb"
+    check(cr_str.len() == 3, "string with \\r len 3")
+    // 多种转义混合（\t \n \r \\ \"）
+    val escapes = "\t\n\r\\\""
+    println("  escapes.len = {escapes.len()}")
+    check(escapes.len() == 5, "5 escape chars (\\t \\n \\r \\\\ \\\")")
+    // 反斜杠边界
+    check("\\".len() == 1, "single backslash len 1")
+    check("\\\\".len() == 2, "double backslash len 2")
+    check("".len() == 0, "empty string len 0")
+
+    // Bug #36: \uXXXX 和 \u{XXXX} 和 \0 转义序列
+    println("--- Unicode/NUL Escape Sequences (Bug #36) ---")
+    // \u0301 组合尖音符（分解形式 é = e + U+0301）
+    val combined = "e\u0301"
+    check(combined.len() == 2, "e + \\u0301 = 2 codepoints")
+    check(cast(combined[0]).to(i32) == 101, "e + \\u0301 [0] = 'e' (101)")
+    check(cast(combined[1]).to(i32) == 769, "e + \\u0301 [1] = U+0301 (769)")
+    // \u{XXXX} 花括号形式
+    val heart = "\u{2764}"
+    check(heart.len() == 1, "\\u{2764} heart = 1 codepoint")
+    check(cast(heart[0]).to(i32) == 10084, "\\u{2764} = U+2764 (10084)")
+    // \u{1F600} 辅助平面（emoji）
+    val emoji = "\u{1F600}"
+    check(emoji.len() == 1, "\\u{1F600} emoji = 1 codepoint")
+    check(cast(emoji[0]).to(i32) == 128512, "\\u{1F600} = U+1F600 (128512)")
+    // \u00E9 预组合形式 é
+    val precomposed = "\u00E9"
+    check(precomposed.len() == 1, "\\u00E9 precomposed é = 1 codepoint")
+    check(cast(precomposed[0]).to(i32) == 233, "\\u00E9 = U+00E9 (233)")
+    // \0 NUL 字符
+    val nul_str = "a\0b"
+    check(nul_str.len() == 3, "a\\0b = 3 codepoints")
+    check(cast(nul_str[1]).to(i32) == 0, "a\\0b [1] = NUL (0)")
+    // char 字面量也支持 \uXXXX
+    val c_u: char = '\u00E9'
+    check(c_u == 'é', "char \\u00E9 == 'é'")
+    val c_brace: char = '\u{1F600}'
+    check(c_brace == '😀', "char \\u{1F600} == '😀'")
+    val c_nul: char = '\0'
+    check(cast(c_nul).to(i32) == 0, "char '\\0' codepoint == 0")
+
+    // ─── 5. 字符串比较 Unicode 序 ───
+    println("--- Unicode Comparison ---")
+    // ASCII 序
+    check("a" < "b", "a < b")
+    check("Z" < "a", "Z < a (uppercase before lowercase)")
+    check("abc" < "abd", "abc < abd")
+    check("abc" < "abcd", "shorter prefix less")
+    // 数字字符序
+    check("9" < "a", "digit before letter")
+    check("10" < "9", "string compare: '10' < '9' (lexicographic)")
+    // 空字符串比较
+    check("" < "a", "empty < non-empty")
+    check("" == "", "empty == empty")
+    // Unicode 序（CJK 在 ASCII 之后）
+    check("z" < "你", "ASCII z < CJK 你")
+    check("你" < "我", "CJK 你 < 我")
+
+    // ─── 6. 超长插值（多段拼接）───
+    println("--- Long Interpolation ---")
+    val a1: i32 = 1
+    val a2: i32 = 2
+    val a3: i32 = 3
+    val a4: i32 = 4
+    val a5: i32 = 5
+    val long_interp = "{a1},{a2},{a3},{a4},{a5}"
+    check(long_interp == "1,2,3,4,5", "5-segment interpolation")
+    // 插值 + 拼接混合
+    val mixed_concat = "v=" + "{a1}" + ",w=" + "{a2}"
+    check(mixed_concat == "v=1,w=2", "interp + concat mix")
+
+    // ─── 7. 字符串作为数组元素 ───
+    println("--- String Arrays ---")
+    val str_arr = ["hello", "world", "你好", "😀"]
+    check(str_arr.len() == 4, "str array len 4")
+    check(str_arr[0] == "hello", "str arr [0]")
+    check(str_arr[2] == "你好", "str arr [2] CJK")
+    check(str_arr[3] == "😀", "str arr [3] emoji")
+    check(str_arr[0] + str_arr[1] == "helloworld", "str arr concat")
+
+    // ─── 8. char 边界值 ───
+    println("--- char Boundaries ---")
+    // ASCII 边界
+    check(cast(' ').to(i32) == 32, "space char to i32 = 32")
+    check(cast('~').to(i32) == 126, "tilde char to i32 = 126")
+    check(cast('\n').to(i32) == 10, "newline char to i32 = 10")
+    check(cast('\t').to(i32) == 9, "tab char to i32 = 9")
+    // Unicode 边界
+    check(cast('你').to(i32) == 20320, "你 to i32 = 20320")
+    check(cast('😀').to(i32) == 128512, "😀 to i32 = 128512 (U+1F600)")
+    // i32 → char 往返
+    check(cast(128512i32).to(char) == '😀', "i32 128512 to 😀")
+
+    // ─── 9. 字符串与 null 交互 ───
+    println("--- String & Nullable ---")
+    val nullable_str: str? = null
+    check(nullable_str == null, "nullable str is null")
+    check((nullable_str ?? "default") == "default", "null str ?? default")
+    val some_str: str? = "value"
+    check((some_str ?? "default") == "value", "non-null str ?? keeps value")
+
+    // ─── 10. 字符串长度为 1 的边界 ───
+    println("--- Length-1 Strings ---")
+    check("a".len() == 1, "single ascii len 1")
+    check("你".len() == 1, "single CJK len 1")
+    check("😀".len() == 1, "single emoji len 1")
+    // 单字符字符串与 char 的关系
+    val single = "X"
+    check(single[0] == 'X', "single str [0] == char")
+
+    // ─── 11. 大胆：字符串重复构建（1000 字符）───
+    println("--- 1000-char Build ---")
+    var big_s: str = ""
+    var si: i32 = 0
+    while si < 1000 {
+        big_s = big_s + "z"
+        si = si + 1
+    }
+    check(big_s.len() == 1000, "1000-char string")
+    check(big_s[0] == 'z', "1000-char [0]")
+    check(big_s[999] == 'z', "1000-char [999]")
+
+    // ─── 12. 大胆：字符串插值中嵌入 null 字面量 ───
+    println("--- Interp with Nullable ---")
+    val maybe: i32? = null
+    // 插值 nullable 值
+    val interp_null = "val: {maybe}"
+    check(interp_null == "val: null", "interp null i32? = 'null'")
+
+    // ─── 13. 大胆：字符串比较链 ───
+    println("--- Comparison Chain ---")
+    check("apple" < "banana", "apple < banana")
+    check("banana" < "cherry", "banana < cherry")
+    check("apple" < "cherry", "apple < cherry (transitive)")
+    check(!("apple" < "apple"), "!(apple < apple) reflexive")
+
+    // ─── 14. 大胆：特殊字符串拼接 ───
+    println("--- Special Concat ---")
+    // 字符串 + char
+    val s_plus_char = "ab" + 'c'
+    check(s_plus_char == "abc", "str + char")
+    // char + 字符串
+    val char_plus_s = 'x' + "yz"
+    check(char_plus_s == "xyz", "char + str")
+
+    summary()
+}

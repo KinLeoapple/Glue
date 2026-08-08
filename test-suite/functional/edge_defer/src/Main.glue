@@ -1,0 +1,318 @@
+// ── 边缘 defer 测试：大胆探测 defer 语义边界 ──
+// 目标：探测 defer 捕获时机、LIFO 顺序、递归/循环/闭包中的行为、
+//       defer 修改返回值、defer 与 early return、defer 跨函数链。
+// 已知约束：避免在 while 条件中调用用户函数（Bug #37）、
+//           避免嵌套 if-else 尾调用（Bug #45）。
+// 关键语义：返回值在 defer 执行前已求值，defer 无法修改返回值。
+//   故返回局部变量的函数返回 defer 前的值。defer 对全局变量的修改可被外部观测。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 1. 基础 LIFO 顺序（通过全局观测，返回值在 defer 前已求值）───
+var lifo_log: str = ""
+fun lifoBasic(): str {
+    var log: str = "body|"
+    defer lifo_log = lifo_log + "A"
+    defer lifo_log = lifo_log + "B"
+    defer lifo_log = lifo_log + "C"
+    log
+}
+
+// ─── 2. defer 捕获局部 var 的值（探测：是否读取为 null）───
+var capture_log: str = ""
+fun deferCaptureLocal(): i32 {
+    var x: i32 = 5
+    defer capture_log = capture_log + cast(x).to(str)
+    x = 10
+    x
+}
+
+// ─── 3. defer 捕获函数参数（探测：是否读取为 null）───
+var param_log: str = ""
+fun deferCaptureParam(n: i32): i32 {
+    defer param_log = param_log + cast(n).to(str)
+    n * 2
+}
+
+// ─── 4. defer 修改全局 var（LIFO 累积）───
+var defer_counter: i32 = 0
+fun deferModifiesOuter(): i32 {
+    defer defer_counter = defer_counter + 1
+    defer defer_counter = defer_counter + 10
+    42
+}
+
+// ─── 5. defer 在递归中（每次递归调用是否都执行 defer？）───
+var recur_log: str = ""
+fun deferRecur(n: i32): i32 {
+    defer recur_log = recur_log + cast(n).to(str)
+    if n <= 0 { 0 } else { n + deferRecur(n - 1) }
+}
+
+// ─── 6. defer 在嵌套函数中 ───
+var nested_log: str = ""
+fun deferNestedFunc(): i32 {
+    fun inner(x: i32): i32 {
+        defer nested_log = nested_log + "inner" + cast(x).to(str)
+        x * 2
+    }
+    defer nested_log = nested_log + "outer"
+    val r = inner(5)
+    r + 1
+}
+
+// ─── 7. defer 在 early return 后（if 分支返回）───
+var early_log: str = ""
+fun deferEarlyReturn(n: i32): i32 {
+    defer early_log = early_log + "cleanup"
+    if n < 0 {
+        0 - n
+    } else {
+        n + 1
+    }
+}
+
+// ─── 8. defer 不影响返回值（返回值在 defer 前已求值）───
+fun deferNoAffectReturn(): i32 {
+    var x: i32 = 5
+    defer x = 999
+    x
+}
+
+// ─── 9. defer 跨函数链（callee defer 应在 caller body 继续前执行）───
+var chain_log: str = ""
+fun chainCallee(): i32 {
+    defer chain_log = chain_log + "callee"
+    1
+}
+fun chainCaller(): i32 {
+    defer chain_log = chain_log + "caller"
+    val r = chainCallee()
+    chain_log = chain_log + "mid"
+    r + 1
+}
+
+// ─── 10. defer + 闭包捕获 ───
+var closure_log: str = ""
+fun deferWithClosure(): i32 {
+    var x: i32 = 0
+    val f = fun() { x = x + 1 }
+    defer closure_log = closure_log + "defer" + cast(x).to(str)
+    f()
+    f()
+    f()
+    closure_log = closure_log + "after" + cast(x).to(str)
+    x
+}
+
+// ─── 11. defer + match（探测：defer 在 match 后是否执行）───
+var match_log: str = ""
+fun deferInMatch(n: i32): i32 {
+    defer match_log = match_log + "cleanup"
+    val r = match n {
+        0 => 100
+        _ => n * 10
+    }
+    r
+}
+
+// ─── 12. defer 数量压力（10 个 defer LIFO）───
+var stress_log: str = ""
+fun deferStress(): i32 {
+    var i: i32 = 0
+    defer stress_log = stress_log + "0"
+    defer stress_log = stress_log + "1"
+    defer stress_log = stress_log + "2"
+    defer stress_log = stress_log + "3"
+    defer stress_log = stress_log + "4"
+    defer stress_log = stress_log + "5"
+    defer stress_log = stress_log + "6"
+    defer stress_log = stress_log + "7"
+    defer stress_log = stress_log + "8"
+    defer stress_log = stress_log + "9"
+    i = 10
+    i
+}
+
+// ─── 13. defer 中调用函数（副作用）───
+var call_log: str = ""
+fun sideEffect(n: i32): i32 {
+    call_log = call_log + cast(n).to(str)
+    n
+}
+fun deferCallsFunction(): i32 {
+    defer sideEffect(1)
+    defer sideEffect(2)
+    defer sideEffect(3)
+    sideEffect(0)
+    42
+}
+
+// ─── 14. defer + while 循环体（探测：每轮执行还是仅最后一次）───
+var loop_log: str = ""
+fun deferInLoop(): i32 {
+    var i: i32 = 0
+    var sum: i32 = 0
+    while i < 3 {
+        defer loop_log = loop_log + cast(i).to(str)
+        sum = sum + i
+        i = i + 1
+    }
+    sum
+}
+
+// ─── 15. defer 全局字符串拼接 LIFO（对照基准）───
+var concat_log: str = ""
+fun deferGlobalConcat(): i32 {
+    defer concat_log = concat_log + "X"
+    defer concat_log = concat_log + "Y"
+    defer concat_log = concat_log + "Z"
+    1
+}
+
+fun main(): void {
+    println("=== Edge Defer ===")
+
+    // 1. LIFO（通过全局观测）
+    println("--- LIFO Basic (via global) ---")
+    lifo_log = ""
+    val lb = lifoBasic()
+    check(lb == "body|", "return value before defer")
+    check(lifo_log == "CBA", "LIFO order CBA via global")
+
+    // 2. defer 捕获局部 var
+    println("--- Defer Capture Local Var ---")
+    capture_log = ""
+    val dc = deferCaptureLocal()
+    check(dc == 10, "return 10")
+    // Bug #47: defer 读取局部 var 为 null
+    println("  INFO: capture_log = '{capture_log}' (expect '10')")
+    check(capture_log == "10", "defer reads local var value")
+
+    // 3. defer 捕获参数
+    println("--- Defer Capture Param ---")
+    param_log = ""
+    val dp = deferCaptureParam(7)
+    check(dp == 14, "return 14")
+    println("  INFO: param_log = '{param_log}' (expect '7')")
+    check(param_log == "7", "defer reads param value")
+
+    // 4. defer 修改全局 var（LIFO 累积）
+    println("--- Defer Modifies Global ---")
+    defer_counter = 0
+    val dm = deferModifiesOuter()
+    check(dm == 42, "return 42 before defer")
+    // LIFO: +10 先执行 → 10，+1 后执行 → 11
+    println("  INFO: defer_counter = {defer_counter} (expect 11)")
+    check(defer_counter == 11, "defer global int LIFO (+10 then +1 = 11)")
+
+    // 5. defer 在递归中
+    println("--- Defer in Recursion ---")
+    recur_log = ""
+    val rr = deferRecur(3)
+    check(rr == 6, "recur sum 3+2+1+0 = 6")
+    // LIFO unwind: n=0 defer, n=1 defer, n=2 defer, n=3 defer
+    println("  INFO: recur_log = '{recur_log}' (expect '0123')")
+    check(recur_log == "0123", "defer runs on each recursive call (LIFO unwind)")
+
+    // 6. defer 在嵌套函数
+    println("--- Defer in Nested Function ---")
+    nested_log = ""
+    val nf = deferNestedFunc()
+    check(nf == 11, "inner(5)=10, +1 = 11")
+    // inner defer 先执行，然后 outer defer
+    println("  INFO: nested_log = '{nested_log}' (expect 'inner5outer')")
+    check(nested_log == "inner5outer", "nested defer: inner then outer")
+
+    // 7. defer 在 early return
+    println("--- Defer with Early Return ---")
+    early_log = ""
+    val e1 = deferEarlyReturn(-5)
+    check(e1 == 5, "early return neg -> 5")
+    check(early_log == "cleanup", "defer runs after early return")
+    early_log = ""
+    val e2 = deferEarlyReturn(10)
+    check(e2 == 11, "normal return 10+1")
+    check(early_log == "cleanup", "defer runs after normal return")
+
+    // 8. defer 不影响返回值
+    println("--- Defer No Affect Return ---")
+    check(deferNoAffectReturn() == 5, "defer does not change return value")
+
+    // 9. defer 跨函数链
+    println("--- Defer Cross-Function Chain ---")
+    chain_log = ""
+    val cc = chainCaller()
+    check(cc == 2, "chainCaller returns 2")
+    // 期望顺序：callee defer 在 callee 返回时执行 → "callee" → "mid" → caller defer → "caller"
+    // Bug #48 已修复：callee defer 正确在 callee 返回时执行
+    println("  INFO: chain_log = '{chain_log}' (expect 'calleemidcaller')")
+    check(chain_log == "calleemidcaller", "cross-function defer order")
+
+    // 10. defer + 闭包
+    println("--- Defer with Closure ---")
+    closure_log = ""
+    val dcl = deferWithClosure()
+    check(dcl == 3, "closure called 3x, x=3")
+    println("  INFO: closure_log = '{closure_log}' (expect 'after3defer3')")
+    check(closure_log == "after3defer3", "defer sees closure-modified var")
+
+    // 11. defer + match
+    println("--- Defer with Match ---")
+    match_log = ""
+    val m0 = deferInMatch(0)
+    check(m0 == 100, "match 0 -> 100")
+    println("  INFO: match_log = '{match_log}' (expect 'cleanup')")
+    check(match_log == "cleanup", "defer runs after match")
+    match_log = ""
+    val m5 = deferInMatch(5)
+    check(m5 == 50, "match 5 -> 50")
+    check(match_log == "cleanup", "defer runs after match wildcard")
+
+    // 12. defer 压力
+    println("--- Defer Stress (10 defers) ---")
+    stress_log = ""
+    val ds = deferStress()
+    check(ds == 10, "stress return 10")
+    check(stress_log == "9876543210", "10 defers LIFO")
+
+    // 13. defer 中调用函数
+    println("--- Defer Calls Function ---")
+    call_log = ""
+    val df = deferCallsFunction()
+    check(df == 42, "return 42")
+    check(call_log == "0321", "defer calls function LIFO")
+
+    // 14. defer 在 while 循环体
+    println("--- Defer in While Loop ---")
+    loop_log = ""
+    val lr = deferInLoop()
+    check(lr == 3, "loop sum 0+1+2 = 3")
+    println("  INFO: loop_log = '{loop_log}' (probe: per-iter or last-only)")
+
+    // 15. defer 全局字符串拼接 LIFO（对照基准）
+    println("--- Defer Global Concat (baseline) ---")
+    concat_log = ""
+    val dg = deferGlobalConcat()
+    check(dg == 1, "return 1")
+    check(concat_log == "ZYX", "global concat LIFO ZYX")
+
+    summary()
+}

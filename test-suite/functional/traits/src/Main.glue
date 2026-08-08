@@ -1,0 +1,185 @@
+// 功能验证：Trait（定义/实现/多 trait 组合/按接收者分派/默认方法）
+// 已修复 P1 #12：trait 默认方法现在可用（单态化特化）。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// 带默认方法的 trait（默认方法当前有 bug，仅测试显式实现的方法）
+trait Greet {
+    fun name(self): str
+    fun hello(self): str {
+        "Hello, " + self.name()
+    }
+}
+
+trait Sizeable {
+    fun sz(self): i32
+}
+
+trait Show {
+    fun show(self): str
+}
+
+// Trait 边缘类型（顶层定义）
+trait Named {
+    fun named(self): str
+}
+trait Counted {
+    fun counted(self): i32
+}
+type Triple: (Named, Counted, Show) = | A | B | C {
+    fun named(self): str {
+        match self {
+            A => "alpha"
+            B => "beta"
+            C => "gamma"
+        }
+    }
+    fun counted(self): i32 {
+        match self {
+            A => 1
+            B => 2
+            C => 3
+        }
+    }
+    fun show(self): str {
+        self.named() + ":" + cast(self.counted()).to(str)
+    }
+}
+
+trait Chain {
+    fun base(self): str
+    fun wrapped(self): str {
+        "[" + self.base() + "]"
+    }
+}
+type Tag: Chain = Tag(label: str) {
+    fun base(self): str {
+        self.label
+    }
+}
+
+type Pair2 = Pair2(a: i32, b: i32)
+trait PairOps {
+    fun swapped(self): Pair2
+}
+type Box2: PairOps = Box2(p: Pair2) {
+    fun swapped(self): Pair2 {
+        Pair2(self.p.b, self.p.a)
+    }
+}
+
+// 多 trait 组合（hello 使用 trait 默认方法，不显式实现）
+type Ordering: (Greet, Sizeable, Show) = | Lt | Eq | Gt {
+    fun name(self): str {
+        match self {
+            Lt => "less"
+            Eq => "equal"
+            Gt => "greater"
+        }
+    }
+
+    fun sz(self): i32 {
+        match self {
+            Lt => -1
+            Eq => 0
+            Gt => 1
+        }
+    }
+
+    fun show(self): str {
+        "Ordering." + self.name()
+    }
+}
+
+// 不同类型实现同一 trait
+type Color: Sizeable = | Red | Green | Blue {
+    fun sz(self): i32 { 3 }
+}
+
+type Pt: (Sizeable, Show) = Pt(x: i32, y: i32) {
+    fun sz(self): i32 { 2 }
+    fun show(self): str {
+        "Pt(" + cast(self.x).to(str) + "," + cast(self.y).to(str) + ")"
+    }
+}
+
+// 实现 Greet 的记录（hello 使用 trait 默认方法）
+type Animal: Greet = Animal(species: str, sound: str) {
+    fun name(self): str {
+        self.species
+    }
+}
+
+fun main(): void {
+    println("=== Traits ===")
+
+    // 显式实现的 trait 方法
+    check(Lt.name() == "less", "implemented method name Lt")
+    // trait 默认方法（已修复 P1 #12：单态化特化使默认方法可用）
+    check(Lt.hello() == "Hello, less", "default hello Lt")
+    check(Eq.hello() == "Hello, equal", "default hello Eq")
+    check(Gt.hello() == "Hello, greater", "default hello Gt")
+
+    // 多 trait
+    check(Lt.sz() == -1, "Sizeable on Lt")
+    check(Lt.show() == "Ordering.less", "Show on Lt")
+    check(Eq.sz() == 0, "Sizeable on Eq")
+    check(Gt.sz() == 1, "Sizeable on Gt")
+
+    // 不同类型同一 trait
+    check(Red.sz() == 3, "Color sz")
+    check(Pt(1, 2).sz() == 2, "Pt sz")
+
+    // Show trait
+    check(Pt(3, 4).show() == "Pt(3,4)", "Pt show")
+
+    // Animal 实现 Greet
+    check(Animal("Dog", "Woof").name() == "Dog", "Animal name")
+    check(Animal("Dog", "Woof").hello() == "Hello, Dog", "Animal hello")
+
+    // 不同 Ordering 值的 trait 方法
+    check(Eq.show() == "Ordering.equal", "Show on Eq")
+    check(Gt.show() == "Ordering.greater", "Show on Gt")
+
+    // ─── Trait 边缘测试 ───
+
+    // 多 trait 组合（3 个 trait，类型已顶层定义）
+    check(A.named() == "alpha", "3-trait A named")
+    check(A.counted() == 1, "3-trait A counted")
+    check(A.show() == "alpha:1", "3-trait A show")
+    check(C.show() == "gamma:3", "3-trait C show")
+
+    // trait 默认方法链式调用（类型已顶层定义）
+    check(Tag("x").base() == "x", "trait default base")
+    check(Tag("x").wrapped() == "[x]", "trait default wrapped calls base")
+
+    // trait 方法返回 record（类型已顶层定义）
+    check(Box2(Pair2(1, 2)).swapped() == Pair2(2, 1), "trait method returns record")
+
+    // trait 方法在数组元素上
+    val tag_arr: Tag[] = [Tag("a"), Tag("b"), Tag("c")]
+    check(tag_arr[0].base() == "a", "trait method on array elem 0")
+    check(tag_arr[2].base() == "c", "trait method on array elem 2")
+
+    // trait 方法组合调用（使用 cast 而非 to_str）
+    check(B.named() + cast(B.counted()).to(str) == "beta2", "trait method composition")
+
+    summary()
+}

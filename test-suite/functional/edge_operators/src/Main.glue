@@ -1,0 +1,253 @@
+// 大胆运算符与表达式求值边缘测试：
+// 优先级 / 一元链 / 短路副作用 / 负数取模 / 除法边界 / 比较链 / 嵌套 if 表达式 / 算术溢出回绕
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 静默退出       → 用 if-as-expression
+//   Bug #21: 超范围字面量静默退出  → 所有字面量加显式类型后缀
+//   Bug #22: i32 MIN / -1 panic    → 避免有符号 MIN / -1
+//   Bug #30: &&/|| 在 while 条件中 stuck → 本测试不在 while 条件中用 &&/||（用 if 表达式）
+//   Bug #37: while 条件中调用用户函数 hang → 用内联条件
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// Bug #38 探测：顶层函数 + 顶层 var，隔离闭包捕获问题
+var sc_count: i32 = 0
+fun scBump(): bool { sc_count = sc_count + 1; true }
+fun scBumpFalse(): bool { sc_count = sc_count + 1; false }
+
+fun main(): void {
+    println("=== Edge Operators ===")
+
+    // ─── 1. 运算符优先级矩阵 ───
+    println("--- Precedence Matrix ---")
+    check(2 + 3 * 4 == 14, "precedence: 2+3*4 = 14 (mul before add)")
+    check(2 * 3 + 4 == 10, "precedence: 2*3+4 = 10")
+    check((2 + 3) * 4 == 20, "paren override: (2+3)*4 = 20")
+    check(10 - 3 - 2 == 5, "left assoc: 10-3-2 = 5 (not 10-(3-2)=9)")
+    check(100 / 10 / 2 == 5, "left assoc: 100/10/2 = 5")
+    check(2 - 3 + 4 == 3, "left assoc: 2-3+4 = 3")
+    check(2 + 3 == 4 + 1, "equality of subexpressions")
+    check(1 + 2 * 3 - 4 == 3, "mixed: 1+2*3-4 = 3")
+    check(2 * 3 + 4 * 5 == 26, "two muls: 2*3+4*5 = 26")
+    check(20 / 4 * 3 == 15, "left assoc div/mul: 20/4*3 = 15")
+    check(7 % 3 + 1 == 2, "mod + add: 7%3+1 = 2")
+
+    // ─── 2. 一元运算符链 ───
+    println("--- Unary Chains ---")
+    val x: i32 = 5
+    check(-x == -5, "unary neg")
+    check(--x == 5, "double neg = identity")  // -(-x)
+    check(---x == -5, "triple neg")
+    check(-(-(-x)) == -5, "triple neg explicit")
+    check(!!true == true, "double not bool")
+    check(!!!false == true, "triple not false -> true")
+    check(!(!true) == true, "double not explicit")
+    // 位运算一元 ~
+    val z: i32 = 0
+    check(~z == -1, "NOT 0 = -1")
+    check(~~z == 0, "double NOT = identity")
+    check(~~~z == -1, "triple NOT")
+    // 混合一元
+    check(-~x == 6, "neg of NOT(5): ~5=-6, -(-6)=6")
+    check(~-x == 4, "NOT of -5: ~(-5) = 4")
+
+    // ─── 3. 取模边界（负数取模）───
+    println("--- Modulo Edges ---")
+    check(7 % 3 == 1, "7 % 3 = 1")
+    check(6 % 3 == 0, "6 % 3 = 0")
+    check(0 % 5 == 0, "0 % 5 = 0")
+    check(5 % 7 == 5, "5 % 7 = 5 (smaller)")
+    check((-7) % 3 == -1, "(-7) % 3 = -1 (truncated toward zero)")
+    check(7 % (-3) == 1, "7 % (-3) = 1 (sign of dividend)")
+    check((-7) % (-3) == -1, "(-7) % (-3) = -1")
+    check((-6) % 3 == 0, "(-6) % 3 = 0 (exact divides)")
+    check((-1) % 3 == -1, "(-1) % 3 = -1")
+    check(1 % (-3) == 1, "1 % (-3) = 1")
+
+    // ─── 4. 除法边界 ───
+    println("--- Division Edges ---")
+    check(10 / 3 == 3, "10 / 3 = 3 (trunc)")
+    check((-10) / 3 == -3, "(-10) / 3 = -3 (trunc toward zero)")
+    check(10 / (-3) == -3, "10 / (-3) = -3")
+    check((-10) / (-3) == 3, "(-10) / (-3) = 3")
+    check(0 / 5 == 0, "0 / 5 = 0")
+    check(7 / 1 == 7, "x / 1 = x")
+    check(100 / 100 == 1, "x / x = 1")
+
+    // ─── 5. 算术溢出回绕（i32）───
+    println("--- Arithmetic Overflow (wrapping) ---")
+    val i32_max: i32 = 2147483647i32
+    check(i32_max + 1 == -2147483648i32, "i32 MAX + 1 wraps to MIN")
+    val i32_min: i32 = -2147483648i32
+    check(i32_min - 1 == 2147483647i32, "i32 MIN - 1 wraps to MAX")
+    check(i32_max * 2 == -2, "i32 MAX * 2 wraps to -2")
+    // i8 边界
+    val i8_max: i8 = 127i8
+    check(i8_max + 1i8 == -128i8, "i8 MAX + 1 wraps to MIN")
+    val i8_min: i8 = -128i8
+    check(i8_min - 1i8 == 127i8, "i8 MIN - 1 wraps to MAX")
+
+    // ─── 6. 比较链语义 ───
+    println("--- Comparison Chains ---")
+    // Glue 不支持链式比较（a < b < c），需用 &&
+    val a: i32 = 5
+    val b: i32 = 10
+    val c: i32 = 15
+    check(a < b && b < c, "transitive: a<b && b<c")
+    check(a < b && b < c && c > a, "three-way comparison")
+    check(!(a > b), "negated comparison")
+    check(a == a, "reflexive equality")
+    check(a != b, "inequality")
+    check(a <= a, "reflexive <=")
+    check(a >= a, "reflexive >=")
+    check(a <= b, "a <= b")
+    check(b >= a, "b >= a")
+
+    // ─── 7. 嵌套 if 表达式（三元替代）───
+    println("--- Nested If Expressions ---")
+    val n: i32 = 7
+    val cat = if n < 0 { "neg" } else if n == 0 { "zero" } else if n < 10 { "small pos" } else { "big pos" }
+    check(cat == "small pos", "nested if 4-way")
+    val abs_val = if n < 0 { -n } else { n }
+    check(abs_val == 7, "abs via if (positive)")
+    val abs_neg = if (-n) < 0 { -(-n) } else { -n }
+    check(abs_neg == 7, "abs via if (negative input)")
+    // if 表达式在算术中
+    val sign = (if n > 0 { 1 } else { -1 }) * 10
+    check(sign == 10, "if expression in arithmetic")
+    // 嵌套 if 在函数调用参数中
+    fun doubleIt(v: i32): i32 { v * 2 }
+    check(doubleIt(if n > 0 { n } else { 0 }) == 14, "if expr as function argument")
+
+    // ─── 8. 逻辑运算与短路（非 while 条件）───
+    println("--- Logical Short-Circuit (Bug #38) ---")
+    // Bug #38：&&/|| 不短路，RHS 总被求值。用顶层 scBump/scBumpFalse + 顶层 sc_count 隔离闭包捕获。
+    sc_count = 0
+    val r1 = false && scBump()
+    check(r1 == false, "&& false result")
+    check(sc_count == 0, "Bug #38: && should short-circuit (sc_count=0)")
+    sc_count = 0
+    val r2 = true || scBump()
+    check(r2 == true, "|| true result")
+    check(sc_count == 0, "Bug #38: || should short-circuit (sc_count=0)")
+    // 非短路情况：LHS true 时 && 应求值 RHS
+    sc_count = 0
+    val r3 = true && scBump()
+    check(r3 == true, "&& evaluate RHS when true")
+    check(sc_count == 1, "&&: scBump called once")
+    // LHS false 时 || 应求值 RHS
+    sc_count = 0
+    val r4 = false || scBump()
+    check(r4 == true, "|| evaluate RHS when false")
+    check(sc_count == 1, "||: scBump called once")
+
+    // ─── 9. 复合布尔表达式 ───
+    println("--- Compound Boolean ---")
+    check((1 < 2) && (3 < 4) && (5 < 6), "all true && chain")
+    check((1 > 2) || (3 < 4), "one false one true ||")
+    check(!((1 > 2) && (3 > 4)), "de Morgan: !(false && false)")
+    check((1 > 2) || (3 > 4) || (5 < 6), "three-way || with last true")
+    // de Morgan 律
+    val p = true
+    val q = false
+    check((!p || !q) == !(p && q), "de Morgan: !p||!q == !(p&&q)")
+    check((!p && !q) == !(p || q), "de Morgan: !p&&!q == !(p||q)")
+
+    // ─── 10. 大胆：混合类型算术提升 ───
+    println("--- Mixed-Type Arithmetic ---")
+    val i: i32 = 10
+    val l: i64 = 20i64
+    // i32 + i64 需要显式 cast（Glue 严格类型）
+    check(cast(i).to(i64) + l == 30i64, "i32 cast to i64 + i64")
+    val f: f64 = 1.5f64
+    check(cast(i).to(f64) + f == 11.5f64, "i32 cast to f64 + f64")
+    // 同类型混合
+    check(i + i == 20, "i32 + i32")
+    check(l - l == 0i64, "i64 - i64")
+
+    // ─── 11. 大胆：嵌套括号与结合性 ───
+    println("--- Nested Parens & Associativity ---")
+    check(((1 + 2) + 3) + 4 == 10, "left-nested add")
+    check(1 + (2 + (3 + 4)) == 10, "right-nested add")
+    check(((10 - 2) - 3) - 1 == 4, "left-nested sub")
+    check(10 - (2 - (3 - 1)) == 10, "right-nested sub: 10-(2-(3-1))=10-(2-2)=10-0=10")
+    check(2 * (3 * (4 * 5)) == 120, "right-nested mul")
+    check(((2 * 3) * 4) * 5 == 120, "left-nested mul same result")
+
+    // ─── 12. 大胆：表达式中的字符串拼接优先级 ───
+    println("--- String Concat Precedence ---")
+    check("a" + "b" + "c" == "abc", "left assoc string concat")
+    check("x" + ("y" + "z") == "xyz", "right assoc string concat same")
+    check(("a" + "b") + ("c" + "d") == "abcd", "paren grouped concat")
+    // str + int (Bug #16 已修复)
+    check("n=" + 42 == "n=42", "str + int precedence")
+    check(42 + "!" == "42!", "int + str")
+
+    // ─── 13. 大胆：一元 minus 与字面量 ───
+    println("--- Unary Minus & Literals ---")
+    check(-0 == 0, "negative zero int = 0")
+    check(-1 + 1 == 0, "-1 + 1 = 0")
+    check(1 + -1 == 0, "1 + -1 = 0")
+    check(2 * -3 == -6, "2 * -3 = -6")
+    check(-2 * 3 == -6, "-2 * 3 = -6")
+    check(-2 * -3 == 6, "-2 * -3 = 6")
+    check(10 - -5 == 15, "10 - (-5) = 15")
+    check(-(-5) == 5, "-(-5) = 5")
+
+    // ─── 14. 大胆：i64 大数算术 ───
+    println("--- i64 Big Arithmetic ---")
+    val big1: i64 = 1000000000i64
+    val big2: i64 = 2000000000i64
+    check(big1 * big2 == 2000000000000000000i64, "i64 big multiplication")
+    check(big1 + big2 == 3000000000i64, "i64 big addition")
+    check(big2 - big1 == 1000000000i64, "i64 big subtraction")
+    check(big2 / big1 == 2, "i64 big division")
+
+    // ─── 15. 大胆：表达式中的 cast 嵌套 ───
+    println("--- Cast in Expressions ---")
+    check(cast(10i32).to(i64) + cast(20i32).to(i64) == 30i64, "two casts in add")
+    check(cast(5i32).to(i64) * cast(6i32).to(i64) == 30i64, "two casts in mul")
+    check(cast(cast(100i32).to(i64)).to(i32) == 100, "nested cast roundtrip in expr")
+    // cast 优先级
+    val v2: i32 = 50
+    check(cast(v2).to(i64) + 10i64 == 60i64, "cast then add")
+
+    // ─── 16. 大胆：复杂综合表达式 ───
+    println("--- Complex Composite ---")
+    // (a + b) * c - d / e
+    check((3 + 4) * 2 - 10 / 5 == 12, "composite: (3+4)*2 - 10/5 = 12")
+    // max via if
+    fun max3(a: i32, b: i32, c: i32): i32 {
+        if a > b { if a > c { a } else { c } } else { if b > c { b } else { c } }
+    }
+    check(max3(1, 2, 3) == 3, "max3(1,2,3) = 3")
+    check(max3(3, 2, 1) == 3, "max3(3,2,1) = 3")
+    check(max3(1, 3, 2) == 3, "max3(1,3,2) = 3")
+    check(max3(5, 5, 5) == 5, "max3 equal = 5")
+    // clamp via if
+    fun clamp(v: i32, lo: i32, hi: i32): i32 {
+        if v < lo { lo } else if v > hi { hi } else { v }
+    }
+    check(clamp(5, 0, 10) == 5, "clamp in range")
+    check(clamp(-5, 0, 10) == 0, "clamp below lo")
+    check(clamp(15, 0, 10) == 10, "clamp above hi")
+
+    summary()
+}

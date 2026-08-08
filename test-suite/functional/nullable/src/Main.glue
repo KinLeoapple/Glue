@@ -1,0 +1,178 @@
+// 功能验证：可空类型（T?/?? 合并/! 断言/? 传播/? . 链式访问）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Addr = Addr(city: str, zip: i32)
+type User = User(name: str, addr: Addr?)
+type DeepOuter = DeepOuter(mid: DeepMid?)
+type DeepMid = DeepMid(inner: DeepInner?)
+type DeepInner = DeepInner(v: i32?)
+
+// ?? 合并
+fun firstNonNull(a: i32?, b: i32?, c: i32?): i32 {
+    a ?? b ?? c ?? -1
+}
+
+// ! 断言
+fun forceVal(x: i32?): i32 {
+    x!
+}
+
+// ? 传播：null 时提前返回 null，非 null 时解包为内值
+fun propagateOpt(x: i32?): i32? {
+    val y = x?
+    y + 1
+}
+
+fun main(): void {
+    println("=== Nullable ===")
+
+    // null 值
+    val a: i32? = null
+    val b: i32? = 42
+
+    // ?? 合并
+    check(firstNonNull(null, null, null) == -1, "all null coalesce to default")
+    check(firstNonNull(null, null, 5) == 5, "third non-null")
+    check(firstNonNull(null, 10, 5) == 10, "second non-null wins")
+    check(firstNonNull(1, 2, 3) == 1, "first non-null wins")
+
+    // 直接 ?? 使用
+    val v1: i32 = null ?? 99
+    check(v1 == 99, "null ?? 99")
+    val v2: i32? = 42
+    check((v2 ?? 99) == 42, "42 ?? 99")
+
+    // ! 断言
+    check(forceVal(42) == 42, "force non-null")
+
+    // null 本身
+    val n: i32? = null
+    check((n ?? 0) == 0, "null coalesce to 0")
+
+    // 非空值
+    val some: i32? = 42
+    check((some ?? 0) == 42, "nullable holds value via ??")
+    check(some! == 42, "non-null assertion on some")
+
+    // 非空字段访问
+    val addr = Addr("Beijing", 100000)
+    val user = User("Alice", addr)
+    check(user.name == "Alice", "non-null field access")
+
+    // ?? 链式合并
+    val x1: i32? = null
+    val x2: i32? = null
+    val x3: i32? = 7
+    check((x1 ?? x2 ?? x3 ?? -1) == 7, "chain coalesce to third")
+
+    // 可空值通过 ?? 解包后参与运算
+    val opt1: i32? = 10
+    val opt2: i32? = 20
+    val sum = (opt1 ?? 0) + (opt2 ?? 0)
+    check(sum == 30, "nullable unwrap and add")
+
+    // str? ?? 合并（Bug #9：str? ?? 合并后用 == 比较）
+    val optStrNull: str? = null
+    check((optStrNull ?? "default") == "default", "str? null coalesce equals default")
+    val optStr: str? = "hello"
+    check((optStr ?? "default") == "hello", "str? non-null coalesce equals value")
+    check(optStr! == "hello", "nullable str non-null assertion")
+
+    // ? 传播：非 null 时解包并参与运算
+    val r1: i32? = propagateOpt(10)
+    check((r1 ?? -1) == 11, "? propagate non-null computes")
+
+    // ? 传播：null 时提前返回 null
+    val r2: i32? = propagateOpt(null)
+    check((r2 ?? -1) == -1, "? propagate null returns null")
+
+    // ?. 链式访问（Bug #8）
+    val addr = Addr("Beijing", 100000)
+    val userWithAddr = User("Alice", addr)
+    val nullUser: User? = null
+    // 非空链式访问
+    check(userWithAddr?.addr?.city == "Beijing", "?. chain on non-null")
+    // null 链式访问短路返回 null
+    val city2 = nullUser?.addr?.city
+    check(city2 == null, "?. chain on null short-circuits to null")
+    // 链式访问带 ?? 合并
+    check((nullUser?.addr?.city ?? "unknown") == "unknown", "?. chain with ?? coalesce")
+
+    // ─── 可空边缘测试 ───
+
+    // 深层 ?. 链（4 层）
+    val deepNull: DeepOuter? = null
+    check((deepNull?.mid?.inner?.v ?? -1) == -1, "4-layer ?. chain on null")
+    val deepVal = DeepOuter(DeepMid(DeepInner(42)))
+    check((deepVal?.mid?.inner?.v ?? -1) == 42, "4-layer ?. chain on value")
+    val deepMidNull = DeepOuter(null)
+    check((deepMidNull?.mid?.inner?.v ?? -1) == -1, "4-layer ?. chain mid null")
+
+    // 多 ?? 链（5 个）
+    val a1: i32? = null
+    val a2: i32? = null
+    val a3: i32? = null
+    val a4: i32? = null
+    val a5: i32? = 77
+    check((a1 ?? a2 ?? a3 ?? a4 ?? a5) == 77, "5-chain ?? coalesce to 5th")
+
+    // null 数组
+    val nulls = [null, 1, null, 2, null]
+    check((nulls[0] ?? -1) == -1, "nullable array elem 0 null")
+    check((nulls[1] ?? -1) == 1, "nullable array elem 1 value")
+    check((nulls[2] ?? -1) == -1, "nullable array elem 2 null")
+    check((nulls[3] ?? -1) == 2, "nullable array elem 3 value")
+    check((nulls[4] ?? -1) == -1, "nullable array elem 4 null")
+
+    // 可空 record 字段访问
+    val userNullAddr = User("Bob", null)
+    check(userNullAddr.name == "Bob", "nullable record field non-null")
+    check(userNullAddr.addr == null, "nullable record field is null")
+    check((userNullAddr.addr?.city ?? "N/A") == "N/A", "nullable record field ?.city")
+
+    // 可空值在数组中迭代
+    val optArr = [10, null, 20, null, 30]
+    var opt_sum: i32 = 0
+    var oi: i32 = 0
+    while oi < optArr.len() {
+        opt_sum = opt_sum + (optArr[oi] ?? 0)
+        oi = oi + 1
+    }
+    check(opt_sum == 60, "nullable array iterate with ?? default")
+
+    // null 的 null
+    val nn: i32? = null
+    check((nn ?? (null ?? 99)) == 99, "nested ?? inside ??")
+
+    // ! 断言链
+    val some_opt: i32? = 42
+    val force_chain = some_opt!
+    check(force_chain == 42, "force unwrap chain")
+
+    // 字符串可空边界
+    val empty_str: str? = ""
+    check((empty_str ?? "default") == "", "empty str is non-null")
+    val null_str: str? = null
+    check((null_str ?? "default") == "default", "null str coalesce")
+    check((null_str?.len() ?? -1) == -1, "null str ?.len() short-circuits")
+
+    summary()
+}

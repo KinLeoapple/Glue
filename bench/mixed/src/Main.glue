@@ -9,6 +9,7 @@
 // ============================================================
 // 1. 表达式 AST
 // ============================================================
+import builtin.io.Console.{println}
 type Expr =
     | ENum(i64)
     | EAdd(Expr, Expr)
@@ -53,7 +54,7 @@ fun buildStudents(n: i32): Student[] {
     var i: i32 = 0
     while i < n {
         val s = Student("s" + cast(i).to(str), cast(i % 100).to(i64), 18 + (i % 5))
-        arr = arr.push(s)
+        arr = arr ++ [s]
         i = i + 1
     }
     arr
@@ -62,7 +63,7 @@ fun buildStudents(n: i32): Student[] {
 fun avgScore(students: Student[]): i64 {
     var total: i64 = 0
     var count: i64 = 0
-    for s in students {
+    for s in students.iter() {
         match s {
             Student(_, score, _) => {
                 total = total + score
@@ -75,7 +76,7 @@ fun avgScore(students: Student[]): i64 {
 
 fun maxScore(students: Student[]): i64 {
     var max: i64 = 0
-    for s in students {
+    for s in students.iter() {
         match s {
             Student(_, score, _) => {
                 if score > max { max = score }
@@ -117,7 +118,7 @@ fun tHeight(t: Tree): i32 {
     }
 }
 
-fun main() {
+fun main(): void {
     // --- 表达式求值 1K 次（buildExpr(10) 递归深度大，1K 次已足够压测）---
     var exprSum: i64 = 0
     var i: i32 = 0

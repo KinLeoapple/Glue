@@ -1,0 +1,355 @@
+// 边缘测试：所有数值类型的边界值 / 溢出回绕 / 特殊浮点值 / 类型宽度 / 符号转换
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层（本测试无递归）
+//   Bug #20: 科学计数法 1e300 解析为 1    → 使用完整小数或十六进制浮点
+//   Bug #21: i32 超范围字面量静默退出     → 所有字面量加显式类型后缀
+//   Bug #22: 有符号 MIN / -1 已修复（wrapping 语义）
+//   Bug #24: 分支内 await 卡住            → 本测试无 await
+//   闭包不支持显式返回类型标注            → 省略 : i32
+//   类型别名不等价                        → 直接使用 () -> i32
+//
+// 新发现限制（见文件末尾注释 + 报告）：
+//   Limit-A: u128 MAX 字面量无法表示（parse_int 返回 i128，超 i128 范围 → None → 静默失败）
+
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Edge Numeric ===")
+
+    // ─── 1. 有符号整数边界值 ───
+    println("--- Signed Integer Boundaries ---")
+
+    // i8
+    val i8_max: i8 = 127i8
+    val i8_min: i8 = -128i8
+    check(i8_max == 127i8, "i8 MAX = 127")
+    check(i8_min == -128i8, "i8 MIN = -128")
+
+    // i16
+    val i16_max: i16 = 32767i16
+    val i16_min: i16 = -32768i16
+    check(i16_max == 32767i16, "i16 MAX = 32767")
+    check(i16_min == -32768i16, "i16 MIN = -32768")
+
+    // i32
+    val i32_max: i32 = 2147483647i32
+    val i32_min: i32 = -2147483648i32
+    check(i32_max == 2147483647i32, "i32 MAX = 2147483647")
+    check(i32_min == -2147483648i32, "i32 MIN = -2147483648")
+
+    // i64
+    val i64_max: i64 = 9223372036854775807i64
+    val i64_min: i64 = -9223372036854775808i64
+    check(i64_max == 9223372036854775807i64, "i64 MAX")
+    check(i64_min == -9223372036854775808i64, "i64 MIN")
+
+    // i128
+    val i128_max: i128 = 170141183460469231731687303715884105727i128
+    val i128_min: i128 = -170141183460469231731687303715884105728i128
+    check(i128_max == 170141183460469231731687303715884105727i128, "i128 MAX")
+    check(i128_min == -170141183460469231731687303715884105728i128, "i128 MIN")
+
+    // ─── 2. 无符号整数边界值 ───
+    println("--- Unsigned Integer Boundaries ---")
+
+    val u8_max: u8 = 255u8
+    val u16_max: u16 = 65535u16
+    val u32_max: u32 = 4294967295u32
+    val u64_max: u64 = 18446744073709551615u64
+    check(u8_max == 255u8, "u8 MAX = 255")
+    check(u16_max == 65535u16, "u16 MAX = 65535")
+    check(u32_max == 4294967295u32, "u32 MAX = 4294967295")
+    check(u64_max == 18446744073709551615u64, "u64 MAX")
+
+    // Bug #25 已修复：u128 suffix 字面量直接用 u128::from_str_radix 解析，
+    // 覆盖完整 0..=2^128-1 范围（不再经 i128 中转导致超界失败）。
+    val u128_max_dec: u128 = 340282366920938463463374607431768211455u128
+    val u128_max_hex: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFu128
+    check(u128_max_dec == u128_max_hex, "u128 MAX decimal == hex literal (Bug #25)")
+    // 用回绕行为验证 u128_max 确实是全 1：MAX + 1 回绕到 0
+    check(u128_max_dec + 1u128 == 0u128, "u128 MAX +1 wraps to 0")
+    check(u128_max_hex - 1u128 == 340282366920938463463374607431768211454u128, "u128 MAX-1 via hex")
+    // u128 MAX / 2 向下取整（验证大数除法正确性）
+    check(u128_max_dec / 2u128 == 170141183460469231731687303715884105727u128, "u128 MAX / 2")
+
+    // ─── 3. 无符号零与最大值 ───
+    println("--- Unsigned Zero & Max ---")
+    val u8_zero: u8 = 0u8
+    val u16_zero: u16 = 0u16
+    val u32_zero: u32 = 0u32
+    check(u8_zero == 0u8, "u8 zero")
+    check(u8_max == 255u8, "u8 max 255")
+    check(u16_zero == 0u16, "u16 zero")
+    check(u16_max == 65535u16, "u16 max 65535")
+    check(u32_zero == 0u32, "u32 zero")
+    check(u32_max == 4294967295u32, "u32 max")
+
+    // ─── 4 & 11. 整数回绕溢出（同时验证类型宽度）───
+    // Glue 对 + - * / % 全部使用 wrapping 语义（Bug #22 已修复）
+    println("--- Wrapping Overflow (= Type Width) ---")
+
+    // i8: 8 位
+    check(127i8 + 1i8 == -128i8, "i8 127+1 wraps to -128")
+    check(-128i8 - 1i8 == 127i8, "i8 MIN-1 wraps to MAX")
+    check(127i8 * 2i8 == -2i8, "i8 127*2 wraps to -2")
+
+    // i16: 16 位
+    check(32767i16 + 1i16 == -32768i16, "i16 MAX+1 wraps to MIN")
+    check(-32768i16 - 1i16 == 32767i16, "i16 MIN-1 wraps to MAX")
+
+    // i32: 32 位
+    check(2147483647i32 + 1i32 == -2147483648i32, "i32 MAX+1 wraps to MIN")
+    check(-2147483648i32 - 1i32 == 2147483647i32, "i32 MIN-1 wraps to MAX")
+    check(2147483647i32 * 2i32 == -2i32, "i32 MAX*2 wraps to -2")
+
+    // i64: 64 位
+    check(9223372036854775807i64 + 1i64 == -9223372036854775808i64, "i64 MAX+1 wraps to MIN")
+    check(-9223372036854775808i64 - 1i64 == 9223372036854775807i64, "i64 MIN-1 wraps to MAX")
+
+    // i128: 128 位
+    check(170141183460469231731687303715884105727i128 + 1i128 == -170141183460469231731687303715884105728i128, "i128 MAX+1 wraps to MIN")
+    check(-170141183460469231731687303715884105728i128 - 1i128 == 170141183460469231731687303715884105727i128, "i128 MIN-1 wraps to MAX")
+
+    // u8: 8 位
+    check(255u8 + 1u8 == 0u8, "u8 255+1 wraps to 0")
+    check(0u8 - 1u8 == 255u8, "u8 0-1 wraps to 255")
+
+    // u16: 16 位
+    check(65535u16 + 1u16 == 0u16, "u16 MAX+1 wraps to 0")
+    check(0u16 - 1u16 == 65535u16, "u16 0-1 wraps to MAX")
+
+    // u32: 32 位
+    check(4294967295u32 + 1u32 == 0u32, "u32 MAX+1 wraps to 0")
+    check(0u32 - 1u32 == 4294967295u32, "u32 0-1 wraps to MAX")
+
+    // u64: 64 位
+    check(18446744073709551615u64 + 1u64 == 0u64, "u64 MAX+1 wraps to 0")
+    check(0u64 - 1u64 == 18446744073709551615u64, "u64 0-1 wraps to MAX")
+
+    // ─── 5. f64 特殊值 ───
+    println("--- f64 Special Values ---")
+    val f64_inf: f64 = 1.0f64 / 0.0f64
+    val f64_neg_inf: f64 = -1.0f64 / 0.0f64
+    val f64_nan: f64 = 0.0f64 / 0.0f64
+    val f64_zero: f64 = 0.0f64
+    val f64_neg_zero: f64 = -0.0f64
+    check(f64_inf == 1.0f64 / 0.0f64, "f64 +Inf identity")
+    check(f64_neg_inf == -1.0f64 / 0.0f64, "f64 -Inf identity")
+    check(f64_nan != f64_nan, "f64 NaN != NaN")
+    check(!(f64_nan == f64_nan), "f64 NaN not == itself")
+    check(f64_inf > 0.0f64, "f64 +Inf > 0")
+    check(f64_neg_inf < 0.0f64, "f64 -Inf < 0")
+    check(f64_neg_zero == 0.0f64, "f64 -0.0 == 0.0")
+    check(1.0f64 / f64_neg_zero == f64_neg_inf, "f64 1/(-0.0) = -Inf")
+    check(1.0f64 / f64_zero == f64_inf, "f64 1/(+0.0) = +Inf")
+    check(f64_inf + f64_inf == f64_inf, "f64 Inf+Inf = Inf")
+    check(f64_inf - f64_inf != f64_inf, "f64 Inf-Inf = NaN (not Inf)")
+    check(f64_inf * 0.0f64 != f64_inf, "f64 Inf*0 = NaN (not Inf)")
+    check(0.1f64 + 0.2f64 != 0.3f64, "f64 0.1+0.2 != 0.3 (precision)")
+
+    // ─── 6. f16 基本运算与边界 ───
+    println("--- f16 ---")
+    val f16_one: f16 = 1.0f16
+    val f16_two: f16 = 2.0f16
+    check(f16_one + f16_one == f16_two, "f16 1+1 == 2")
+    check(f16_one - f16_one == 0.0f16, "f16 1-1 == 0")
+    val f16_max: f16 = 65504.0f16
+    check(f16_max == 65504.0f16, "f16 MAX = 65504")
+    val f16_nan: f16 = 0.0f16 / 0.0f16
+    check(f16_nan != f16_nan, "f16 NaN != NaN")
+    val f16_inf: f16 = 1.0f16 / 0.0f16
+    check(f16_inf == 1.0f16 / 0.0f16, "f16 +Inf identity")
+    check(f16_inf > 0.0f16, "f16 +Inf > 0")
+
+    // ─── 7. f128 基本运算与边界 ───
+    println("--- f128 ---")
+    // 使用十六进制浮点字面量表示 pi（避免科学计数法 Bug #20）
+    // 0x1.921fb54442d18p+1 = 3.141592653589793...
+    val f128_pi: f128 = 0x1.921fb54442d18p+1f128
+    check(f128_pi > 3.0f128, "f128 hex pi > 3")
+    check(f128_pi < 4.0f128, "f128 hex pi < 4")
+    val f128_one: f128 = 1.0f128
+    check(f128_one + f128_one == 2.0f128, "f128 1+1 == 2")
+    val f128_nan: f128 = 0.0f128 / 0.0f128
+    check(f128_nan != f128_nan, "f128 NaN != NaN")
+    val f128_inf: f128 = 1.0f128 / 0.0f128
+    check(f128_inf == 1.0f128 / 0.0f128, "f128 +Inf identity")
+
+    // ─── 8. 混合整数运算（显式 cast）───
+    println("--- Mixed Arithmetic (cast) ---")
+    val i32_v: i32 = 1000000i32
+    val i64_v: i64 = cast(i32_v).to(i64) * cast(i32_v).to(i64)
+    check(i64_v == 1000000000000i64, "i32->i64 promotion avoids overflow")
+    check(cast(42i8).to(i64) == 42i64, "widen i8 to i64")
+    check(cast(1000i32).to(i64) == 1000i64, "widen i32 to i64")
+    check(cast(127i8).to(i32) == 127, "widen i8 MAX to i32")
+    check(cast((-128i8)).to(i32) == -128, "widen i8 MIN to i32")
+    val mixed: i64 = cast(100i32).to(i64) + cast(200i32).to(i64)
+    check(mixed == 300i64, "cast in expression sum")
+    // 链式 cast
+    check(cast(cast(65i32).to(i64)).to(i8) == 65i8, "chained i32->i64->i8")
+
+    // ─── 9. char 边界值 ───
+    println("--- char ---")
+    val c_a: char = 'A'
+    val c_zero: char = '0'
+    val c_lower: char = 'z'
+    check(c_a == 'A', "char A equality")
+    check(cast(c_a).to(i32) == 65, "char A to i32 = 65")
+    check(cast(c_zero).to(i32) == 48, "char 0 to i32 = 48")
+    check(cast(c_lower).to(i32) == 122, "char z to i32 = 122")
+    check(cast(65i32).to(char) == 'A', "i32 65 to char A")
+    // ASCII 范围边界
+    check(cast(' ').to(i32) == 32, "char space to i32 = 32")
+    check(cast('~').to(i32) == 126, "char tilde to i32 = 126")
+    // Unicode 字符
+    val c_cjk: char = '你'
+    check(c_cjk == '你', "unicode char 你 equality")
+    check(cast(c_cjk).to(i32) == 20320, "char 你 to i32 = 20320")
+    val c_euro: char = '€'
+    check(cast(c_euro).to(i32) == 8364, "char € to i32 = 8364")
+    // 空字符：'\0' 字面量可能不支持，用 cast(0i32).to(char) 构造
+    val c_null: char = cast(0i32).to(char)
+    check(cast(c_null).to(i32) == 0, "null char via cast(0) roundtrip = 0")
+
+    // ─── 10. bool 边缘 ───
+    println("--- bool ---")
+    check(true == true, "true == true")
+    check(false == false, "false == false")
+    check(true != false, "true != false")
+    check(!true == false, "!true == false")
+    check(!false == true, "!false == true")
+    check(!!true == true, "!!true == true")
+    check(!!!false == true, "!!!false == true")
+    check(true && true, "true && true")
+    check(false || true, "false || true")
+    check((true && false) == false, "true && false == false")
+    check((false || false) == false, "false || false == false")
+    // bool 比较链
+    val b1: bool = true
+    val b2: bool = false
+    check(b1 != b2, "bool var inequality")
+    check(b1 == !b2, "b1 == !b2")
+
+    // ─── 12. 有符号/无符号转换 ───
+    println("--- Signed/Unsigned Conversion ---")
+    check(cast((-1i8)).to(u8) == 255u8, "i8 -1 to u8 = 255")
+    check(cast((-1i32)).to(u8) == 255u8, "i32 -1 to u8 = 255")
+    check(cast((-1i32)).to(u32) == 4294967295u32, "i32 -1 to u32 = MAX")
+    check(cast((-1i64)).to(u64) == 18446744073709551615u64, "i64 -1 to u64 = MAX")
+    check(cast(255u8).to(i8) == -1i8, "u8 255 to i8 = -1")
+    check(cast(200u8).to(i8) == -56i8, "u8 200 to i8 = -56")
+    check(cast(127u8).to(i8) == 127i8, "u8 127 to i8 = 127 (in range)")
+    // narrowing wrap
+    check(cast(300i32).to(i8) == 44i8, "i32 300 to i8 = 44 (wrap)")
+    check(cast(256i32).to(u8) == 0u8, "i32 256 to u8 = 0 (wrap)")
+    // widening unsigned
+    check(cast(200u8).to(u16) == 200u16, "u8 200 to u16 = 200")
+    check(cast(200u8).to(u32) == 200u32, "u8 200 to u32 = 200")
+
+    // ─── 13. 浮点 ↔ 整数截断（向零截断）───
+    println("--- Float/Int Truncation ---")
+    check(cast(2.7f64).to(i32) == 2, "f64 2.7 -> i32 = 2 (trunc toward 0)")
+    check(cast((-2.7f64)).to(i32) == -2, "f64 -2.7 -> i32 = -2 (trunc toward 0)")
+    check(cast(2.0f64).to(i32) == 2, "f64 2.0 -> i32 = 2 (exact)")
+    check(cast(0.999f64).to(i32) == 0, "f64 0.999 -> i32 = 0")
+    check(cast((-0.999f64)).to(i32) == 0, "f64 -0.999 -> i32 = 0")
+    check(cast(3.14f64).to(i64) == 3i64, "f64 3.14 -> i64 = 3")
+
+    // ─── 14. i64 → f64 → i64 精度损失（> 2^53） ───
+    println("--- i64/f64 Precision Loss ---")
+    // 2^53 + 1 = 9007199254740993，f64 无法表示（最近表示为 9007199254740992.0）
+    val precise: i64 = 9007199254740993i64
+    val lost: i64 = cast(cast(precise).to(f64)).to(i64)
+    check(lost == 9007199254740992i64, "i64 2^53+1 -> f64 -> i64 loses +1")
+    // 2^53 可精确表示
+    val exact53: i64 = 9007199254740992i64
+    check(cast(cast(exact53).to(f64)).to(i64) == exact53, "i64 2^53 exact in f64")
+    // 小 i64 往返无损
+    check(cast(cast(123456789i64).to(f64)).to(i64) == 123456789i64, "small i64 roundtrip f64 exact")
+
+    // ─── 15. NaN 全比较矩阵 ───
+    println("--- NaN Comparison Matrix ---")
+    val nn: f64 = 0.0f64 / 0.0f64
+    check(!(nn == 0.0f64), "NaN == 0.0 is false")
+    check(nn != 0.0f64, "NaN != 0.0 is true (IEEE 754 unordered)")
+    check(nn != nn, "NaN != NaN is true (IEEE 754 unordered, unlike ==)")
+    check(!(nn < 0.0f64), "NaN < 0.0 is false")
+    check(!(nn > 0.0f64), "NaN > 0.0 is false")
+    check(!(nn <= 0.0f64), "NaN <= 0.0 is false")
+    check(!(nn >= 0.0f64), "NaN >= 0.0 is false")
+    check(!(nn == nn), "NaN == NaN is false")
+    // 注意：Glue 的 != 对 NaN 语义需验证；这里断言 unordered 行为
+    check(!(nn < nn), "NaN < NaN is false")
+
+    // ─── 16. Inf 完整算术矩阵 ───
+    println("--- Inf Arithmetic Matrix ---")
+    val pinf: f64 = 1.0f64 / 0.0f64
+    val ninf: f64 = -1.0f64 / 0.0f64
+    check(pinf * 2.0f64 == pinf, "Inf * 2 = Inf")
+    check(pinf + 1.0f64 == pinf, "Inf + 1 = Inf")
+    check(pinf - 1.0f64 == pinf, "Inf - 1 = Inf")
+    check(pinf / pinf != pinf, "Inf / Inf = NaN (not Inf)")
+    check(pinf * 0.0f64 != pinf, "Inf * 0 = NaN (not Inf)")
+    check(pinf - pinf != pinf, "Inf - Inf = NaN (not 0/Inf)")
+    check(ninf < pinf, "-Inf < +Inf")
+    check(!(pinf < ninf), "+Inf < -Inf is false")
+    check(ninf == ninf, "-Inf == -Inf (not NaN)")
+
+    // ─── 17. 负数 mod / div 边界 ───
+    println("--- Negative div/mod Boundaries ---")
+    check((-7i32) % 3 == -1, "-7 % 3 = -1 (truncated)")
+    check(7i32 % (-3) == 1, "7 % -3 = 1 (truncated)")
+    check((-7i32) % (-3) == -1, "-7 % -3 = -1")
+    // div/mod 不变式在负数
+    val pa: i32 = -100
+    val pb: i32 = 7
+    check((pa / pb) * pb + (pa % pb) == pa, "div/mod invariant negative operands")
+
+    // Bug #22: 有符号 MIN / -1 使用 wrapping 语义（不再 panic）
+    // i32::MIN / -1 在 wrapping 语义下回绕为 i32::MIN（符号位翻转溢出）
+    check((-2147483648i32) / (-1i32) == -2147483648i32, "i32 MIN / -1 wraps to MIN (Bug #22)")
+    check((-2147483648i32) % (-1i32) == 0, "i32 MIN % -1 = 0 (Bug #22)")
+    check((-9223372036854775808i64) / (-1i64) == -9223372036854775808i64, "i64 MIN / -1 wraps to MIN (Bug #22)")
+    check((-9223372036854775808i64) % (-1i64) == 0, "i64 MIN % -1 = 0 (Bug #22)")
+    check((-128i8) / (-1i8) == -128i8, "i8 MIN / -1 wraps to MIN (Bug #22)")
+    check((-32768i16) / (-1i16) == -32768i16, "i16 MIN / -1 wraps to MIN (Bug #22)")
+    check((-170141183460469231731687303715884105728i128) / (-1i128) == -170141183460469231731687303715884105728i128, "i128 MIN / -1 wraps to MIN (Bug #22)")
+
+    // ─── 18. f32 ↔ f64 窄化（精度损失）───
+    println("--- f32/f64 Narrowing ---")
+    // f64 -> f32 会丢失精度
+    val wide_pi: f64 = 3.141592653589793f64
+    val narrow_pi: f32 = cast(wide_pi).to(f32)
+    val back: f64 = cast(narrow_pi).to(f64)
+    check(back != wide_pi, "f64 pi -> f32 -> f64 loses precision")
+    check(back == 3.1415927f32, "f32 pi roundtrips")  // 注意需用 f32 字面量比较
+
+    summary()
+}
+
+// ─── 新发现限制汇总 ───
+//
+// Limit-A (已修复，Bug #25): u128 MAX 字面量现已可直接表示
+//   修复: Builder.rs parse_const_value 对 u128 suffix 走独立 u128::from_str_radix 路径，
+//         覆盖完整 0..=2^128-1 范围，不再经 i128 中转。

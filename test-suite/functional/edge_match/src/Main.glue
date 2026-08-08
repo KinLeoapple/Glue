@@ -1,0 +1,475 @@
+// 大胆模式匹配边缘测试：深嵌套 ADT/newtype/nullable/多 guard 链/嵌套 match/match 表达式/ADT 数组 match
+//
+// 已知 bug 绕过（见 BUG_REPORT.md）：
+//   Bug #18: return 语句静默退出          → 使用 if-as-expression，不用 return
+//   Bug #19: 嵌套函数不能自递归           → 递归函数放顶层
+//   Bug #21: i32 超范围字面量静默退出     → 字面量加显式类型后缀
+//   Bug #29: 嵌套模式 Error(Error(v)) i32 丢失类型信息 → cast 恢复
+//   Bug #35: ADT 变体模式变量遮蔽函数参数 → 已修复（flow narrowing 跳过被遮蔽的 scrutinee fact）
+//   Bug #37: while 条件调用用户函数 hang  → 不在 while 条件中调用 match 函数
+//   Bug #38: &&/|| 不短路                 → guard 中不依赖 &&/|| 副作用
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 递归 ADT：二叉树 + 链表 ───
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+type List =
+    | Nil
+    | Cons(i32, List)
+
+// ─── 多变体带数据 ───
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+    | Triangle(f64, f64, f64)
+    | Square(f64)
+
+// ─── newtype ───
+type Meters = Meters(f64)
+type Celsius = Celsius(f64)
+
+// ─── Bug #35 验证用：ADT 变体模式变量遮蔽函数参数 ───
+type W3 = | W3(f64)
+type W2 = | W2(i32)
+
+// ─── 顶层递归函数 ───
+fun treeSum(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(v, l, r) => v + treeSum(l) + treeSum(r)
+    }
+}
+
+fun listLen(l: List): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + listLen(t)
+    }
+}
+
+// 深嵌套模式（4 层）
+fun deepExtract(t: Tree): i32 {
+    match t {
+        Node(_, Node(_, Node(x, _, _), _), _) => x
+        Node(_, Node(x, _, _), _) => x * 10
+        Node(x, _, _) => x * 100
+        Leaf => -1
+    }
+}
+
+// 多 guard 链
+fun classify(n: i32): str {
+    match n {
+        0 => "zero"
+        n if n < 0 => "negative"
+        n if n > 0 && n < 10 => "small"   // Bug #38: && 不短路但结果值正确
+        n if n >= 10 && n < 100 => "medium"
+        _ => "large"
+    }
+}
+
+// match 表达式作为返回值
+fun describe(b: bool): str {
+    match b {
+        true => "yes"
+        false => "no"
+    }
+}
+
+// match on nullable
+fun optStr(o: i32?): str {
+    match o {
+        null => "none"
+        v => "some:{v}"
+    }
+}
+
+// match on newtype
+fun toCelsius(m: Meters): f64 {
+    match m {
+        Meters(v) => v
+    }
+}
+
+// match on char 范围（用 guard）
+fun charKind(c: char): str {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => "vowel"
+        c if c >= '0' && c <= '9' => "digit"
+        c if c >= 'A' && c <= 'Z' => "upper"
+        c if c >= 'a' && c <= 'z' => "lower"
+        _ => "other"
+    }
+}
+
+fun main(): void {
+    println("=== Edge Match ===")
+
+    // ─── 1. 深嵌套模式（4 层 Tree）───
+    println("--- Deep Nested Patterns (4-layer) ---")
+    val t4 = Node(1, Node(2, Node(3, Leaf, Leaf), Leaf), Leaf)
+    check(deepExtract(t4) == 3, "4-layer extract inner x=3")
+    val t3 = Node(1, Node(2, Leaf, Leaf), Leaf)
+    check(deepExtract(t3) == 20, "3-layer extract x=2 *10")
+    val t2 = Node(7, Leaf, Leaf)
+    check(deepExtract(t2) == 700, "2-layer extract x=7 *100")
+    check(deepExtract(Leaf) == -1, "Leaf -> -1")
+
+    // ─── 2. 多 guard 链 ───
+    println("--- Multi-guard Chains ---")
+    check(classify(0) == "zero", "classify 0 = zero")
+    check(classify(-5) == "negative", "classify -5 = negative")
+    check(classify(5) == "small", "classify 5 = small")
+    check(classify(50) == "medium", "classify 50 = medium")
+    check(classify(500) == "large", "classify 500 = large")
+    check(classify(9) == "small", "classify 9 = small (boundary)")
+    check(classify(10) == "medium", "classify 10 = medium (boundary)")
+    check(classify(99) == "medium", "classify 99 = medium (boundary)")
+    check(classify(100) == "large", "classify 100 = large (boundary)")
+
+    // ─── 3. match on bool ───
+    println("--- Match on bool ---")
+    check(describe(true) == "yes", "describe true = yes")
+    check(describe(false) == "no", "describe false = no")
+    val bool_val: bool = true
+    val r = match bool_val {
+        true => 1
+        false => 0
+    }
+    check(r == 1, "match expression on bool var")
+
+    // ─── 4. match on nullable ───
+    println("--- Match on Nullable ---")
+    check(optStr(null) == "none", "optStr null = none")
+    check(optStr(42i32) == "some:42", "optStr 42 = some:42")
+    val opt_v: i32? = 99i32
+    check(optStr(opt_v) == "some:99", "optStr var 99")
+    val opt_n: i32? = null
+    check(optStr(opt_n) == "none", "optStr var null")
+    // match nullable with ?? 对照
+    check((opt_v ?? 0i32) == 99, "?? on Some = 99")
+    check((opt_n ?? 0i32) == 0, "?? on null = 0")
+
+    // ─── 5. match on newtype ───
+    println("--- Match on Newtype ---")
+    check(toCelsius(Meters(5.0f64)) == 5.0f64, "newtype Meters unpack 5.0")
+    check(toCelsius(Meters(100.0f64)) == 100.0f64, "newtype Meters unpack 100.0")
+    // 直接 match 表达式
+    val m_val = match Meters(3.14f64) {
+        Meters(v) => v
+    }
+    check(m_val == 3.14f64, "match expression on newtype literal")
+    // Celsius newtype
+    val c_val = match Celsius(36.6f64) {
+        Celsius(t) => t
+    }
+    check(c_val == 36.6f64, "Celsius newtype unpack 36.6")
+
+    // ─── 6. match on char（or-pattern + guard 范围）───
+    println("--- Match on char (or-pattern + guard) ---")
+    check(charKind('a') == "vowel", "char a = vowel")
+    check(charKind('e') == "vowel", "char e = vowel")
+    check(charKind('z') == "lower", "char z = lower")
+    check(charKind('A') == "upper", "char A = upper")
+    check(charKind('Z') == "upper", "char Z = upper")
+    check(charKind('5') == "digit", "char 5 = digit")
+    check(charKind('0') == "digit", "char 0 = digit")
+    check(charKind('9') == "digit", "char 9 = digit")
+    check(charKind(' ') == "other", "char space = other")
+    check(charKind('!') == "other", "char ! = other")
+
+    // ─── 7. match on f64 特殊值 ───
+    println("--- Match on f64 Special Values (Bug #42 probe) ---")
+    fun classify_f64(x: f64): str {
+        match x {
+            0.0f64 => "zero"
+            x if x < 0.0f64 => "negative"
+            x if x > 0.0f64 => "positive"
+            _ => "nan"
+        }
+    }
+    // Bug #42：match on f64 失效。探测实际返回值
+    println("  INFO: classify_f64(0.0) = {classify_f64(0.0f64)} (expected 'zero')")
+    println("  INFO: classify_f64(-1.5) = {classify_f64(-1.5f64)} (expected 'negative')")
+    println("  INFO: classify_f64(3.14) = {classify_f64(3.14f64)} (expected 'positive')")
+    val nan: f64 = 0.0f64 / 0.0f64
+    println("  INFO: classify_f64(NaN) = {classify_f64(nan)} (expected 'nan')")
+    check(classify_f64(0.0f64) == "zero", "Bug #42: f64 zero (currently fails)")
+    check(classify_f64(-1.5f64) == "negative", "Bug #42: f64 negative (currently fails)")
+    check(classify_f64(3.14f64) == "positive", "Bug #42: f64 positive (currently fails)")
+    check(classify_f64(nan) == "nan", "Bug #42: f64 NaN -> nan (currently fails)")
+
+    // ─── 8. 嵌套 match 表达式 ───
+    println("--- Nested Match Expressions ---")
+    fun nestedMatch(a: i32, b: i32): str {
+        match a {
+            0 => match b {
+                0 => "both zero"
+                _ => "a zero b nonzero"
+            }
+            _ => match b {
+                0 => "a nonzero b zero"
+                _ => "both nonzero"
+            }
+        }
+    }
+    check(nestedMatch(0, 0) == "both zero", "nested (0,0)")
+    check(nestedMatch(0, 5) == "a zero b nonzero", "nested (0,5)")
+    check(nestedMatch(5, 0) == "a nonzero b zero", "nested (5,0)")
+    check(nestedMatch(3, 4) == "both nonzero", "nested (3,4)")
+
+    // ─── 9. or-pattern 变体（多 ADT 变体）───
+    println("--- Or-pattern on ADT Variants ---")
+    fun isPrimary(s: Shape): bool {
+        match s {
+            Circle(_) | Square(_) => true
+            _ => false
+        }
+    }
+    check(isPrimary(Circle(1.0f64)) == true, "Circle is primary")
+    check(isPrimary(Square(2.0f64)) == true, "Square is primary")
+    check(isPrimary(Rect(1.0f64, 2.0f64)) == false, "Rect not primary")
+    check(isPrimary(Triangle(1.0f64, 2.0f64, 3.0f64)) == false, "Triangle not primary")
+
+    // ─── 10. match 提取值参与运算 ───
+    println("--- Match Value Extraction & Arithmetic ---")
+    // Bug #35 已修复：模式变量名可与函数参数同名（遮蔽），f64 二元运算正确
+    fun doubleShape(s: Shape): Shape {
+        match s {
+            Circle(r) => Circle(r * 2.0f64)
+            Rect(w, h) => Rect(w * 2.0f64, h * 2.0f64)
+            Triangle(a, b, c) => Triangle(a * 2.0f64, b * 2.0f64, c * 2.0f64)
+            Square(s) => Square(s * 2.0f64)
+        }
+    }
+    check(doubleShape(Circle(2.0f64)) == Circle(4.0f64), "double circle")
+    check(doubleShape(Rect(1.5f64, 2.5f64)) == Rect(3.0f64, 5.0f64), "double rect")
+    check(doubleShape(Square(5.0f64)) == Square(10.0f64), "double square (Bug #35 shadow)")
+
+    // Bug #35 专门验证：ADT 变体模式变量遮蔽函数参数 + f64 二元运算
+    type W3 = | W3(f64)
+    type W2 = | W2(i32)
+    fun doubleF64(w: W3): f64 {
+        match w {
+            W3(w) => w * w
+        }
+    }
+    fun addOneF64(w: W3): f64 {
+        match w {
+            W3(w) => w + 1.0f64
+        }
+    }
+    fun doubleI32(w: W2): i32 {
+        match w {
+            W2(w) => w + w
+        }
+    }
+    check(doubleF64(W3(5.0f64)) == 25.0f64, "Bug #35: f64 shadow w*w = 25.0")
+    check(addOneF64(W3(5.0f64)) == 6.0f64, "Bug #35: f64 shadow w+1 = 6.0")
+    check(doubleI32(W2(42i32)) == 84i32, "Bug #35: i32 shadow w+w = 84")
+    // 不遮蔽的情况仍正常
+    fun doubleF64NoShadow(w: W3): f64 {
+        match w {
+            W3(v) => v * v
+        }
+    }
+    check(doubleF64NoShadow(W3(5.0f64)) == 25.0f64, "Bug #35: f64 no shadow v*v = 25.0")
+
+    // ─── 11. match 提取后条件判断 ───
+    println("--- Match Extract + Conditional ---")
+    fun shapeKind(s: Shape): str {
+        match s {
+            Circle(r) if r > 0.0f64 => "big-circle"
+            Circle(_) => "small-circle"
+            Rect(w, h) if w == h => "square-like"
+            Rect(_, _) => "rect"
+            Triangle(_, _, _) => "triangle"
+            Square(_) => "square"
+        }
+    }
+    check(shapeKind(Circle(5.0f64)) == "big-circle", "circle r>0 = big-circle")
+    check(shapeKind(Circle(0.0f64)) == "small-circle", "circle r=0 = small-circle")
+    check(shapeKind(Rect(3.0f64, 3.0f64)) == "square-like", "rect w==h = square-like")
+    check(shapeKind(Rect(3.0f64, 4.0f64)) == "rect", "rect w!=h = rect")
+    check(shapeKind(Triangle(1.0f64, 2.0f64, 3.0f64)) == "triangle", "triangle")
+    check(shapeKind(Square(2.0f64)) == "square", "square")
+
+    // ─── 12. 递归 ADT + match（链表/树）───
+    println("--- Recursive ADT + Match ---")
+    val list = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    check(listLen(list) == 4, "list length 4")
+    check(treeSum(Node(1, Node(2, Leaf, Leaf), Node(3, Leaf, Leaf))) == 6, "tree sum")
+
+    // match 链表头
+    fun headOr(l: List, default: i32): i32 {
+        match l {
+            Nil => default
+            Cons(h, _) => h
+        }
+    }
+    check(headOr(list, 0) == 1, "list head = 1")
+    check(headOr(Nil, 99) == 99, "empty list head = default 99")
+
+    // ─── 13. match on str 字面量 ───
+    println("--- Match on str Literals ---")
+    fun command(cmd: str): i32 {
+        match cmd {
+            "go" | "move" => 1
+            "stop" | "halt" => 2
+            "quit" | "exit" => 3
+            "" => -1
+            _ => 0
+        }
+    }
+    check(command("go") == 1, "cmd go")
+    check(command("move") == 1, "cmd move")
+    check(command("stop") == 2, "cmd stop")
+    check(command("halt") == 2, "cmd halt")
+    check(command("quit") == 3, "cmd quit")
+    check(command("exit") == 3, "cmd exit")
+    check(command("") == -1, "cmd empty")
+    check(command("xyz") == 0, "cmd unknown")
+
+    // ─── 14. match 表达式绑定 ───
+    println("--- Match Expression Binding ---")
+    val m1 = match 5 {
+        0 => "z"
+        _ => "nz"
+    }
+    check(m1 == "nz", "match expr to val")
+    val m2 = match "hi" {
+        "hi" => 1
+        _ => 0
+    }
+    check(m2 == 1, "match str expr to val")
+
+    // ─── 15. 大胆：match on ADT 数组 ───
+    println("--- Match on ADT Array ---")
+    val shapes = [Circle(1.0f64), Rect(2.0f64, 3.0f64), Square(4.0f64)]
+    check(shapes[0] == Circle(1.0f64), "shapes[0] match Circle")
+    check(shapes[1] == Rect(2.0f64, 3.0f64), "shapes[1] match Rect")
+    // match 取出数组元素
+    fun firstShape(s: Shape[]): str {
+        match s[0] {
+            Circle(_) => "circle"
+            Rect(_, _) => "rect"
+            Square(_) => "square"
+            Triangle(_, _, _) => "triangle"
+        }
+    }
+    check(firstShape(shapes) == "circle", "first shape = circle")
+    // 数组中所有 shape 分类
+    var si: i32 = 0
+    var circle_count: i32 = 0
+    while si < shapes.len() {
+        match shapes[si] {
+            Circle(_) => { circle_count = circle_count + 1 }
+            _ => { }
+        }
+        si = si + 1
+    }
+    check(circle_count == 1, "1 circle in shapes array")
+
+    // ─── 16. 大胆：match 中使用捕获变量参与 guard ───
+    println("--- Match with Guard Using Capture ---")
+    fun range(n: i32): str {
+        match n {
+            x if x < 0 => "neg"
+            x if x == 0 => "zero"
+            x if x < 10 => "small"
+            x if x < 100 => "medium"
+            _ => "large"
+        }
+    }
+    check(range(-1) == "neg", "range -1 = neg")
+    check(range(0) == "zero", "range 0 = zero")
+    check(range(5) == "small", "range 5 = small")
+    check(range(50) == "medium", "range 50 = medium")
+    check(range(500) == "large", "range 500 = large")
+
+    // ─── 17. 大胆：通配符与变量混合深嵌套 ───
+    println("--- Wildcard + Variable Deep Mix ---")
+    fun classifyNode(t: Tree): str {
+        match t {
+            Leaf => "leaf"
+            Node(v, Leaf, Leaf) => "leaf-leaf:{v}"
+            Node(v, Leaf, _) => "has-right:{v}"
+            Node(v, _, Leaf) => "has-left:{v}"
+            Node(v, _, _) => "both:{v}"
+        }
+    }
+    check(classifyNode(Leaf) == "leaf", "classify leaf")
+    check(classifyNode(Node(1, Leaf, Leaf)) == "leaf-leaf:1", "classify leaf-leaf:1")
+    check(classifyNode(Node(2, Leaf, Node(9, Leaf, Leaf))) == "has-right:2", "classify has-right:2")
+    check(classifyNode(Node(3, Node(8, Leaf, Leaf), Leaf)) == "has-left:3", "classify has-left:3")
+    check(classifyNode(Node(4, Node(5, Leaf, Leaf), Node(6, Leaf, Leaf))) == "both:4", "classify both:4")
+
+    // ─── 18. 大胆：match 提取 record 字段并参与运算 ───
+    println("--- Match Record Field Extraction ---")
+    type Pt = Pt(x: i32, y: i32)
+    type Seg = Seg(a: Pt, b: Pt)
+    fun segLen(s: Seg): i32 {
+        match s {
+            Seg(Pt(x1, y1), Pt(x2, y2)) => (x2 - x1) + (y2 - y1)
+        }
+    }
+    check(segLen(Seg(Pt(0, 0), Pt(3, 4))) == 7, "seg len 3+4=7")
+    check(segLen(Seg(Pt(10, 20), Pt(30, 40))) == 40, "seg len 20+20=40")
+
+    // ─── 19. 大胆：match on 链表深递归（10 层）───
+    println("--- Match on Deep Recursive List ---")
+    var deep: List = Nil
+    var di: i32 = 0
+    while di < 10 {
+        deep = Cons(di, deep)
+        di = di + 1
+    }
+    check(listLen(deep) == 10, "10-deep list length")
+    // match 第一个元素
+    fun firstOf(l: List): i32 {
+        match l {
+            Nil => -1
+            Cons(h, _) => h
+        }
+    }
+    check(firstOf(deep) == 9, "first of 10-deep list = 9")
+
+    // ─── 20. 大胆：match 表达式嵌套 + 复杂 guard ───
+    println("--- Complex Nested Match + Guard ---")
+    fun fizzbuzz(n: i32): str {
+        match n {
+            n if n % 15 == 0 => "fizzbuzz"
+            n if n % 3 == 0 => "fizz"
+            n if n % 5 == 0 => "buzz"
+            _ => "{n}"
+        }
+    }
+    check(fizzbuzz(15) == "fizzbuzz", "fizzbuzz 15")
+    check(fizzbuzz(3) == "fizz", "fizz 3")
+    check(fizzbuzz(5) == "buzz", "buzz 5")
+    check(fizzbuzz(7) == "7", "fizzbuzz 7 = '7'")
+    check(fizzbuzz(30) == "fizzbuzz", "fizzbuzz 30")
+    check(fizzbuzz(9) == "fizz", "fizz 9")
+
+    summary()
+}

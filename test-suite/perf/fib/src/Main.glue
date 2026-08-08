@@ -1,0 +1,40 @@
+// 性能测试：Fibonacci 递归（压测函数调用栈/递归/整数算术）
+
+fun fib(n: i64): i64 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fun fib_iter(n: i64): i64 {
+    var a: i64 = 0
+    var b: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        val tmp = a + b
+        a = b
+        b = tmp
+        i = i + 1
+    }
+    a
+}
+
+fun main(): void {
+    println("=== Fibonacci Benchmark ===")
+
+    // 递归版 fib(28)
+    val t0 = __instant_now_ns()
+    val result1 = fib(28)
+    val t1 = __instant_now_ns()
+    println("fib(28) recursive = {result1}")
+    val elapsed1 = (t1 - t0) / 1000000i64
+    println("elapsed: {elapsed1} ms")
+
+    // 迭代版 fib(100000)
+    val t2 = __instant_now_ns()
+    val result2 = fib_iter(100000)
+    val t3 = __instant_now_ns()
+    println("fib(100000) iterative = {result2}")
+    val elapsed2 = (t3 - t2) / 1000000i64
+    println("elapsed: {elapsed2} ms")
+
+    println("=== Done ===")
+}

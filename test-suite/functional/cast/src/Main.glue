@@ -1,0 +1,204 @@
+// 功能验证：类型转换（widening/narrowing/int-float/链式cast）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Cast ===")
+
+    // Widening: i8 → i16 → i32 → i64
+    check(cast(42i8).to(i64) == 42i64, "widen i8 to i64")
+    check(cast(100i16).to(i32) == 100, "widen i16 to i32")
+    check(cast(1000i32).to(i64) == 1000i64, "widen i32 to i64")
+
+    // Narrowing: wrapping
+    check(cast(300i32).to(i8) == 44, "narrow i32 300 to i8 (wrap)")
+    check(cast(256i32).to(u8) == 0, "narrow i32 256 to u8 (wrap)")
+    check(cast((-1i32)).to(u8) == 255, "narrow i32 -1 to u8 (wrap)")
+    check(cast(50000u16).to(u8) == 80, "narrow u16 50000 to u8 (wrap)")
+
+    // Int → Float
+    check(cast(42i32).to(f64) == 42.0f64, "i32 to f64")
+    check(cast(0i32).to(f64) == 0.0f64, "zero i32 to f64")
+
+    // Float → Int (truncation)
+    check(cast(3.14f64).to(i32) == 3, "f64 3.14 to i32 truncate")
+    check(cast(3.99f64).to(i32) == 3, "f64 3.99 to i32 truncate")
+    check(cast((-2.7f64)).to(i32) == -2, "f64 -2.7 to i32 truncate")
+
+    // 链式 cast
+    check(cast(cast(100i32).to(i64)).to(i8) == 100, "chained i32->i64->i8")
+
+    // cast 在算术中
+    val a: i32 = 100
+    val b: i64 = cast(a).to(i64) * 2i64
+    check(b == 200i64, "cast in arithmetic")
+
+    // signed <-> unsigned
+    val neg: i8 = -1
+    check(cast(neg).to(u8) == 255, "i8 -1 to u8")
+    check(cast(neg).to(i64) == -1i64, "i8 -1 to i64 (sign extend)")
+
+    // widening u8 -> u16 -> u32
+    val u8v: u8 = 200
+    check(cast(u8v).to(u16) == 200, "u8 to u16")
+    check(cast(u8v).to(u32) == 200, "u8 to u32")
+
+    // narrowing i64 -> i16 (in range)
+    val big: i64 = 1000
+    check(cast(big).to(i16) == 1000, "i64 to i16 in range")
+
+    // char <-> int
+    val c: char = 'A'
+    check(cast(c).to(i32) == 65, "char A to i32")
+
+    // int -> str
+    check(cast(42i32).to(str) == "42", "i32 to str")
+    check(cast(0i32).to(str) == "0", "zero to str")
+
+    // float -> str
+    check(cast(true).to(str) == "true", "bool true to str")
+    check(cast(false).to(str) == "false", "bool false to str")
+
+    // 嵌套泛型 cast：cast(cast(x).to(f64)).to(T)
+    check(double_cast(3.14) == 3.14, "nested cast f64 roundtrip")
+    check(double_cast(42) == 42, "nested cast i32 roundtrip")
+
+    // ─── Cast 边缘测试 ───
+
+    // cast 边界值
+    check(cast(127i8).to(i32) == 127, "i8 MAX to i32")
+    check(cast((-128i8)).to(i32) == -128, "i8 MIN to i32")
+    check(cast(255u8).to(i32) == 255, "u8 MAX to i32")
+
+    // cast 0 值
+    check(cast(0i32).to(f64) == 0.0f64, "zero i32 to f64")
+    check(cast(0i64).to(f64) == 0.0f64, "zero i64 to f64")
+
+    // cast 负数到无符号
+    check(cast((-1i32)).to(u8) == 255, "i32 -1 to u8")
+    check(cast((-1i64)).to(u8) == 255, "i64 -1 to u8")
+
+    // cast f64 边界
+    check(cast(0.0f64).to(i32) == 0, "f64 0.0 to i32")
+    check(cast((-0.0f64)).to(i32) == 0, "f64 -0.0 to i32")
+
+    // 链式 cast（3 层）
+    check(cast(cast(cast(65i32).to(i64)).to(i8)).to(i32) == 65, "3-layer chain cast")
+
+    // cast 在表达式中
+    val mixed: i64 = cast(100i32).to(i64) + cast(200i32).to(i64)
+    check(mixed == 300, "cast in expression sum")
+
+    // cast bool -> str（已在上文测试）
+    // bool -> int 不支持，跳过
+
+    // cast char 边界
+    check(cast('A').to(i32) == 65, "char A to i32")
+    check(cast('a').to(i32) == 97, "char a to i32")
+    check(cast('0').to(i32) == 48, "char 0 to i32")
+
+    // cast i32 -> char
+    check(cast(65i32).to(char) == 'A', "i32 65 to char A")
+
+    // cast 负数 f64 -> i32
+    check(cast((-3.7f64)).to(i32) == -3, "f64 -3.7 to i32 truncate")
+    check(cast((-0.5f64)).to(i32) == 0, "f64 -0.5 to i32 truncate")
+
+    // cast 大整数 narrowing
+    check(cast(32767i32).to(i16) == 32767, "i32 MAX i16 to i16 (in range)")
+    check(cast(32768i32).to(i16) == -32768, "i32 32768 to i16 (wrap to MIN)")
+
+    // cast u8 -> i8 (高位变符号)
+    check(cast(200u8).to(i8) == -56, "u8 200 to i8 (sign bit)")
+    check(cast(127u8).to(i8) == 127, "u8 127 to i8 (in range)")
+
+    // cast 在函数参数中
+    fun takesI64(x: i64): i64 { x }
+    check(takesI64(cast(42i32).to(i64)) == 42i64, "cast in function argument")
+
+    // ─── 大胆 cast 边缘 ───
+
+    // i128 宽化与窄化
+    check(cast(42i32).to(i128) == 42i128, "i32 to i128 widen")
+    check(cast((-1i32)).to(i128) == -1i128, "i32 -1 to i128 sign extend")
+    check(cast(127i8).to(i128) == 127i128, "i8 MAX to i128")
+    check(cast((-128i8)).to(i128) == -128i128, "i8 MIN to i128 sign extend")
+    // i64 → i128 符号扩展
+    check(cast((-1i64)).to(i128) == -1i128, "i64 -1 to i128 sign extend")
+    check(cast(9223372036854775807i64).to(i128) == 9223372036854775807i128, "i64 MAX to i128")
+
+    // u128（通过 cast(-1i128).to(u128) 构造 MAX，绕过 Bug #25）
+    val u128_max: u128 = cast((-1i128)).to(u128)
+    check(cast(255u8).to(u128) == 255u128, "u8 255 to u128 zero extend")
+    check(cast(0u8).to(u128) == 0u128, "u8 0 to u128")
+    check(cast(u128_max).to(i128) == -1i128, "u128 MAX to i128 = -1 (bit reinterpret)")
+
+    // 符号扩展 vs 零扩展对照
+    val neg_byte: i8 = -1
+    check(cast(neg_byte).to(i64) == -1i64, "i8 -1 sign extend to i64 = -1")
+    check(cast(cast(neg_byte).to(u8)).to(i64) == 255i64, "i8 -1 -> u8 -> i64 zero extend = 255")
+    val pos_u8: u8 = 200
+    check(cast(pos_u8).to(u64) == 200u64, "u8 200 zero extend to u64 = 200")
+    check(cast(cast(pos_u8).to(i8)).to(i64) == -56i64, "u8 200 -> i8 -> i64 sign extend = -56")
+
+    // f16 ↔ f32 ↔ f64 链式
+    check(cast(1.5f64).to(f32) == 1.5f32, "f64 1.5 to f32")
+    check(cast(1.5f32).to(f64) == 1.5f64, "f32 1.5 to f64")
+    check(cast(1.5f64).to(f16) == 1.5f16, "f64 1.5 to f16")
+    check(cast(1.5f16).to(f64) == 1.5f64, "f16 1.5 to f64")
+    check(cast(cast(3.14f64).to(f16)).to(f64) != 3.14f64, "f64 -> f16 -> f64 loses precision")
+
+    // f128 链式
+    check(cast(1.0f64).to(f128) == 1.0f128, "f64 1.0 to f128")
+    check(cast(1.0f128).to(f64) == 1.0f64, "f128 1.0 to f64")
+
+    // char 大码点 roundtrip
+    check(cast('你').to(i32) == 20320, "char 你 to i32 = 20320")
+    check(cast(20320i32).to(char) == '你', "i32 20320 to char 你")
+    check(cast('€').to(i64) == 8364i64, "char € to i64 = 8364")
+    check(cast(8364i64).to(char) == '€', "i64 8364 to char €")
+
+    // i32 → f64 → i32 大值往返
+    check(cast(cast(1000000i32).to(f64)).to(i32) == 1000000, "i32 1M -> f64 -> i32 exact")
+    check(cast(cast((-1000000i32)).to(f64)).to(i32) == -1000000, "i32 -1M -> f64 -> i32 exact")
+
+    // cast 在 match 表达式中
+    val n: i32 = 5
+    val as_f64 = match n {
+        0 => 0.0f64
+        _ => cast(n).to(f64)
+    }
+    check(as_f64 == 5.0f64, "cast in match arm")
+
+    // cast i64 → i32 窄化溢出（wrapping）
+    check(cast(4294967296i64).to(i32) == 0, "i64 2^32 to i32 wraps to 0")
+    check(cast(4294967297i64).to(i32) == 1, "i64 2^32+1 to i32 wraps to 1")
+    check(cast((-4294967296i64)).to(i32) == 0, "i64 -2^32 to i32 wraps to 0")
+
+    // cast 嵌套在算术表达式
+    check(cast(10i32).to(i64) * cast(20i32).to(i64) + cast(5i32).to(i64) == 205i64, "nested cast arithmetic")
+
+    summary()
+}
+
+// 嵌套泛型 cast：cast(cast(x).to(f64)).to(T)
+fun double_cast<T>(x: T): T {
+    cast(cast(x).to(f64)).to(T)
+}

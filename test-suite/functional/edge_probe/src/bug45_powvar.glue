@@ -1,0 +1,37 @@
+fun powV1(base: i64, exp: i32): i64 {
+    if exp == 0i32 {
+        1i64
+    } else {
+        if exp % 2 == 1i32 {
+            base * powV1(base * base, exp / 2)
+        } else {
+            powV1(base * base, exp / 2)
+        }
+    }
+}
+
+fun powV2(base: i64, exp: i32): i64 {
+    if exp == 0i32 {
+        1i64
+    } else {
+        val r = powV2(base * base, exp / 2)
+        if exp % 2 == 1i32 {
+            base * r
+        } else {
+            r
+        }
+    }
+}
+
+fun main(): void {
+    println("=== powNested Variants ===")
+    println("powV1(2,0) = {powV1(2,0)} (expected 1)")
+    println("powV1(2,1) = {powV1(2,1)} (expected 2)")
+    println("powV1(2,2) = {powV1(2,2)} (expected 4)")
+    println("powV1(2,3) = {powV1(2,3)} (expected 8)")
+    println("powV1(2,4) = {powV1(2,4)} (expected 16)")
+    println("---")
+    println("powV2(2,0) = {powV2(2,0)} (expected 1)")
+    println("powV2(2,2) = {powV2(2,2)} (expected 4)")
+    println("powV2(2,4) = {powV2(2,4)} (expected 16)")
+}

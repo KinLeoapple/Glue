@@ -1,0 +1,14 @@
+// 微基准：测量单次操作开销
+
+fun fib(n: i64): i64 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fun main(): void {
+    // fib(20) = 6765, 约 1.3万次调用
+    println(fib(20))
+    // fib(24) = 46368, 约 9.7万次调用
+    println(fib(24))
+    // fib(26) = 121393, 约 24万次调用
+    println(fib(26))
+}

@@ -1,0 +1,152 @@
+// 边缘异步测试：async await/channel/timer/并发完成
+// 注意：Bug #24 — await 在 if/while 分支子图内会导致 event loop stuck。
+// 所有 await 操作必须在函数顶层，循环中收发 channel 用递归函数替代。
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// async 函数返回 i32
+async fun asyncVal(n: i32): Async<i32> {
+    Timer(1).await()
+    n
+}
+
+// async 函数返回 str
+async fun asyncStr(s: str): Async<str> {
+    Timer(1).await()
+    s
+}
+
+// async 链式调用（await 在函数顶层）
+async fun chained(n: i32): Async<i32> {
+    val a = asyncVal(n).await()
+    a + 100
+}
+
+// async 三层嵌套
+async fun deepAsync(n: i32): Async<i32> {
+    val a = asyncVal(n).await()
+    val b = asyncVal(a).await()
+    val c = asyncVal(b).await()
+    c
+}
+
+// async 返回 record（顶层定义类型）
+type Pair = Pair(x: i32, y: i32)
+async fun asyncPair(x: i32, y: i32): Async<Pair> {
+    Timer(1).await()
+    Pair(x, y)
+}
+
+// 注意：channel.recv() 在 if/else 分支内也受 Bug #24 影响导致 event loop stuck。
+// 因此递归 channel 收发（base case 需要 if 判断）无法实现。
+// 循环/递归中收发 channel 需等待 Bug #24 修复后才能测试。
+
+fun main(): void {
+    println("=== Edge Async ===")
+
+    // 基本 async await
+    val r1 = asyncVal(42).await()
+    check(r1 == 42, "async return i32")
+
+    // async 返回 str
+    val r2 = asyncStr("hello").await()
+    check(r2 == "hello", "async return str")
+
+    // async 链式
+    val r3 = chained(10).await()
+    check(r3 == 110, "chained async (10 -> 110)")
+
+    // 多个 async 顺序等待
+    val a = asyncVal(1).await()
+    val b = asyncVal(2).await()
+    val c = asyncVal(3).await()
+    check(a + b + c == 6, "3 async sequential sum")
+
+    // async 三层嵌套
+    val r4 = deepAsync(5).await()
+    check(r4 == 5, "3-layer nested async")
+
+    // async 返回 record
+    val r5 = asyncPair(3, 4).await()
+    check(r5 == Pair(3, 4), "async return record equality")
+
+    // async 返回值参与运算
+    val r6 = asyncVal(100).await()
+    check(r6 + 1 == 101, "async value in arithmetic")
+
+    // channel 基本操作（函数顶层，非分支非循环）
+    val ch = channel<i32>(2)
+    ch.send(10)
+    ch.send(20)
+    check(ch.recv() == 10, "channel recv first")
+    check(ch.recv() == 20, "channel recv second")
+
+    // channel 字符串
+    val sch = channel<str>(3)
+    sch.send("a")
+    sch.send("b")
+    sch.send("c")
+    check(sch.recv() == "a", "channel str recv a")
+    check(sch.recv() == "b", "channel str recv b")
+    check(sch.recv() == "c", "channel str recv c")
+
+    // channel capacity 边界
+    val cap_ch = channel<i32>(1)
+    cap_ch.send(99)
+    check(cap_ch.recv() == 99, "channel capacity 1")
+
+    // channel i64
+    val lch64 = channel<i64>(2)
+    lch64.send(10000000000i64)
+    lch64.send(-1i64)
+    check(lch64.recv() == 10000000000i64, "channel i64 large value")
+    check(lch64.recv() == -1i64, "channel i64 negative")
+
+    // channel bool
+    val bch = channel<bool>(2)
+    bch.send(true)
+    bch.send(false)
+    check(bch.recv() == true, "channel bool true")
+    check(bch.recv() == false, "channel bool false")
+
+    // async 0 等待
+    val r7 = asyncVal(0).await()
+    check(r7 == 0, "async zero value")
+
+    // async 负数
+    val r8 = asyncVal(-42).await()
+    check(r8 == -42, "async negative value")
+
+    // channel f64
+    val fch = channel<f64>(2)
+    fch.send(3.14)
+    fch.send(-0.5)
+    check(fch.recv() == 3.14, "channel f64 pi")
+    check(fch.recv() == -0.5, "channel f64 negative")
+
+    // channel 大容量（容量 1000，但只收发 2 个）
+    val big_ch = channel<i32>(1000)
+    big_ch.send(111)
+    big_ch.send(222)
+    check(big_ch.recv() == 111, "channel large capacity recv 1")
+    check(big_ch.recv() == 222, "channel large capacity recv 2")
+
+    summary()
+}

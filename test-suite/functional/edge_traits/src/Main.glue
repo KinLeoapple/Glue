@@ -1,0 +1,378 @@
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+// ─── 顶层类型与 trait 定义 ───
+
+// trait 默认方法链：A 调 B 调 C
+trait Chain {
+    fun base(self): str
+    fun wrap1(self): str {
+        "[" + self.base() + "]"
+    }
+    fun wrap2(self): str {
+        "{{" + self.wrap1() + "}}"
+    }
+    fun wrap3(self): str {
+        "<" + self.wrap2() + ">"
+    }
+}
+
+// trait 方法互相调用（a 调 b，b 调 a）
+trait Mutual {
+    fun isEven(self, n: i32): bool
+    fun isOdd(self, n: i32): bool {
+        !self.isEven(n)
+    }
+}
+
+// trait with state change method
+trait Counter {
+    fun current(self): i32
+}
+
+// trait 方法返回实现 trait 的类型（多态分派）
+trait Shape {
+    fun area(self): f64
+    fun describe(self): str {
+        "shape area=" + cast(self.area()).to(str)
+    }
+}
+
+// 递归 trait 方法：List 长度通过 trait 方法递归
+trait ListOps {
+    fun length(self): i32
+    fun sum(self): i32
+}
+
+// 实现 Chain 的类型
+type TagA: Chain = TagA(label: str) {
+    fun base(self): str {
+        self.label
+    }
+}
+
+type TagB: Chain = TagB(num: i32) {
+    fun base(self): str {
+        cast(self.num).to(str)
+    }
+}
+
+// 实现 Mutual 的类型
+type MutCheck: Mutual = MutCheck(dummy: i32) {
+    fun isEven(self, n: i32): bool {
+        n % 2 == 0
+    }
+}
+
+// 实现 Counter 的类型
+type CounterBox: Counter = CounterBox(count: i32) {
+    fun current(self): i32 {
+        self.count
+    }
+    fun next(self): CounterBox {
+        CounterBox(self.count + 1)
+    }
+}
+
+// 实现 Shape 的多个类型
+type CircleS: Shape = CircleS(r: f64) {
+    fun area(self): f64 {
+        3.141592653589793f64 * self.r * self.r
+    }
+}
+
+type RectS: Shape = RectS(w: f64, h: f64) {
+    fun area(self): f64 {
+        self.w * self.h
+    }
+}
+
+type SquareS: Shape = SquareS(side: f64) {
+    fun area(self): f64 {
+        self.side * self.side
+    }
+}
+
+// 递归 ADT 实现 ListOps（递归 trait 方法）
+type IntList = | Nil | Cons(i32, IntList)
+
+// 顶层递归函数实现 trait 方法的递归逻辑
+fun listLen(l: IntList): i32 {
+    match l {
+        Nil => 0
+        Cons(_, t) => 1 + listLen(t)
+    }
+}
+fun listSum(l: IntList): i32 {
+    match l {
+        Nil => 0
+        Cons(x, t) => x + listSum(t)
+    }
+}
+
+type IntListWrap: ListOps = IntListWrap(inner: IntList) {
+    fun length(self): i32 {
+        listLen(self.inner)
+    }
+    fun sum(self): i32 {
+        listSum(self.inner)
+    }
+}
+
+// 辅助函数：构建 wrap2/wrap3 的期望字符串。
+// 必须用拼接构建，避免字符串字面量中 `{[...]}` 被字符串插值解析。
+fun wrap2Expected(label: str): str {
+    "{{" + "[" + label + "]" + "}}"
+}
+
+fun wrap3Expected(label: str): str {
+    "<" + "{{" + "[" + label + "]" + "}}" + ">"
+}
+
+fun main(): void {
+    println("=== Edge Traits ===")
+
+    // ─── 1. trait 默认方法链（3 层嵌套调用）───
+    println("--- Trait Default Method Chain ---")
+    val ta = TagA("hello")
+    check(ta.base() == "hello", "Chain base")
+    check(ta.wrap1() == "[hello]", "Chain wrap1 (default calls base)")
+    println("  INFO: ta.wrap2() = '{ta.wrap2()}' (expected wrap2)")
+    check(ta.wrap2() == wrap2Expected("hello"), "Chain wrap2 (default calls wrap1)")
+    // Bug #44: trait default method chain depth > 2 breaks (wrap3 -> wrap2 -> wrap1 -> base)
+    println("  INFO: ta.wrap3() = '{ta.wrap3()}' (expected '<[hello]>', Bug #44 depth=3)")
+    check(ta.wrap3() == wrap3Expected("hello"), "Chain wrap3 (Bug #44: depth-3 default chain)")
+    // 不同实现
+    val tb = TagB(42)
+    check(tb.base() == "42", "Chain base (int->str)")
+    println("  INFO: tb.wrap3() = '{tb.wrap3()}' (expected '<[42]>', Bug #44)")
+    check(tb.wrap3() == wrap3Expected("42"), "Chain wrap3 on int type (Bug #44)")
+
+    // ─── 2. trait 方法互相调用 ───
+    println("--- Trait Mutual Method Call ---")
+    val mc = MutCheck()
+    check(mc.isEven(4), "isEven 4")
+    check(!mc.isEven(5), "isEven 5 false")
+    check(mc.isOdd(5), "isOdd 5 (calls isEven)")
+    check(!mc.isOdd(4), "isOdd 4 false (calls isEven)")
+    check(mc.isEven(0), "isEven 0")
+    check(mc.isOdd(0) == false, "isOdd 0 false")
+
+    // ─── 3. trait method returns concrete type (next returns new record) ───
+    println("--- Trait Method Returns New Instance ---")
+    val c0 = CounterBox(0)
+    check(c0.current() == 0, "counter current 0")
+    val c1 = c0.next()
+    check(c1.current() == 1, "counter next -> 1")
+    val c2 = c1.next()
+    check(c2.current() == 2, "counter next next -> 2")
+    // 链式调用 next
+    val c5 = c0.next().next().next().next().next()
+    check(c5.current() == 5, "counter 5x next chain")
+    // 原对象不变
+    check(c0.current() == 0, "counter original unchanged")
+
+    // ─── 4. 多类型实现同一 trait（多态分派）───
+    println("--- Multi-type Trait Polymorphism ---")
+    val circle = CircleS(2.0f64)
+    val rect = RectS(3.0f64, 4.0f64)
+    val sq = SquareS(5.0f64)
+    // 直接调用 trait 方法
+    check(circle.area() == 12.566370614359172f64, "Circle area r=2")
+    check(rect.area() == 12.0f64, "Rect area 3x4")
+    check(sq.area() == 25.0f64, "Square area side=5")
+    // 默认方法 describe 调用各自 area
+    check(circle.describe() == "shape area=12.566370614359172", "Circle describe (default calls area)")
+    check(rect.describe() == "shape area=12", "Rect describe")
+    check(sq.describe() == "shape area=25", "Square describe")
+
+    // ─── 5. trait 对象数组（探测：trait 方法在数组元素上分派）───
+    println("--- Trait Method on Array Elements ---")
+    // 注：Glue 可能不支持 trait 对象数组（元素类型不同）
+    // 探测：用 record 数组存储实现同一 trait 的不同 record 类型
+    // 探测 1：同类型数组（正常）
+    val circle_arr: CircleS[] = [CircleS(1.0f64), CircleS(2.0f64), CircleS(3.0f64)]
+    check(circle_arr[0].area() == 3.141592653589793f64, "circle arr[0] area")
+    check(circle_arr[2].area() == 28.274333882308138f64, "circle arr[2] area")
+    check(circle_arr[1].describe() == "shape area=12.566370614359172", "circle arr[1] describe")
+    // 数组求和（trait 方法遍历）
+    var area_sum: f64 = 0.0f64
+    var ai: i32 = 0
+    while ai < circle_arr.len() {
+        area_sum = area_sum + circle_arr[ai].area()
+        ai = ai + 1
+    }
+    // area_sum = π(1+4+9) = π*14 ≈ 43.98（浮点字面量精度限制，用容差）
+    check(area_sum > 43.982f64 && area_sum < 43.983f64, "sum of circle array areas (approx)")
+
+    // ─── 6. trait 方法递归（通过 IntListWrap）───
+    println("--- Trait Method Recursion ---")
+    val empty_list = Nil
+    val lw_empty = IntListWrap(empty_list)
+    check(lw_empty.length() == 0, "empty list length via trait")
+    check(lw_empty.sum() == 0, "empty list sum via trait")
+    // 1-元素列表
+    val l1 = Cons(10i32, Nil)
+    val lw1 = IntListWrap(l1)
+    check(lw1.length() == 1, "1-elem list length")
+    check(lw1.sum() == 10, "1-elem list sum")
+    // 5-元素列表
+    val l5 = Cons(1i32, Cons(2i32, Cons(3i32, Cons(4i32, Cons(5i32, Nil)))))
+    val lw5 = IntListWrap(l5)
+    check(lw5.length() == 5, "5-elem list length")
+    check(lw5.sum() == 15, "5-elem list sum 1+2+3+4+5")
+    // 10-元素列表
+    var l10: IntList = Nil
+    var li: i32 = 9
+    while li >= 0 {
+        l10 = Cons(li, l10)
+        li = li - 1
+    }
+    val lw10 = IntListWrap(l10)
+    check(lw10.length() == 10, "10-elem list length")
+    check(lw10.sum() == 45, "10-elem list sum 0+1+...+9")
+
+    // ─── 7. trait 默认方法访问字段（默认方法内调用显式方法）───
+    println("--- Trait Default Accessing Fields ---")
+    val tag_x = TagA("X")
+    // wrap3 默认方法内部多次调用 base/wrap1/wrap2
+    val chained = tag_x.wrap3() + " | " + tag_x.wrap2() + " | " + tag_x.wrap1()
+    check(chained == wrap3Expected("X") + " | " + wrap2Expected("X") + " | " + "[X]", "default method chain composition")
+    // 不同实例独立
+    val tag_y = TagA("Y")
+    check(tag_x.base() == "X", "tag_x independent")
+    check(tag_y.base() == "Y", "tag_y independent")
+    check(tag_x.wrap3() == wrap3Expected("X"), "tag_x wrap3 independent")
+    check(tag_y.wrap3() == wrap3Expected("Y"), "tag_y wrap3 independent")
+
+    // ─── 8. trait 方法在 if/match 表达式中 ───
+    println("--- Trait Method in Expressions ---")
+    val c = CircleS(1.0f64)
+    val r = RectS(2.0f64, 2.0f64)
+    // if 表达式中调用 trait 方法
+    val bigger = if c.area() > r.area() { c.area() } else { r.area() }
+    check(bigger == 4.0f64, "trait method in if expression")
+    // 算术组合（浮点字面量精度限制，用容差比较）
+    val total = c.area() + r.area() + sq.area()
+    println("  INFO: c.area()={c.area()} r.area()={r.area()} sq.area()={sq.area()} total={total}")
+    check(total > 32.141f64 && total < 32.142f64, "trait method in arithmetic (approx 32.1415)")
+    // 字符串插值
+    val desc = "c={c.describe()} r={r.describe()}"
+    check(desc == "c=shape area=3.141592653589793 r=shape area=4", "trait method in interpolation")
+
+    // ─── 9. trait 方法与 cast 组合 ───
+    println("--- Trait Method + Cast ---")
+    val n_area = cast(circle.area()).to(i32)
+    check(n_area == 12, "cast trait area to i32")
+    val area_str = cast(rect.area()).to(str)
+    check(area_str == "12", "cast trait area to str")
+    // trait 方法返回值作为 cast 输入
+    val desc_len = cast(circle.describe()).to(str)
+    check(desc_len.len() > 0, "describe() result string non-empty")
+
+    // ─── 10. trait 方法链式（同类型多次调用）───
+    println("--- Trait Method Chaining ---")
+    // CounterBox.next() 返回 CounterBox，可链式
+    val chained_cnt = CounterBox(10).next().next().next()
+    check(chained_cnt.current() == 13, "chained next 3x from 10")
+    // trait 默认方法链（base -> wrap1 -> wrap2 -> wrap3）
+    val tb_chain = TagB(7)
+    val composed = tb_chain.wrap3()
+    check(composed == wrap3Expected("7"), "trait default chain from int type")
+
+    // ─── 11. 大胆：trait 方法递归（直接自递归，非顶层函数）───
+    println("--- Trait Method Direct Recursion (probe) ---")
+    // 探测：trait 方法内部是否能直接递归调用 self.method()
+    // 这里通过 ListOps.sum 调用 listSum（顶层函数），而非直接 self.sum
+    // 尝试直接在 trait 方法中递归（通过 match 模式）
+    // 注：Glue 不允许 trait 方法体中直接写 match self 递归（self 类型不明确）
+    // 所以用顶层函数包装。此处验证包装路径正常
+    val big_list = Cons(100i32, Cons(200i32, Cons(300i32, Nil)))
+    val lw_big = IntListWrap(big_list)
+    check(lw_big.length() == 3, "big list length 3")
+    check(lw_big.sum() == 600, "big list sum 100+200+300")
+
+    // ─── 12. trait 方法参数（非 self 参数）───
+    println("--- Trait Method with Extra Params ---")
+    val mc2 = MutCheck()
+    // isEven/isOdd 接受额外参数 n
+    check(mc2.isEven(100), "isEven 100")
+    check(mc2.isOdd(101), "isOdd 101")
+    check(mc2.isEven(0), "isEven 0 (boundary)")
+    check(mc2.isOdd(0) == false, "isOdd 0 false")
+    // 负数
+    check(mc2.isEven(-4), "isEven -4")
+    check(mc2.isOdd(-3), "isOdd -3")
+
+    // ─── 13. trait 方法返回 bool 并组合 ───
+    println("--- Trait Method Returning Bool ---")
+    val check_pair = MutCheck()
+    val combined = check_pair.isEven(6) && check_pair.isOdd(7)
+    check(combined, "isEven(6) && isOdd(7)")
+    val either = check_pair.isEven(7) || check_pair.isOdd(7)
+    check(either, "isEven(7) || isOdd(7)")
+    val negate = !check_pair.isEven(7)
+    check(negate, "!isEven(7)")
+
+    // ─── 14. 多类型实现 trait，分别构造实例 ───
+    println("--- Multi-type Trait Instances ---")
+    val shapes_circle = CircleS(10.0f64)
+    val shapes_rect = RectS(10.0f64, 20.0f64)
+    val shapes_sq = SquareS(15.0f64)
+    // 各自调用 trait 默认方法 describe
+    check(shapes_circle.describe() == "shape area=314.1592653589793", "circle r=10 describe")
+    check(shapes_rect.describe() == "shape area=200", "rect 10x20 describe")
+    check(shapes_sq.describe() == "shape area=225", "sq side=15 describe")
+    // 面积比较
+    val max_area = if shapes_circle.area() > shapes_rect.area() {
+        if shapes_circle.area() > shapes_sq.area() { shapes_circle.area() } else { shapes_sq.area() }
+    } else {
+        if shapes_rect.area() > shapes_sq.area() { shapes_rect.area() } else { shapes_sq.area() }
+    }
+    check(max_area == 314.1592653589793f64, "max area among 3 shapes")
+    // 总面积（浮点字面量精度限制，用容差比较）
+    val total_area = shapes_circle.area() + shapes_rect.area() + shapes_sq.area()
+    println("  INFO: total_area={total_area} (expect ~739.159)")
+    check(total_area > 739.159f64 && total_area < 739.160f64, "total area of 3 shapes (approx)")
+
+    // ─── 15. trait 方法在循环中累积（避免 Bug #37：while 条件不调用）───
+    println("--- Trait Method Accumulation in Loop ---")
+    val cnt_arr: CounterBox[] = [CounterBox(0), CounterBox(10), CounterBox(20), CounterBox(30)]
+    var total_cnt: i32 = 0
+    var ci: i32 = 0
+    while ci < cnt_arr.len() {
+        total_cnt = total_cnt + cnt_arr[ci].current()
+        ci = ci + 1
+    }
+    check(total_cnt == 60, "sum of 4 counter boxes 0+10+20+30")
+    // 链式 next 累积
+    val c_start = CounterBox(0)
+    var chain_sum: i32 = 0
+    var c_current = c_start
+    var csi: i32 = 0
+    while csi < 5 {
+        chain_sum = chain_sum + c_current.current()
+        c_current = c_current.next()
+        csi = csi + 1
+    }
+    check(chain_sum == 10, "chain next 5x sum 0+1+2+3+4")
+
+    summary()
+}

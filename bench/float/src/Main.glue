@@ -2,6 +2,7 @@
 // 目标：压测 Float 软件 IEEE 754 路径、混合精度、Mandelbrot 迭代
 // 强化：10万→50万数 × 10→20 次迭代，新增 Mandelbrot 迭代
 
+import builtin.io.Console.{println}
 fun newtonSqrt(x: f64, iters: i32): f64 {
     var guess: f64 = x / 2.0
     if guess == 0.0 { return 0.0 }
@@ -44,7 +45,7 @@ fun floatMix(n: i32): f64 {
     acc
 }
 
-fun main() {
+fun main(): void {
     // --- Newton-Raphson sqrt: 500K 数 × 20 次迭代 ---
     var sum: f64 = 0.0
     var i: i64 = 1

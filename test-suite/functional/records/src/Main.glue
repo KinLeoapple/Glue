@@ -1,0 +1,144 @@
+// 功能验证：记录类型（构造/字段访问/更新/嵌套/相等/不等/解构）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Point = Point(x: i32, y: i32)
+type Person = Person(name: str, age: i32)
+type Box = Box(inner: Point)
+
+fun quadrant(pt: Point): i32 {
+    match pt {
+        Point(x, y) if x > 0 && y > 0 => 1
+        Point(x, y) if x < 0 && y > 0 => 2
+        Point(x, y) if x < 0 && y < 0 => 3
+        Point(x, y) if x > 0 && y < 0 => 4
+        _ => 0
+    }
+}
+
+fun main(): void {
+    println("=== Records ===")
+
+    // 构造与字段访问
+    val p = Point(3, 4)
+    check(p.x == 3, "field access x")
+    check(p.y == 4, "field access y")
+
+    // 相等性（值语义）
+    val p2 = Point(3, 4)
+    check(p == p2, "record value equality")
+
+    // 不等（已修复 P1 #1：record != 不再始终返回 false）
+    val p3 = Point(5, 6)
+    check(p != p3, "record inequality (!=)")
+    check(p.x != p3.x, "record inequality via field x")
+    check(p.y != p3.y, "record inequality via field y")
+    check(!(p != p2), "record equality via !(!=)")
+
+    // 字符串字段
+    val person = Person("Alice", 30)
+    check(person.name == "Alice", "str field name")
+    check(person.age == 30, "int field age")
+
+    // 嵌套记录
+    val box = Box(Point(1, 2))
+    check(box.inner.x == 1, "nested field access")
+    check(box.inner.y == 2, "nested field access y")
+
+    // 记录更新（显式构造，非 spread）
+    val older = Person(person.name, 31)
+    check(older.name == "Alice", "updated keeps name")
+    check(older.age == 31, "updated age")
+    check(person.age == 30, "original unchanged after update")
+
+    // 记录数组
+    val pts = [Point(0, 0), Point(1, 1), Point(2, 2)]
+    check(pts[1].x == 1, "record array elem 1 x")
+    check(pts[2].y == 2, "record array elem 2 y")
+
+    // 记录解构（match）
+    check(quadrant(Point(1, 1)) == 1, "quadrant 1")
+    check(quadrant(Point(-1, 1)) == 2, "quadrant 2")
+    check(quadrant(Point(-1, -1)) == 3, "quadrant 3")
+    check(quadrant(Point(1, -1)) == 4, "quadrant 4")
+    check(quadrant(Point(0, 0)) == 0, "quadrant origin")
+
+    // var 记录可变更新
+    var mp = Point(0, 0)
+    mp.x = 10
+    check(mp.x == 10, "var record field update")
+
+    // ─── 记录边缘测试 ───
+
+    // 深嵌套记录（4 层）
+    type L4 = L4(v: L3)
+    type L3 = L3(v: L2)
+    type L2 = L2(v: L1)
+    type L1 = L1(v: i32)
+    val deep_rec = L4(L3(L2(L1(42))))
+    check(deep_rec.v.v.v.v == 42, "4-deep nested record access")
+    check(deep_rec.v.v.v == L1(42), "3-deep nested record equality")
+
+    // 多字段记录（8 字段）
+    type Big = Big(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32)
+    val big_rec = Big(1, 2, 3, 4, 5, 6, 7, 8)
+    check(big_rec.a == 1, "8-field record a")
+    check(big_rec.d == 4, "8-field record d")
+    check(big_rec.h == 8, "8-field record h")
+    check(big_rec.a + big_rec.b + big_rec.c + big_rec.d + big_rec.e + big_rec.f + big_rec.g + big_rec.h == 36, "8-field sum")
+
+    // 嵌套记录数组
+    val box_arr = [Box(Point(1, 1)), Box(Point(2, 2)), Box(Point(3, 3))]
+    check(box_arr[0].inner.x == 1, "nested record array [0].inner.x")
+    check(box_arr[2].inner.y == 3, "nested record array [2].inner.y")
+
+    // 记录字段更新后原记录不变
+    val orig_p = Point(10, 20)
+    val updated_p = Point(orig_p.x + 1, orig_p.y)
+    check(orig_p.x == 10, "original unchanged after update")
+    check(updated_p.x == 11, "updated x")
+    check(updated_p.y == 20, "updated y keeps original")
+
+    // 记录作为函数返回值
+    fun makePoint(x: i32, y: i32): Point {
+        Point(x, y)
+    }
+    check(makePoint(5, 6) == Point(5, 6), "record from function return")
+
+    // 记录相等性深度
+    check(Point(1, 2) == Point(1, 2), "record equality same values")
+    check(Point(1, 2) != Point(1, 3), "record inequality different y")
+    check(Point(1, 2) != Point(2, 2), "record inequality different x")
+
+    // 记录解构 match 全字段
+    fun sumPoint(p: Point): i32 {
+        match p {
+            Point(x, y) => x + y
+        }
+    }
+    check(sumPoint(Point(10, 20)) == 30, "record destruct match")
+
+    // 多字段记录更新（显式构造）
+    val big_updated = Big(big_rec.a, big_rec.b, big_rec.c, big_rec.d, 99, big_rec.f, big_rec.g, big_rec.h)
+    check(big_updated.e == 99, "8-field update single field")
+    check(big_updated.a == 1, "8-field update keeps others")
+
+    summary()
+}

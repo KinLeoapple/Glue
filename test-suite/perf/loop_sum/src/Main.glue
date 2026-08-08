@@ -1,0 +1,33 @@
+// 性能测试：大循环求和（压测循环/算术/类型转换）
+
+fun main(): void {
+    println("=== Loop Sum Benchmark ===")
+
+    // i32 循环
+    var sum32: i32 = 0
+    val t0 = __instant_now_ns()
+    var i: i32 = 0
+    while i < 1000000 {
+        sum32 = sum32 + i
+        i = i + 1
+    }
+    val t1 = __instant_now_ns()
+    println("i32 sum 0..1000000 = {sum32}")
+    val elapsed1 = (t1 - t0) / 1000000i64
+    println("elapsed: {elapsed1} ms")
+
+    // i64 循环
+    var sum64: i64 = 0
+    val t2 = __instant_now_ns()
+    var j: i64 = 0
+    while j < 1000000i64 {
+        sum64 = sum64 + j
+        j = j + 1i64
+    }
+    val t3 = __instant_now_ns()
+    println("i64 sum 0..1000000 = {sum64}")
+    val elapsed2 = (t3 - t2) / 1000000i64
+    println("elapsed: {elapsed2} ms")
+
+    println("=== Done ===")
+}

@@ -1,0 +1,250 @@
+// 功能验证：模式匹配（嵌套构造器/or-pattern/guard/字面量/解构/通配）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+type Tree =
+    | Leaf
+    | Node(i32, Tree, Tree)
+
+// 递归树求和（顶层函数）
+fun treeSum(t: Tree): i32 {
+    match t {
+        Leaf => 0
+        Node(v, l, r) => v + treeSum(l) + treeSum(r)
+    }
+}
+
+type Shape =
+    | Circle(f64)
+    | Rect(f64, f64)
+
+type Pt = Pt(x: i32, y: i32)
+type Seg = Seg(a: Pt, b: Pt)
+
+// 嵌套构造器解构
+fun deepNest(t: Tree): i32 {
+    match t {
+        Node(_, Node(x, _, _), Node(y, _, _)) => x + y
+        Node(v, Leaf, Leaf) => v
+        Node(v, _, _) => v * 100
+        Leaf => -1
+    }
+}
+
+// or-pattern + guard
+fun classify(n: i32): str {
+    match n {
+        0 | 1 | 2 => "small"
+        n if n < 0 => "negative"
+        n if n % 2 == 0 => "even"
+        _ => "odd"
+    }
+}
+
+// 嵌套记录解构
+fun segLen(s: Seg): i32 {
+    match s {
+        Seg(Pt(x1, y1), Pt(x2, y2)) => (x2 - x1) + (y2 - y1)
+    }
+}
+
+// 字面量模式
+fun litMatch(s: str): i32 {
+    match s {
+        "a" | "b" | "c" => 1
+        "" => 0
+        _ => -1
+    }
+}
+
+// char 模式
+fun vowel(c: char): bool {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => true
+        _ => false
+    }
+}
+
+fun main(): void {
+    println("=== Patterns ===")
+
+    // 嵌套构造器
+    val t1 = Node(1, Node(2, Leaf, Leaf), Node(3, Leaf, Leaf))
+    check(deepNest(t1) == 5, "nested Node destructuring")
+    check(deepNest(Node(7, Leaf, Leaf)) == 7, "Node Leaf Leaf")
+    check(deepNest(Node(7, Leaf, Node(1, Leaf, Leaf))) == 700, "Node _ _")
+    check(deepNest(Leaf) == -1, "Leaf")
+
+    // or-pattern + guard
+    check(classify(0) == "small", "or-pattern 0")
+    check(classify(1) == "small", "or-pattern 1")
+    check(classify(2) == "small", "or-pattern 2")
+    check(classify(-5) == "negative", "guard negative")
+    check(classify(4) == "even", "guard even")
+    check(classify(3) == "odd", "default odd")
+
+    // 嵌套记录解构
+    val seg = Seg(Pt(0, 0), Pt(3, 4))
+    check(segLen(seg) == 7, "nested record destructuring")
+
+    // 字面量模式
+    check(litMatch("a") == 1, "literal a")
+    check(litMatch("b") == 1, "literal b")
+    check(litMatch("c") == 1, "literal c")
+    check(litMatch("") == 0, "literal empty")
+    check(litMatch("xyz") == -1, "literal default")
+
+    // char 模式
+    check(vowel('a') == true, "vowel a")
+    check(vowel('e') == true, "vowel e")
+    check(vowel('x') == false, "not vowel x")
+
+    // 通配符
+    fun shapeName(s: Shape): str {
+        match s {
+            Circle(_) => "circle"
+            Rect(_, _) => "rect"
+        }
+    }
+    check(shapeName(Circle(1.0f64)) == "circle", "wildcard Circle")
+    check(shapeName(Rect(1.0f64, 2.0f64)) == "rect", "wildcard Rect")
+
+    // 带变量绑定
+    fun shapeDim(s: Shape): f64 {
+        match s {
+            Circle(r) => r
+            Rect(w, _) => w
+        }
+    }
+    check(shapeDim(Circle(5.0f64)) == 5.0f64, "binding Circle r")
+    check(shapeDim(Rect(3.0f64, 4.0f64)) == 3.0f64, "binding Rect w")
+
+    // match 表达式
+    val result = match 3 {
+        1 => 10
+        2 => 20
+        _ => 99
+    }
+    check(result == 99, "match expression default")
+
+    // 多 guard
+    fun signum(n: i32): i32 {
+        match n {
+            n if n > 0 => 1
+            n if n < 0 => -1
+            _ => 0
+        }
+    }
+    check(signum(5) == 1, "guard positive")
+    check(signum(-3) == -1, "guard negative")
+    check(signum(0) == 0, "guard zero")
+
+    // ─── 模式匹配边缘测试 ───
+
+    // 深嵌套模式（3 层 Tree）
+    val deep_tree = Node(1, Node(2, Node(3, Leaf, Leaf), Leaf), Node(4, Leaf, Leaf))
+    check(deepNest(deep_tree) == 6, "3-deep nested pattern match")
+
+    // 多 or-pattern 组合（5 个分支）
+    fun weekday(c: char): bool {
+        match c {
+            'M' | 'W' | 'F' => true
+            'T' | 'S' => true
+            _ => false
+        }
+    }
+    check(weekday('M') == true, "5-or-pattern M")
+    check(weekday('T') == true, "5-or-pattern T")
+    check(weekday('X') == false, "5-or-pattern default")
+
+    // 模式守卫复杂条件
+    fun grade(score: i32): str {
+        match score {
+            s if s >= 90 => "A"
+            s if s >= 80 => "B"
+            s if s >= 70 => "C"
+            s if s >= 60 => "D"
+            _ => "F"
+        }
+    }
+    check(grade(95) == "A", "guard chain 95 -> A")
+    check(grade(85) == "B", "guard chain 85 -> B")
+    check(grade(75) == "C", "guard chain 75 -> C")
+    check(grade(65) == "D", "guard chain 65 -> D")
+    check(grade(55) == "F", "guard chain 55 -> F")
+
+    // 字面量 + 变量混合模式
+    fun describe(n: i32): str {
+        match n {
+            0 => "zero"
+            1 | 2 | 3 => "small"
+            n if n < 10 => "medium"
+            n if n < 100 => "large"
+            _ => "huge"
+        }
+    }
+    check(describe(0) == "zero", "mixed pattern 0")
+    check(describe(2) == "small", "mixed pattern 2")
+    check(describe(7) == "medium", "mixed pattern 7")
+    check(describe(50) == "large", "mixed pattern 50")
+    check(describe(500) == "huge", "mixed pattern 500")
+
+    // 嵌套 record 模式深解构
+    val deep_seg = Seg(Pt(10, 20), Pt(30, 40))
+    check(segLen(deep_seg) == 40, "deep record pattern segLen")
+
+    // match 表达式在值绑定中
+    val m1 = match 5 {
+        0 => "z"
+        _ => "nz"
+    }
+    check(m1 == "nz", "match expression to val")
+
+    // 通配符与变量混合
+    fun firstOrZero(t: Tree): i32 {
+        match t {
+            Node(v, _, _) => v
+            Leaf => 0
+        }
+    }
+    check(firstOrZero(Node(99, Leaf, Leaf)) == 99, "wildcard + variable Node")
+    check(firstOrZero(Leaf) == 0, "wildcard + variable Leaf")
+
+    // 字符串字面量多分支
+    fun command(cmd: str): i32 {
+        match cmd {
+            "go" | "move" | "run" => 1
+            "stop" | "halt" => 2
+            "quit" | "exit" => 3
+            _ => 0
+        }
+    }
+    check(command("go") == 1, "str multi-or go")
+    check(command("run") == 1, "str multi-or run")
+    check(command("stop") == 2, "str multi-or stop")
+    check(command("quit") == 3, "str multi-or quit")
+    check(command("xyz") == 0, "str multi-or default")
+
+    // 递归 ADT 深度模式（treeSum 已顶层定义）
+    val sum_tree = Node(1, Node(2, Leaf, Leaf), Node(3, Node(4, Leaf, Leaf), Leaf))
+    check(treeSum(sum_tree) == 10, "recursive tree pattern sum")
+
+    summary()
+}

@@ -1,0 +1,38 @@
+fun recDirect(x: i32): i32 {
+    if x == 0i32 {
+        0i32
+    } else {
+        if x == 1i32 {
+            1i32
+        } else {
+            recDirect(x - 1)
+        }
+    }
+}
+
+fun recArith(x: i32): i32 {
+    if x == 0i32 {
+        0i32
+    } else {
+        if x == 1i32 {
+            1i32
+        } else {
+            1 + recArith(x - 1)
+        }
+    }
+}
+
+fun recFlat(x: i32): i32 {
+    if x == 0i32 {
+        0i32
+    } else {
+        recFlat(x - 1)
+    }
+}
+
+fun main(): void {
+    println("=== Bug #45 Recursion ===")
+    println("recFlat(3) = {recFlat(3)} (expected 0)")
+    println("recDirect(3) = {recDirect(3)} (expected 1, Bug #45 if null)")
+    println("recArith(3) = {recArith(3)} (expected 1, Bug #45 if null)")
+}

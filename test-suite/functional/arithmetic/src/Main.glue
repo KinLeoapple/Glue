@@ -1,0 +1,191 @@
+// 功能验证：算术运算（整数/浮点/运算符优先级/混合类型）
+var failures: i32 = 0
+
+fun check(cond: bool, name: str): void {
+    if cond {
+        println("  PASS: {name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL: {name}")
+    }
+}
+
+fun summary(): void {
+    println("")
+    if failures == 0 {
+        println("RESULT: ALL PASSED")
+    } else {
+        println("RESULT: {failures} FAILED")
+    }
+}
+
+fun main(): void {
+    println("=== Arithmetic ===")
+
+    // 基本四则运算
+    check(1 + 2 == 3, "add")
+    check(10 - 7 == 3, "sub")
+    check(6 * 7 == 42, "mul")
+    check(100 / 7 == 14, "integer div")
+    check(100 % 7 == 2, "mod")
+
+    // 负数运算
+    check(-5 + 3 == -2, "negative add")
+    check(-10 - (-3) == -7, "double negative sub")
+    check(-3 * 4 == -12, "negative mul")
+    check(-100 / 7 == -14, "negative div (truncation)")
+    check(-100 % 7 == -2, "negative mod (truncation)")
+
+    // 零
+    check(0 + 0 == 0, "zero add")
+    check(5 * 0 == 0, "zero mul")
+    check(0 / 5 == 0, "zero dividend")
+
+    // 运算符优先级
+    check(1 + 2 * 3 == 7, "precedence: mul before add")
+    check(2 * 3 + 1 == 7, "precedence: mul before add reversed")
+    check(10 - 2 - 3 == 5, "left assoc: sub")
+    check(100 / 10 / 2 == 5, "left assoc: div")
+    check((1 + 2) * 3 == 9, "parentheses override")
+    check(2 + 3 * 4 - 1 == 13, "mixed precedence")
+
+    // 整数除法截断
+    check(7 / 2 == 3, "truncation: 7/2=3")
+    check(-7 / 2 == -3, "truncation: -7/2=-3")
+    check(7 / (-2) == -3, "truncation: 7/-2=-3")
+    check(-7 / (-2) == 3, "truncation: -7/-2=3")
+
+    // div/mod 不变式
+    val a: i32 = 100
+    val b: i32 = 7
+    check((a / b) * b + (a % b) == a, "div/mod invariant positive")
+    val na: i32 = -100
+    check((na / b) * b + (na % b) == na, "div/mod invariant negative")
+
+    // 浮点运算
+    check(1.0f64 + 2.0f64 == 3.0f64, "float add")
+    check(10.0f64 - 7.0f64 == 3.0f64, "float sub")
+    check(6.0f64 * 7.0f64 == 42.0f64, "float mul")
+    check(10.0f64 / 4.0f64 == 2.5f64, "float div exact")
+
+    // 浮点精度
+    check(0.1f64 + 0.2f64 != 0.3f64, "float precision: 0.1+0.2 != 0.3")
+
+    // i64 运算
+    val big: i64 = 1000000000
+    check(big * 2i64 == 2000000000i64, "i64 mul")
+    check(big + big == 2000000000i64, "i64 add")
+
+    // 混合大小运算（需要 cast）
+    val x: i32 = 100
+    val y: i64 = cast(x).to(i64) + 1i64
+    check(y == 101i64, "i32 to i64 cast + add")
+
+    // augmented assignment
+    var acc: i32 = 0
+    acc = acc + 10
+    check(acc == 10, "plus assignment")
+    acc = acc - 3
+    check(acc == 7, "minus assignment")
+    acc = acc * 2
+    check(acc == 14, "mul assignment")
+    acc = acc / 3
+    check(acc == 4, "div assignment")
+    acc = acc % 3
+    check(acc == 1, "mod assignment")
+
+    // ─── 数值边界边缘测试 ───
+
+    // i32 边界与 wrapping 溢出
+    val i32_max: i32 = 2147483647
+    val i32_min: i32 = -2147483648
+    check(i32_max + 1 == i32_min, "i32 MAX+1 wraps to MIN")
+    check(i32_min - 1 == i32_max, "i32 MIN-1 wraps to MAX")
+    check(i32_max * 2 == -2, "i32 MAX*2 wraps to -2")
+    check(0 - i32_min == i32_min, "negate i32 MIN wraps to MIN")
+
+    // i64 边界
+    val i64_max: i64 = 9223372036854775807
+    val i64_min: i64 = -9223372036854775808
+    check(i64_max + 1i64 == i64_min, "i64 MAX+1 wraps to MIN")
+    check(i64_min - 1i64 == i64_max, "i64 MIN-1 wraps to MAX")
+
+    // u8 / u16 无符号 wrapping
+    val u8_max: u8 = 255
+    check(u8_max + 1 == 0, "u8 MAX+1 wraps to 0")
+    val u8_zero: u8 = 0
+    check(u8_zero - 1 == 255, "u8 0-1 wraps to MAX")
+    val u16_max: u16 = 65535
+    check(u16_max + 1 == 0, "u16 MAX+1 wraps to 0")
+
+    // 大数乘法溢出（wrapping）
+    val big_mul: i32 = 100000
+    check(big_mul * big_mul == 1410065408, "100000*100000 wraps to 1410065408")
+
+    // div/mod 不变式在边界
+    check((i32_max / 7) * 7 + (i32_max % 7) == i32_max, "div/mod invariant at MAX")
+    check((i32_min / 7) * 7 + (i32_min % 7) == i32_min, "div/mod invariant at MIN")
+
+    // ─── 浮点边缘 ───
+
+    // NaN 语义（NaN != NaN）
+    val nan_f64: f64 = 0.0 / 0.0
+    check(nan_f64 != nan_f64, "NaN != NaN")
+    check(!(nan_f64 == nan_f64), "NaN not equal to itself")
+    check(!(nan_f64 < 0.0) && !(nan_f64 > 0.0), "NaN unordered comparisons")
+
+    // Inf / -Inf
+    val inf_f64: f64 = 1.0 / 0.0
+    val neg_inf_f64: f64 = -1.0 / 0.0
+    check(inf_f64 == 1.0 / 0.0, "+Inf identity")
+    check(neg_inf_f64 == -1.0 / 0.0, "-Inf identity")
+    check(inf_f64 > 0.0, "+Inf > 0")
+    check(neg_inf_f64 < 0.0, "-Inf < 0")
+    check(inf_f64 > 1.0f64, "+Inf > 1.0")
+    check(neg_inf_f64 < neg_inf_f64 == false, "-Inf == -Inf (not NaN)")
+
+    // -0.0 与 +0.0
+    val neg_zero: f64 = -0.0
+    check(neg_zero == 0.0, "-0.0 == 0.0")
+    check(1.0 / neg_zero == neg_inf_f64, "1.0/(-0.0) = -Inf")
+    check(1.0 / 0.0 == inf_f64, "1.0/(+0.0) = +Inf")
+
+    // 浮点精度边界
+    check(0.1f64 + 0.2f64 != 0.3f64, "0.1+0.2 != 0.3")
+    check(0.1f64 + 0.2f64 + 0.3f64 != 0.6f64, "0.1+0.2+0.3 != 0.6 (precision)")
+    check(0.5f64 + 0.5f64 == 1.0f64, "0.5+0.5 == 1.0 (exact)")
+
+    // f64 极值与 Inf 算术
+    val f64_min_positive: f64 = 2.2250738585072014e-308
+    check(f64_min_positive > 0.0, "f64 MIN_POSITIVE > 0")
+    check(inf_f64 + inf_f64 == inf_f64, "Inf + Inf = Inf")
+    check(inf_f64 - inf_f64 != inf_f64, "Inf - Inf = NaN (not Inf)")
+    check(inf_f64 * 0.0 != inf_f64, "Inf * 0 = NaN (not Inf)")
+
+    // f32 浮点
+    val nan_f32: f32 = 0.0 / 0.0
+    check(nan_f32 != nan_f32, "f32 NaN != NaN")
+    val inf_f32: f32 = 1.0 / 0.0
+    check(inf_f32 > 0.0, "f32 +Inf > 0")
+
+    // f16 浮点（半精度）
+    val f16_one: f16 = 1.0
+    check(f16_one + f16_one == 2.0, "f16 1+1 == 2")
+    val nan_f16: f16 = 0.0 / 0.0
+    check(nan_f16 != nan_f16, "f16 NaN != NaN")
+
+    // f128 浮点（四倍精度）
+    val f128_pi: f128 = 3.141592653589793238462643383279
+    check(f128_pi > 3.0, "f128 pi > 3")
+    check(f128_pi < 4.0, "f128 pi < 4")
+    val nan_f128: f128 = 0.0 / 0.0
+    check(nan_f128 != nan_f128, "f128 NaN != NaN")
+
+    // 类型提升边界（需要显式 cast）
+    // 注意：字面量 1000000000000 超 i32 范围会触发 Bug #21 静默退出，必须用 i64 后缀
+    val i32_val: i32 = 1000000
+    val i64_val: i64 = cast(i32_val).to(i64) * cast(i32_val).to(i64)
+    check(i64_val == 1000000000000i64, "i32->i64 promotion avoids overflow")
+
+    summary()
+}

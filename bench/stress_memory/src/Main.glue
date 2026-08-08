@@ -12,11 +12,12 @@
 // ============================================================
 // 1. 数组 push — O(n²) COW 复制
 // ============================================================
+import builtin.io.Console.{println}
 fun arrayPush(n: i32): i64[] {
     var arr: i64[] = []
     var i: i32 = 0
     while i < n {
-        arr = arr.push(cast(i).to(i64))
+        arr = arr ++ [cast(i).to(i64)]
         i = i + 1
     }
     arr
@@ -143,7 +144,7 @@ fun recordChurn(iters: i32): i64 {
     sum
 }
 
-fun main() {
+fun main(): void {
     // --- 数组 push 50000: O(n²) COW 复制 ---
     val bigArr = arrayPush(50000)
     println(bigArr.len())

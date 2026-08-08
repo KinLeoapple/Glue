@@ -1,0 +1,35 @@
+// 性能测试：字符串构建（压测字符串拼接/内存分配）
+
+fun main(): void {
+    println("=== String Build Benchmark ===")
+
+    // 10000 次拼接
+    var s: str = ""
+    val t0 = __instant_now_ns()
+    var i: i32 = 0
+    while i < 10000 {
+        s = s + "x"
+        i = i + 1
+    }
+    val t1 = __instant_now_ns()
+    val slen = cast(s.len()).to(i32)
+    println("string length = {slen}")
+    val elapsed1 = (t1 - t0) / 1000000i64
+    println("elapsed: {elapsed1} ms")
+
+    // 短词拼接
+    var s2: str = ""
+    val t2 = __instant_now_ns()
+    var j: i32 = 0
+    while j < 5000 {
+        s2 = s2 + "ab"
+        j = j + 1
+    }
+    val t3 = __instant_now_ns()
+    val s2len = cast(s2.len()).to(i32)
+    println("string2 length = {s2len}")
+    val elapsed2 = (t3 - t2) / 1000000i64
+    println("elapsed: {elapsed2} ms")
+
+    println("=== Done ===")
+}
