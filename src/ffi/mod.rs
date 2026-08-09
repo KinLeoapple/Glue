@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! ffi — Foreign Function Interface modules.
 //!
 //! Aggregates two FFI-related submodules:

@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! sema — Semantic analysis modules.
 //!
 //! Aggregates the Sema pipeline submodules:

@@ -192,32 +192,6 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    // ── 尝试性推断的统一 snapshot/rollback ──
-
-    /// 尝试性推断的状态快照：同时保存 solver 和 arena 状态。
-    ///
-    /// ConstraintSolver 的 snapshot 只保存 subst/candidates/errors/pending，
-    /// 但 `unify` 直接修改 `type_vars[].bound`，`unify_kind` 直接修改 `kind_vars`。
-    /// 本快照补充 arena 层状态，确保回退时完全一致。
-    pub fn snapshot_type_state(&mut self) -> TypeStateSnapshot {
-        TypeStateSnapshot {
-            solver_snap: self.solver.snapshot(),
-            arena_snap: self.arena.snapshot_arena(),
-        }
-    }
-
-    /// Rollback 到快照状态：同时回退 solver 和 arena。
-    pub fn rollback_type_state(&mut self, snap: TypeStateSnapshot) {
-        self.solver.rollback(snap.solver_snap);
-        self.arena.restore_arena(&snap.arena_snap);
-    }
-
-    /// Commit 快照：保留求解结果，丢弃快照。
-    pub fn commit_type_state(&mut self, snap: TypeStateSnapshot) {
-        self.solver.commit(snap.solver_snap);
-        // arena 状态保留（commit 确认结果）
-    }
-
     // ── 类型绑定栈操作 ──
 
     /// 进入泛型作用域：为每个类型参数分配 rigid var 并压栈。
@@ -4271,21 +4245,14 @@ pub struct ConstraintError {
     pub column: u32,
 }
 
-/// 约束求解器：收集约束、批量求解、支持 snapshot/rollback。
+/// 约束求解器：收集约束、批量求解。
 ///
 /// 设计：
 /// - `pending`：待求解约束队列（FIFO）
-/// - `snapshots`：snapshot 栈，记录 snapshot 时的 pending 长度和 subst 快照
 /// - `subst`：已求解的 TypeVar → TypeHandle 映射（求解结果）
 /// - `errors`：求解失败记录（不中断，错误恢复）
-///
-/// 使用模式：
-/// 1. `let snap = solver.snapshot();`
-/// 2. `solver.add(constraint);` ...（尝试性推断）
-/// 3. 若成功 `solver.commit(snap);`，若失败 `solver.rollback(snap);`
 pub struct ConstraintSolver {
     pending: Vec<Constraint>,
-    snapshots: Vec<SnapshotState>,
     subst: FxHashMap<u32, TypeHandle>,
     errors: Vec<ConstraintError>,
     /// 每个 TypeVar 在不动点迭代中收到的所有候选绑定（多值记录）。
@@ -4295,15 +4262,6 @@ pub struct ConstraintSolver {
     /// - 唯一候选 → 写入 subst
     /// - 多个不同候选 → 标记歧义错误（仍选 arena 的实际解写入 subst 以避免级联误报）
     candidates: FxHashMap<u32, Vec<TypeHandle>>,
-}
-
-/// Snapshot 内部状态：pending 长度 + subst 快照 + candidates 快照
-#[derive(Debug, Clone)]
-struct SnapshotState {
-    pending_len: usize,
-    subst_snapshot: FxHashMap<u32, TypeHandle>,
-    errors_len: usize,
-    candidates_snapshot: FxHashMap<u32, Vec<TypeHandle>>,
 }
 
 impl Default for ConstraintSolver {
@@ -4316,7 +4274,6 @@ impl ConstraintSolver {
     pub fn new() -> Self {
         ConstraintSolver {
             pending: Vec::new(),
-            snapshots: Vec::new(),
             subst: FxHashMap::default(),
             errors: Vec::new(),
             candidates: FxHashMap::default(),
@@ -4354,53 +4311,6 @@ impl ConstraintSolver {
             trait_name: trait_name.into(),
             type_args: type_args.to_vec().into_boxed_slice(),
         });
-    }
-
-    /// 创建 snapshot：记录当前状态，用于后续 rollback。
-    ///
-    /// snapshot 后添加的约束和求解结果都可以通过 rollback 撤销。
-    pub fn snapshot(&mut self) -> SnapshotId {
-        let id = SnapshotId(self.snapshots.len() as u32);
-        self.snapshots.push(SnapshotState {
-            pending_len: self.pending.len(),
-            subst_snapshot: self.subst.clone(),
-            errors_len: self.errors.len(),
-            candidates_snapshot: self.candidates.clone(),
-        });
-        id
-    }
-
-    /// Rollback 到 snapshot 状态：撤销 snapshot 后的所有约束和求解结果。
-    ///
-    /// 用于尝试性推断失败时回退（如 match 分支类型不匹配）。
-    pub fn rollback(&mut self, id: SnapshotId) {
-        let idx = id.0 as usize;
-        if idx >= self.snapshots.len() {
-            return;
-        }
-        let state = self.snapshots[idx].clone();
-        self.pending.truncate(state.pending_len);
-        self.subst = state.subst_snapshot;
-        self.errors.truncate(state.errors_len);
-        self.candidates = state.candidates_snapshot;
-        // 丢弃该 snapshot 及之后的所有 snapshot
-        self.snapshots.truncate(idx);
-    }
-
-    /// Commit snapshot：保留求解结果，丢弃 snapshot。
-    ///
-    /// 用于尝试性推断成功后确认结果。
-    pub fn commit(&mut self, id: SnapshotId) {
-        let idx = id.0 as usize;
-        if idx >= self.snapshots.len() {
-            return;
-        }
-        // 只丢弃该 snapshot，保留约束和求解结果
-        self.snapshots.remove(idx);
-        // 修正后续 snapshot 的 id（它们仍有效，只是 index 前移）
-        // 但为简化，我们要求 commit 顺序与 snapshot 相反（栈式）
-        // 非栈式 commit 会破坏 id 映射，此处简化为 truncate
-        // 实际使用中推荐栈式 snapshot/commit
     }
 
     /// 批量求解所有 pending 约束。
@@ -4723,7 +4633,6 @@ impl ConstraintSolver {
     /// 清空所有状态（模块切换时调用）。
     pub fn reset(&mut self) {
         self.pending.clear();
-        self.snapshots.clear();
         self.subst.clear();
         self.errors.clear();
         self.candidates.clear();

@@ -1083,23 +1083,54 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
 // 固定点迭代驱动器
 // =========================================================================
 
-/// 优化入口（无分析报告）：等价于 `optimize_with_analysis(graph, None)`。
+/// 优化等级。
+///
+/// 驱动 `optimize_with_analysis` 的 pass 选择与迭代上限：
+/// - `O0`：不优化，仅 Build 产出
+/// - `O1`：跳过结构变换，仅固定点迭代（Inline + 传统优化）
+/// - `O2`：全量（结构变换 + 固定点迭代），标准等级
+/// - `O3`：全量 + 提高迭代上限（200），激进优化
+///
+/// 环境变量 `GLUE_NO_*` 仍可逐 pass 禁用（调试用），优先级高于等级。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum OptLevel {
+    O0 = 0,
+    O1 = 1,
+    O2 = 2,
+    O3 = 3,
+}
+
+impl Default for OptLevel {
+    fn default() -> Self {
+        OptLevel::O2
+    }
+}
+
+/// 优化入口（无分析报告）：等价于 `optimize_with_analysis(graph, None, OptLevel::default())`。
 pub fn optimize(graph: &mut DataFlowGraph) {
-    optimize_with_analysis(graph, None);
+    optimize_with_analysis(graph, None, OptLevel::default());
 }
 
 /// 优化入口（带分析报告）：对 graph 执行固定点迭代优化。
 ///
-/// 两阶段管线：
-/// 1. 结构变换（一次性）：LICM → LoopUnroll — 依赖 AnalysisReport 中的 NodeId，
+/// 两阶段管线（按 `level` 启用）：
+/// 1. 结构变换（一次性，level >= 2）：LICM → LoopUnroll — 依赖 AnalysisReport 中的 NodeId，
 ///    rebuild 后 NodeId 失效，故仅运行一次。
-/// 2. 固定点迭代：Inline → ConstFold → StrengthRed → CSE → CopyProp → DCE → DSE
+/// 2. 固定点迭代（level >= 1）：Inline → ConstFold → StrengthRed → CSE → CopyProp → DCE → DSE
 ///    — Inline 自收集候选（不依赖 analysis），可在每轮安全运行。
 /// 无分析报告时 Phase 1 跳过，退化为纯传统优化管线。
+/// `level == O0` 时整个优化器跳过。
 pub fn optimize_with_analysis(
     graph: &mut DataFlowGraph,
     analysis: Option<&AnalysisReport>,
+    level: OptLevel,
 ) {
+    // O0：不优化
+    if level == OptLevel::O0 {
+        return;
+    }
+
     let pure_set = crate::ir::Ir::pure_compute_fn_set();
     let no_fold = std::env::var("GLUE_NO_FOLD").is_ok();
     let no_cse = std::env::var("GLUE_NO_CSE").is_ok();
@@ -1113,8 +1144,8 @@ pub fn optimize_with_analysis(
     // hoisted_owners 追踪 + rebuild 分组重排确保 body 节点正确纳入 caller 范围。
     let no_inline = std::env::var("GLUE_NO_INLINE").is_ok();
 
-    // ── Phase 1：结构变换（一次性，依赖 analysis 的 NodeId）──
-    if analysis.is_some() {
+    // ── Phase 1：结构变换（一次性，依赖 analysis 的 NodeId，level >= 2）──
+    if level >= OptLevel::O2 && analysis.is_some() {
         let mut ctx = OptimizerContext::default();
         if !no_licm   { pass_licm(graph, &mut ctx, analysis); }
         if !no_unroll { pass_loop_unroll(graph, &mut ctx, analysis); }
@@ -1123,11 +1154,13 @@ pub fn optimize_with_analysis(
         }
     }
 
-    // ── Phase 2：固定点迭代（Inline + 传统优化）──
+    // ── Phase 2：固定点迭代（Inline + 传统优化，level >= 1）──
     let dbg_iter = std::env::var("GLUE_INLINE_DBG").is_ok();
+    // O3 提高迭代上限；环境变量 GLUE_OPT_MAX_ITER 优先（调试用）
+    let default_max_iter = if level >= OptLevel::O3 { 200 } else { 50 };
     let mut max_iter = std::env::var("GLUE_OPT_MAX_ITER")
         .ok().and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(50);
+        .unwrap_or(default_max_iter);
     loop {
         let mut ctx = OptimizerContext::default();
 

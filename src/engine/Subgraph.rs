@@ -106,7 +106,7 @@ impl<S: LockStrategy> Engine<S> {
             let (branch_start, _branch_end) = child_sg.node_range;
             let branch_param_count = child_sg.param_count as usize;
 
-            let mut child = Frame::new(child_fid, subgraph_id, parent_node_count, self.graph.clone());
+            let mut child = self.acquire_frame(child_fid, subgraph_id, parent_node_count);
             child.node_offset = parent_start;
 
             // 复制父帧已就绪的值（refcount 设 0 = 永不回收，帧结束时统一释放）
@@ -254,7 +254,7 @@ impl<S: LockStrategy> Engine<S> {
                     subgraph_id.0, rq_len, &pending_info[..pending_info.len().min(15)]);
             }
 
-            self.frames.lock().insert(child_fid, Box::new(child));
+            self.frames.lock().insert(child_fid, child);
             child_fid
         } else {
             // 跨函数调用：原有逻辑
@@ -262,7 +262,7 @@ impl<S: LockStrategy> Engine<S> {
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
-            let mut child = Frame::new(child_fid, subgraph_id, node_count, self.graph.clone());
+            let mut child = self.acquire_frame(child_fid, subgraph_id, node_count);
             self.prepare_frame(&mut child);
 
             let param_count = child_sg.param_count as usize;
@@ -272,7 +272,7 @@ impl<S: LockStrategy> Engine<S> {
                 let consumer_count = self.graph.downstreams[offset + i].len() as u16;
                 child.set_value(local_id, arg.clone(), consumer_count);
                 // 不 push_ready：参数值已设置，notify_downstream 传播给下游
-                notify_downstream(&mut child, &self.graph, local_id, global_id, NodeId(node_start.0));
+                notify_downstream(&mut *child, &self.graph, local_id, global_id, NodeId(node_start.0));
             }
 
             child.caller = Some((caller_fid, call_node));
@@ -280,7 +280,7 @@ impl<S: LockStrategy> Engine<S> {
             child.parent_frame_ptr = std::ptr::null_mut();
             child.closure_val = closure_val;
 
-            self.frames.lock().insert(child_fid, Box::new(child));
+            self.frames.lock().insert(child_fid, child);
             child_fid
         }
     }
@@ -387,7 +387,8 @@ impl<S: LockStrategy> Engine<S> {
         let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
         let child_signal = child_frame.control_signal.clone();
         let caller = child_frame.caller;
-        // child_frame 在此之后 drop
+        // 回收子帧到池（Vec 容量保留供复用）
+        self.release_frame(Box::new(child_frame));
 
         if let Some((caller_fid, call_node)) = caller {
             let mut caller_frame_opt = self.frames.lock().remove(&caller_fid);

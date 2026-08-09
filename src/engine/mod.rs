@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! Engine 模块 — 数据流就绪调度执行引擎（调度器）
 //!
 //! 基于 [`crate::ir::Ir::DataFlowGraph`]，实现：
@@ -80,6 +81,8 @@ pub struct Engine<S: LockStrategy> {
     /// 将事件暂存，process_frame insert 帧后消费（与 pending_completions 对称）
     pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
     pub result: S::Mutex<Option<Value>>,
+    /// 帧池：回收已完成帧的 Box<Frame> 供复用，消除频繁 Vec 分配/释放
+    pub frame_pool: S::Mutex<Vec<Box<crate::ir::Ir::Frame>>>,
     /// 单线程队列（Multi 模式为 None）
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
     /// 多线程调度（Single 模式为 None）

@@ -111,17 +111,26 @@ impl Default for TimerRuntime {
 ///
 /// async 函数调用启动子帧时注册 async_id → child_fid。
 /// 子帧完成时设置 result + 触发 AsyncJoin 事件唤醒等待的 await 帧。
+///
+/// 使用双 HashMap 实现 O(1) 双向查找：async_id → entry + child_fid → async_id。
+/// FrameId 单调递增不复用，child_index 无冲突风险。
 pub struct AsyncJoinRuntime {
-    entries: Vec<AsyncJoinEntry>,
+    entries: std::collections::HashMap<crate::ir::Ir::AsyncHandleId, AsyncJoinEntry>,
+    child_index: std::collections::HashMap<FrameId, crate::ir::Ir::AsyncHandleId>,
     next_async_id: u32,
 }
 struct AsyncJoinEntry {
-    async_id: crate::ir::Ir::AsyncHandleId,
     child_fid: FrameId,
     result: Option<Value>,
 }
 impl AsyncJoinRuntime {
-    pub fn new() -> Self { Self { entries: Vec::new(), next_async_id: 0 } }
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            child_index: std::collections::HashMap::new(),
+            next_async_id: 0,
+        }
+    }
     /// 分配新的 async_id（i32 标量值）
     pub fn alloc_id(&mut self) -> crate::ir::Ir::AsyncHandleId {
         assert!(self.next_async_id < u32::MAX, "AsyncHandleId overflow: too many async calls");
@@ -130,45 +139,47 @@ impl AsyncJoinRuntime {
         id
     }
     pub fn register(&mut self, async_id: crate::ir::Ir::AsyncHandleId, child_fid: FrameId) {
-        self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
+        self.child_index.insert(child_fid, async_id);
+        self.entries.insert(async_id, AsyncJoinEntry { child_fid, result: None });
     }
     /// 原子地分配 async_id 并注册 child_fid（消除 alloc_id + register 的竞态窗口）。
     pub fn alloc_and_register(&mut self, child_fid: FrameId) -> crate::ir::Ir::AsyncHandleId {
         let async_id = crate::ir::Ir::AsyncHandleId(self.next_async_id);
         self.next_async_id += 1;
-        self.entries.push(AsyncJoinEntry { async_id, child_fid, result: None });
+        self.child_index.insert(child_fid, async_id);
+        self.entries.insert(async_id, AsyncJoinEntry { child_fid, result: None });
         async_id
     }
     pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::ir::Ir::AsyncHandleId> {
-        // 仅匹配未完成（result=None）的 entry：帧 ID 会被复用，
-        // 已完成的旧 entry 若仍匹配会导致新 async call 的完成事件被错误路由到旧 async_id。
-        self.entries
-            .iter()
-            .find(|e| e.child_fid == child_fid && e.result.is_none())
-            .map(|e| e.async_id)
+        // 仅返回未完成（result=None）的 entry：已完成旧 entry 的 child_fid 映射
+        // 可能尚未清理，需二次检查 result 状态。
+        let async_id = self.child_index.get(&child_fid)?;
+        let entry = self.entries.get(async_id)?;
+        if entry.result.is_none() { Some(*async_id) } else { None }
     }
     pub fn find_child_by_async_id(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<FrameId> {
-        self.entries.iter().find(|e| e.async_id == async_id).map(|e| e.child_fid)
+        self.entries.get(&async_id).map(|e| e.child_fid)
     }
     /// 尝试获取 async 结果。若结果已就绪则消费（移除）该 entry。
     /// 消费式读取避免 entries 无界增长。
     pub fn try_get_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<Value> {
-        if let Some(idx) = self.entries.iter().position(|e| e.async_id == async_id) {
-            if self.entries[idx].result.is_some() {
-                return Some(self.entries.swap_remove(idx).result.unwrap());
-            }
+        let entry = self.entries.get(&async_id)?;
+        if entry.result.is_none() {
+            return None;
         }
-        None
+        let entry = self.entries.remove(&async_id)?;
+        self.child_index.remove(&entry.child_fid);
+        entry.result
     }
     pub fn set_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId, value: Value) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.async_id == async_id) {
+        if let Some(e) = self.entries.get_mut(&async_id) {
             e.result = Some(value);
         }
     }
     /// 移除指定 async_id 的 entry（waiter 已被 on_event_arrived 唤醒，值已注入）。
     pub fn remove_entry(&mut self, async_id: crate::ir::Ir::AsyncHandleId) {
-        if let Some(idx) = self.entries.iter().position(|e| e.async_id == async_id) {
-            self.entries.swap_remove(idx);
+        if let Some(entry) = self.entries.remove(&async_id) {
+            self.child_index.remove(&entry.child_fid);
         }
     }
 }

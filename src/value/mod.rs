@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! value — Glue 统一值系统
 //!
 //! 拆分为四个子模块：

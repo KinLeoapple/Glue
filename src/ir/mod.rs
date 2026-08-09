@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! ir — Intermediate representation, IR builder, and compute functions.
 //!
 //! Aggregates three IR-related submodules:

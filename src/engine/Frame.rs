@@ -18,14 +18,63 @@ impl<S: LockStrategy> Engine<S> {
         id
     }
 
+    /// 帧池容量上限（防止无界增长）
+    const FRAME_POOL_MAX: usize = 32;
+
+    /// 从帧池获取可复用帧，或新建帧。
+    /// 复用时保留 Vec 容量（resize 不重新分配），消除频繁 alloc/dealloc。
+    pub(super) fn acquire_frame(
+        &self,
+        id: FrameId,
+        subgraph_id: SubGraphId,
+        node_count: usize,
+    ) -> Box<Frame> {
+        let mut pool = self.frame_pool.lock();
+        if let Some(mut frame_box) = pool.pop() {
+            let frame = &mut *frame_box;
+            frame.id = id;
+            frame.subgraph_id = subgraph_id;
+            frame.graph = self.graph.clone();
+            frame.value_table.resize(node_count);
+            frame.value_table.reset_all();
+            frame.pending_inputs.resize(node_count, 0);
+            frame.ready_queue.clear();
+            frame.state = FrameState::Ready;
+            frame.caller = None;
+            frame.node_offset = 0;
+            frame.control_signal = ControlSignal::None;
+            frame.suspend_state = SuspendState::NotSuspended;
+            frame.defer_stack.clear();
+            frame.suspend_event = None;
+            frame.select_timers.clear();
+            frame.root_frame_ptr = std::ptr::null_mut();
+            frame.parent_frame_ptr = std::ptr::null_mut();
+            frame.cached_child_frame = None;
+            frame.closure_val = None;
+            frame_box
+        } else {
+            drop(pool);
+            Box::new(Frame::new(id, subgraph_id, node_count, self.graph.clone()))
+        }
+    }
+
+    /// 回收帧到池供复用（池满则 drop）。
+    pub(super) fn release_frame(&self, frame_box: Box<Frame>) {
+        let mut pool = self.frame_pool.lock();
+        if pool.len() < Self::FRAME_POOL_MAX {
+            pool.push(frame_box);
+        }
+        // else: pool full, frame_box drops
+    }
+
     /// 初始化帧：分配 + 预填充。返回 FrameId（帧已插入 frames）。
     pub(super) fn init_frame(&self, subgraph_id: SubGraphId) -> FrameId {
         let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
         let node_count = (node_end.0 - node_start.0) as usize;
         let fid = self.alloc_frame_id();
-        let mut frame = Frame::new(fid, subgraph_id, node_count, self.graph.clone());
+        let mut frame = self.acquire_frame(fid, subgraph_id, node_count);
         self.prepare_frame(&mut frame);
-        self.frames.lock().insert(fid, Box::new(frame));
+        self.frames.lock().insert(fid, frame);
         fid
     }
 
@@ -50,7 +99,7 @@ impl<S: LockStrategy> Engine<S> {
         let (branch_start, branch_end) = child_sg.node_range;
 
         let fid = self.alloc_frame_id();
-        let mut frame = Frame::new(fid, body_subgraph, parent_node_count, self.graph.clone());
+        let mut frame = self.acquire_frame(fid, body_subgraph, parent_node_count);
         frame.node_offset = parent_start;
 
         // 复制父帧已就绪的值（跳过 defer body 范围内的节点）
@@ -80,7 +129,7 @@ impl<S: LockStrategy> Engine<S> {
         frame.parent_frame_ptr = parent_ptr;
         frame.root_frame_ptr = parent_root;
 
-        self.frames.lock().insert(fid, Box::new(frame));
+        self.frames.lock().insert(fid, frame);
         fid
     }
 

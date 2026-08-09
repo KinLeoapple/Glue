@@ -26,7 +26,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 // `use crate::sema::Sema::*;` glob import 获取这些符号。
 pub use crate::types::{
     TypeHandle, Ty, TypeFamily, DetailId, EnvId, FieldType, TraitMethodSig,
-    SemKind, TypeVar, UnifyError, ArenaSnapshot, SnapshotId, TypeStateSnapshot,
+    SemKind, TypeVar, UnifyError,
     TypeArena, TypeDetail, TypeDisplay,
     TypeOps, ops_of, ops_by_type_id,
     DynamicOpsRegistry, DynamicOpsEntry,

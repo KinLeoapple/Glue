@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! ModuleLoader — 统一的模块加载器
 //!
 //! 合并 stdlib 和用户模块的加载逻辑：

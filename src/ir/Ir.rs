@@ -51,7 +51,6 @@ pub struct ComputeFnId(pub u32);
 macro_rules! compute_fn_ids {
     ( $( $idx:literal => $name:ident ),* $(,)? ) => {
         $(
-            #[allow(dead_code)]
             pub const $name: ComputeFnId = ComputeFnId($idx);
         )*
     };

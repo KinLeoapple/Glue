@@ -449,6 +449,17 @@ impl<S: LockStrategy> Engine<S> {
                         Value::VOID,
                         queue,
                     );
+                    // send 成功后仍需设置节点值 + 通知下游，否则后续语句永远不就绪
+                    let consumer_count =
+                        graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                    frame.set_value(local_id, Value::VOID, consumer_count);
+                    notify_downstream(
+                        frame,
+                        &graph,
+                        local_id,
+                        graph_node_id,
+                        NodeId(node_start),
+                    );
                 }
                 NodeResult::Cancel(async_id) => {
                     let child_fid = self
@@ -742,6 +753,8 @@ impl<S: LockStrategy> Engine<S> {
                         if woken > 0 {
                             self.async_join_runtime.lock().remove_entry(async_id);
                         }
+                        // 回收 async 子帧到池
+                        self.release_frame(frame_box);
                     } else {
                         // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
                         self.event_waiters.lock().retain(|(e, _)| {
@@ -754,6 +767,7 @@ impl<S: LockStrategy> Engine<S> {
                     // 顶层帧完成：返回结果
                     let ret = extract_child_return(frame, &self.graph);
                     *self.result.lock() = Some(ret);
+                    self.release_frame(frame_box);
                 }
             }
             FrameState::Failed => {
@@ -766,6 +780,7 @@ impl<S: LockStrategy> Engine<S> {
                 } else {
                     // 顶层帧 Failed：返回 NULL
                     *self.result.lock() = Some(Value::NULL);
+                    self.release_frame(frame_box);
                 }
             }
             _ => {

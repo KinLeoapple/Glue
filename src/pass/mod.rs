@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! pass — Post-processing passes (Sema-post and IR-post).
 //!
 //! Aggregates two post-processing pass modules:

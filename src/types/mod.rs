@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! Type — Glue 类型系统模块
 //!
 //! 承载所有内置类型的静态属性、统一语义层枚举 `Ty`（唯一类型来源，Copy）、

@@ -1,29 +1,10 @@
 // =========================================================================
-// Arena — 类型分配器 + unify/occurs/resolve + 快照
+// Arena — 类型分配器 + unify/occurs/resolve
 // =========================================================================
 
 use super::Tag::*;
 use super::ty::*;
 use super::Display::TypeDisplay;
-
-/// TypeArena 状态快照：用于尝试性推断的 rollback。
-#[derive(Clone)]
-pub struct ArenaSnapshot {
-    type_vars_len: usize,
-    type_vars_bound: Vec<Option<TypeHandle>>,
-    kind_vars_len: usize,
-    kind_vars: Vec<Option<SemKind>>,
-}
-
-/// Snapshot 标识：用于 rollback/commit 尝试性推断。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapshotId(pub u32);
-
-/// 尝试性推断的统一状态快照：同时保存 ConstraintSolver 和 TypeArena 状态。
-pub struct TypeStateSnapshot {
-    pub solver_snap: SnapshotId,
-    pub arena_snap: ArenaSnapshot,
-}
 
 /// Ty 分配器：arena-based，管理类型槽、结构详情、类型变量与 kind 变量。
 ///
@@ -871,32 +852,6 @@ impl TypeArena {
     #[inline]
     pub fn display(&self, ty: TypeHandle) -> TypeDisplay<'_> {
         TypeDisplay { arena: self, ty }
-    }
-
-    // ── Snapshot / Restore ──
-
-    pub fn snapshot_arena(&self) -> ArenaSnapshot {
-        ArenaSnapshot {
-            type_vars_len: self.type_vars.len(),
-            type_vars_bound: self.type_vars.iter().map(|v| v.bound).collect(),
-            kind_vars_len: self.kind_vars.len(),
-            kind_vars: self.kind_vars.clone(),
-        }
-    }
-
-    pub fn restore_arena(&mut self, snap: &ArenaSnapshot) {
-        self.type_vars.truncate(snap.type_vars_len);
-        for (i, bound) in snap.type_vars_bound.iter().enumerate() {
-            if i < self.type_vars.len() {
-                self.type_vars[i].bound = *bound;
-            }
-        }
-        self.kind_vars.truncate(snap.kind_vars_len);
-        for (i, k) in snap.kind_vars.iter().enumerate() {
-            if i < self.kind_vars.len() {
-                self.kind_vars[i] = k.clone();
-            }
-        }
     }
 
     // ── 内置标量名查找（原 from_scalar_name）──

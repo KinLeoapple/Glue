@@ -47,6 +47,9 @@ enum Commands {
         /// worker 线程数（默认 1，即单线程模式）
         #[arg(long)]
         workers: Option<usize>,
+        /// 优化等级 0-3（默认 2）
+        #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
+        opt_level: Option<u8>,
     },
     /// 诊断模式（默认完整 pipeline，--stage 指定到某阶段停止并输出）
     Debug {
@@ -81,12 +84,28 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { name } => cmd_init(name),
-        Commands::Run { file, workers } => cmd_run(file, workers, false),
+        Commands::Run { file, workers, opt_level } => cmd_run(file, workers, false, opt_level_from(opt_level)),
         Commands::Debug { file, stage } => cmd_debug(file, stage),
     }
 }
 
 // ==================== 项目清单 ====================
+
+/// 从 CLI u8 参数构造 OptLevel，越界值钳制到合法范围。
+fn opt_level_from(v: Option<u8>) -> glue::pass::Optimizer::OptLevel {
+    use glue::pass::Optimizer::OptLevel;
+    match v {
+        None => OptLevel::default(),
+        Some(0) => OptLevel::O0,
+        Some(1) => OptLevel::O1,
+        Some(2) => OptLevel::O2,
+        Some(3) => OptLevel::O3,
+        Some(n) => {
+            eprintln!("warning: opt-level {} out of range [0,3], clamped to 3", n);
+            OptLevel::O3
+        }
+    }
+}
 
 /// 项目清单文件名
 const MANIFEST_NAME: &str = "glue.toml";
@@ -258,7 +277,7 @@ fn cmd_debug(file: Option<String>, stage: Option<DebugStage>) {
         DebugStage::EmitC => debug_emit_c(&source),
         DebugStage::EmitFfi => debug_emit_ffi(&source),
         DebugStage::Check => debug_check(&source, &entry_path),
-        DebugStage::Full => cmd_run(Some(entry_path), None, true),
+        DebugStage::Full => cmd_run(Some(entry_path), None, true, glue::pass::Optimizer::OptLevel::default()),
     }
 }
 
@@ -563,7 +582,7 @@ fn debug_check(source: &str, filename: &str) {
 
 // ==================== run 子命令（debug full 也复用） ====================
 
-fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
+fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool, opt_level: glue::pass::Optimizer::OptLevel) {
     let entry_path = resolve_entry_path(file);
     let source = read_source(&entry_path);
 
@@ -630,17 +649,22 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
         }
     }
     // 为每个非 entry 模块生成静态分析报告（memoize/dead_code/inline 等通用覆盖）
-    // leak 到堆上保持存活至程序结束（与 analysis_report 同生命周期，CLI 工具无回收需求）
-    let builtin_analyses: Vec<Option<&Analyzer::AnalysisReport>> = non_entry_modules.iter()
-        .map(|m| Analyzer::analyze(m, &m.arena, &sema_result))
-        .map(|r| Box::leak(Box::new(r)) as &Analyzer::AnalysisReport)
-        .map(Some)
-        .collect();
-    let mut graph = IrBuilder::new(&sema_result, &type_arena, &entry_module)
-        .with_builtins(non_entry_modules)
-        .with_analysis(&analysis_report)
-        .with_builtin_analyses(builtin_analyses)
-        .build();
+    // 持有 owned Box 避免泄漏：引用仅在 build() 期间有效，build 完成后随 owner 释放
+    let mut graph = {
+        let builtin_analyses_owned: Vec<Box<Analyzer::AnalysisReport>> = non_entry_modules
+            .iter()
+            .map(|m| Box::new(Analyzer::analyze(m, &m.arena, &sema_result)))
+            .collect();
+        let builtin_analyses: Vec<Option<&Analyzer::AnalysisReport>> = builtin_analyses_owned
+            .iter()
+            .map(|b| Some(b.as_ref()))
+            .collect();
+        IrBuilder::new(&sema_result, &type_arena, &entry_module)
+            .with_builtins(non_entry_modules)
+            .with_analysis(&analysis_report)
+            .with_builtin_analyses(builtin_analyses)
+            .build()
+    };
 
     // 检查 IR 编译错误（未实现的特性降级、找不到函数等）
     if !graph.ir_errors.is_empty() {
@@ -670,9 +694,8 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
     }
 
     // IR 后优化：LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE 固定点迭代
-    if std::env::var("GLUE_NO_OPT").is_err() {
-        glue::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report));
-    }
+    // opt_level 驱动：O0 跳过，O1 仅固定点，O2 全量，O3 全量+提高迭代上限
+    glue::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
 
     if debug {
         eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
