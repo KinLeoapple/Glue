@@ -65,10 +65,15 @@ pub fn hash_type_args(arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
     h
 }
 
-/// 构造单态化缓存键。格式：`{func_name}#{hash}`（与 Zig 版一致）。
-pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHandle]) -> String {
-    let hash = hash_type_args(arena, type_args);
-    format!("{}#{:x}", func_name, hash)
+/// 构造单态化缓存键：func_name 与 type_args 的 FNV-1a 组合 u64 哈希（无 String 分配）。
+pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in func_name.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= hash_type_args(arena, type_args);
+    h.wrapping_mul(0x100000001b3)
 }
 
 /// 查找已有单态化实例（仅查询缓存，不创建）。
@@ -116,7 +121,7 @@ struct WalkCtx<'a> {
     /// 而非调用点模块名，确保 IR Builder 查找时 key 一致）
     func_module_names: FxHashMap<&'a str, &'a str>,
     /// 循环检测：正在实例化的 cache_key → instance_id（前向引用支持）
-    in_progress: FxHashMap<String, u32>,
+    in_progress: FxHashMap<u64, u32>,
     /// 当前模块名（用于实参 expr_types 查询，实参属于调用点模块）
     module_name: &'a str,
 }
@@ -136,7 +141,10 @@ fn infer_type_args<'a>(
     arguments: &[ExprId],
     type_args_hint: Option<&[AstTypeRef]>,
     sig: &FuncSigInfo,
-    ctx: &WalkCtx<'a>,
+    ast: &'a AstArena<'a>,
+    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
+    func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
+    module_name: &str,
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) -> Vec<TypeHandle> {
@@ -145,7 +153,7 @@ fn infer_type_args<'a>(
         if !hints.is_empty() {
             let mut args = Vec::with_capacity(hints.len());
             for &tn in hints {
-                let h = resolve_type_node_resolved(arena, Some(tn), &[], ctx.ast, sema_result)
+                let h = resolve_type_node_resolved(arena, Some(tn), &[], ast, sema_result)
                     .unwrap_or_else(|| {
                         sema_result.add_error(SemaError::new(
                             &format!("failed to resolve type argument in {}", func_name),
@@ -160,7 +168,7 @@ fn infer_type_args<'a>(
     }
 
     // 2. 隐式推断
-    let fd_decl = match ctx.func_decls.get(func_name).copied() {
+    let fd_decl = match func_decls.get(func_name).copied() {
         Some(d) => d,
         None => {
             // AST 不可达（可能是方法或内建函数）：为每个类型参数创建具名 Adt 占位
@@ -173,7 +181,7 @@ fn infer_type_args<'a>(
     };
     // 被调函数所在模块的 arena：跨模块时类型注解 TypeId 属于被调模块 arena，
     // 必须用 fd_ast（而非 ctx.ast）访问，否则越界。
-    let fd_ast = ctx.func_arenas.get(func_name).copied().unwrap_or(ctx.ast);
+    let fd_ast = func_arenas.get(func_name).copied().unwrap_or(ast);
     let fd = match &fd_decl.node {
         Decl::FunDecl {
             type_params,
@@ -211,7 +219,7 @@ fn infer_type_args<'a>(
         if !is_type_param(pname) || name_to_handle.contains_key(pname) {
             continue;
         }
-        let arg_key = module_expr_key(ctx.module_name, arg.0 as u64);
+        let arg_key = module_expr_key(module_name, arg.0 as u64);
         if let Some(info) = sema_result.get_expr(arg_key) {
             name_to_handle.insert(pname, info.ty);
         }
@@ -230,7 +238,7 @@ fn infer_type_args<'a>(
             } => (fn_params.as_slice(), *fn_ret),
             _ => continue,
         };
-        let lambda = match &ctx.ast.expr(*arg).node {
+        let lambda = match &ast.expr(*arg).node {
             Expr::Lambda {
                 params: lambda_params,
                 return_type: lambda_rt,
@@ -254,7 +262,7 @@ fn infer_type_args<'a>(
             }
             if let Some(lt) = lambda_params[j].type_annotation {
                 if let Some(h) =
-                    resolve_type_node_resolved(arena, Some(lt), &[], ctx.ast, sema_result)
+                    resolve_type_node_resolved(arena, Some(lt), &[], ast, sema_result)
                 {
                     name_to_handle.insert(fp_name, h);
                 }
@@ -270,11 +278,11 @@ fn infer_type_args<'a>(
             if is_type_param(ret_name) && !name_to_handle.contains_key(ret_name) {
                 if let Some(lrt) = lambda_rt {
                     if let Some(h) =
-                        resolve_type_node_resolved(arena, Some(lrt), &[], ctx.ast, sema_result)
+                        resolve_type_node_resolved(arena, Some(lrt), &[], ast, sema_result)
                     {
                         name_to_handle.insert(ret_name, h);
                     }
-                } else if let Some(h) = infer_lambda_return_type(lambda, ctx, sema_result, arena) {
+                } else if let Some(h) = infer_lambda_return_type(lambda, ast, module_name, sema_result, arena) {
                     name_to_handle.insert(ret_name, h);
                 }
             }
@@ -301,22 +309,23 @@ fn infer_type_args<'a>(
 /// 优先：显式返回类型注解 → body expression 的 ExprInfo → block trailing_expr 的 ExprInfo。
 fn infer_lambda_return_type<'a>(
     lambda: (&'a [Param<'a>], Option<AstTypeRef>, &'a LambdaBody),
-    ctx: &WalkCtx<'a>,
+    ast: &'a AstArena<'a>,
+    module_name: &str,
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) -> Option<TypeHandle> {
     let (_, lambda_rt, body) = lambda;
     if let Some(rt) = lambda_rt {
-        return resolve_type_node_resolved(arena, Some(rt), &[], ctx.ast, sema_result);
+        return resolve_type_node_resolved(arena, Some(rt), &[], ast, sema_result);
     }
     match body {
         LambdaBody::Expression(body_expr) => {
-            let key = module_expr_key(ctx.module_name, body_expr.0 as u64);
+            let key = module_expr_key(module_name, body_expr.0 as u64);
             sema_result.get_expr(key).map(|info| info.ty)
         }
         LambdaBody::Block(block_expr) => {
-            if let Expr::Block { trailing: Some(trailing), .. } = &ctx.ast.expr(*block_expr).node {
-                let key = module_expr_key(ctx.module_name, trailing.0 as u64);
+            if let Expr::Block { trailing: Some(trailing), .. } = &ast.expr(*block_expr).node {
+                let key = module_expr_key(module_name, trailing.0 as u64);
                 return sema_result.get_expr(key).map(|info| info.ty);
             }
             None
@@ -338,7 +347,7 @@ fn get_or_create_instance<'a>(
     func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
     func_module_names: &FxHashMap<&'a str, &'a str>,
-    in_progress: &mut FxHashMap<String, u32>,
+    in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
     arena: &mut TypeArena,
@@ -402,7 +411,7 @@ fn get_or_create_instance<'a>(
     };
 
     // 4. 标记为正在实例化（前向引用支持）
-    in_progress.insert(cache_key.clone(), instance_id);
+    in_progress.insert(cache_key, instance_id);
 
     // 5. 递归解析函数体类型（instance 是栈上局部，与 sema_result 无别名）
     // module_name 是被调函数所在模块名，确保 expr_types key 与 IR Builder 查找一致
@@ -451,7 +460,7 @@ fn process_call<'a>(
     func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
     func_module_names: &FxHashMap<&'a str, &'a str>,
-    in_progress: &mut FxHashMap<String, u32>,
+    in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
     arena: &mut TypeArena,
@@ -479,15 +488,18 @@ fn process_call<'a>(
     // module_name 必须用调用点所在模块：实参表达式的类型信息以
     // module_expr_key(调用点模块, expr_id) 为 key 存入 expr_types，
     // 若用空串将导致 infer_type_args 查不到实参类型，T 无法绑定。
-    let ctx = WalkCtx {
+    let type_args = infer_type_args(
+        func_name,
+        arguments,
+        type_args_hint,
+        &sig,
         ast,
-        func_decls: func_decls.clone(),
-        func_arenas: func_arenas.clone(),
-        func_module_names: func_module_names.clone(),
-        in_progress: FxHashMap::default(),
+        func_decls,
+        func_arenas,
         module_name,
-    };
-    let type_args = infer_type_args(func_name, arguments, type_args_hint, &sig, &ctx, sema_result, arena);
+        sema_result,
+        arena,
+    );
 
     // 查找或创建实例
     // ast 用被调函数所在模块 arena（跨模块时 body ExprId 属于被调模块 arena），
@@ -531,7 +543,7 @@ fn process_method_call<'a>(
     func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
     func_module_names: &FxHashMap<&'a str, &'a str>,
-    in_progress: &mut FxHashMap<String, u32>,
+    in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
     arena: &mut TypeArena,
@@ -549,15 +561,18 @@ fn process_method_call<'a>(
         None => return,
     };
 
-    let ctx = WalkCtx {
+    let type_args = infer_type_args(
+        method,
+        arguments,
+        type_args_hint,
+        &sig,
         ast,
-        func_decls: func_decls.clone(),
-        func_arenas: func_arenas.clone(),
-        func_module_names: func_module_names.clone(),
-        in_progress: FxHashMap::default(),
+        func_decls,
+        func_arenas,
         module_name,
-    };
-    let type_args = infer_type_args(method, arguments, type_args_hint, &sig, &ctx, sema_result, arena);
+        sema_result,
+        arena,
+    );
 
     // ast 用被调函数所在模块 arena（跨模块 Module.fun() 调用时 body 属于被调模块）
     let callee_ast = func_arenas.get(method).copied().unwrap_or(ast);
@@ -1025,7 +1040,7 @@ fn resolve_instance_body_types<'a>(
     func_decls: &'a FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &'a FxHashMap<&'a str, &'a AstArena<'a>>,
     func_module_names: &'a FxHashMap<&'a str, &'a str>,
-    in_progress: &mut FxHashMap<String, u32>,
+    in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     type_args: &[TypeHandle],
     module_name: &'a str,

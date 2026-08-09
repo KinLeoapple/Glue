@@ -508,7 +508,7 @@ pub struct SemaResult {
     /// 单态化实例表
     pub monomorph_instances: Vec<MonomorphInstance>,
     /// 单态化实例名 → monomorph_instances 索引
-    pub monomorph_index: FxHashMap<String, u32>,
+    pub monomorph_index: FxHashMap<u64, u32>,
     /// trait 默认方法单态化实例表（Sema 后阶段由 Monomorph 模块收集）
     pub trait_default_instances: Vec<TraitDefaultInstance>,
     /// 动态 ops 注册表（用户类型 ops，替代 TypeDescriptorPool）

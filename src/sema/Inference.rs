@@ -56,7 +56,7 @@ pub struct InstantiationCtx {
     /// 暂存的 field_accesses 元信息（key = module_expr_key）
     pub local_field_accesses: FxHashMap<u64, FieldAccessInfo>,
     /// 循环检测：正在实例化的 cache_key → instance_id（前向引用支持）
-    pub in_progress: FxHashMap<String, u32>,
+    pub in_progress: FxHashMap<u64, u32>,
 }
 
 /// type_binding_stack 和 self_binding_stack 随 impl/trait/fn 块进出而 push/pop。
@@ -255,7 +255,7 @@ impl<'a> InferContext<'a> {
         type_args: Box<[TypeHandle]>,
         type_param_names: &[&str],
         module_name: String,
-        in_progress: FxHashMap<String, u32>,
+        in_progress: FxHashMap<u64, u32>,
     ) {
         // 将 type_binding_stack 栈顶的 rigid var 替换为具体 type_args
         for (i, &name) in type_param_names.iter().enumerate() {
@@ -289,7 +289,7 @@ impl<'a> InferContext<'a> {
     ) -> Option<(
         FxHashMap<u64, ExprInfo>,
         FxHashMap<u64, FieldAccessInfo>,
-        FxHashMap<String, u32>,
+        FxHashMap<u64, u32>,
     )> {
         self.instantiation_ctx.take().map(|ctx| {
             (

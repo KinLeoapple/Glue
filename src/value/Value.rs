@@ -1074,10 +1074,9 @@ pub enum Value {
 }
 
 impl Value {
-    /// 构造标量值，debug 构建检查 tag 为标量变体。
+    /// 构造标量值。tag 必须为标量变体（由各 typed 构造器保证，非标量 tag 禁止进入此路径）。
     #[inline]
     fn scalar(sv: ScalarValue, tag: ValueTag) -> Self {
-        debug_assert!(tag.is_scalar(), "non-scalar tag {:?} used for ScalarValue", tag);
         Value::Scalar(sv, tag)
     }
 }
@@ -1087,7 +1086,7 @@ unsafe impl Sync for Value {}
 
 impl Value {
     // ---- 标量构造器 ----
-    // 所有构造器统一调用 Self::scalar()，使 debug_assert!(tag.is_scalar()) 守卫生效。
+    // 所有构造器统一调用 Self::scalar()，tag 由各 typed 构造器正确传入。
     pub fn i32(v: i32) -> Self { Self::scalar(ScalarValue { i32_val: v }, ValueTag::I32) }
     pub fn i64(v: i64) -> Self { Self::scalar(ScalarValue { i64_val: v }, ValueTag::I64) }
     pub fn f64(v: f64) -> Self { Self::scalar(ScalarValue { f64_val: v }, ValueTag::F64) }

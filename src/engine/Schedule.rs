@@ -1,4 +1,7 @@
-//! 数据流调度核心：SIMD/rayon 批量化、就绪调度自由函数、run_frame_nodes、process_frame。
+//! 数据流调度核心：就绪调度自由函数、run_frame_nodes、process_frame。
+//!
+//! SIMD 批量化已下沉到 compute_fn 内部（通过 EvalContext + do_simd_batch），
+//! engine 热循环不再有批处理特化检查。
 
 use super::*;
 use crate::ir::Ir::*;
@@ -7,224 +10,11 @@ use crate::value::Value;
 use crate::ir::Compute::char_from_u32_or_nul;
 
 // =========================================================================
-// SIMD/rayon 批量化调度 — 模块级宏 + 自由函数
-// =========================================================================
-
-/// 批量提取二元运算输入 → SIMD/rayon 批算 → 写回 value_table。
-macro_rules! exec_bin_batch {
-    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $batch_fn:ident, $op:expr) => {{
-        let n = $locals.len();
-        let mut a: Vec<$rust> = Vec::with_capacity(n);
-        let mut b: Vec<$rust> = Vec::with_capacity(n);
-        for &lid in $locals.iter() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let node = $graph.nodes[gid.0 as usize];
-            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
-            a.push($frame.get_value_by_global(inp[0]).$acc());
-            b.push($frame.get_value_by_global(inp[1]).$acc());
-        }
-        let mut dst = vec![0 as $rust; n];
-        crate::value::$batch_fn(&mut dst, &a, &b, $op);
-        for (i, &lid) in $locals.iter().enumerate() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
-            $frame.set_value(lid, Value::$ctor(dst[i]), cc);
-        }
-    }};
-}
-
-/// 批量提取比较运算输入 → SIMD/rayon 批算 → 写回 value_table（结果为 bool）。
-macro_rules! exec_cmp_batch {
-    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $acc:ident, $batch_fn:ident, $op:expr) => {{
-        let n = $locals.len();
-        let mut a: Vec<$rust> = Vec::with_capacity(n);
-        let mut b: Vec<$rust> = Vec::with_capacity(n);
-        for &lid in $locals.iter() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let node = $graph.nodes[gid.0 as usize];
-            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
-            a.push($frame.get_value_by_global(inp[0]).$acc());
-            b.push($frame.get_value_by_global(inp[1]).$acc());
-        }
-        let mut mask = vec![0u8; n];
-        crate::value::$batch_fn(&mut mask, &a, &b, $op);
-        for (i, &lid) in $locals.iter().enumerate() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
-            $frame.set_value(lid, Value::bool_val(mask[i] != 0), cc);
-        }
-    }};
-}
-
-/// 批量提取一元运算输入 → SIMD/rayon 批算 → 写回 value_table。
-macro_rules! exec_unary_batch {
-    ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $op:expr) => {{
-        let n = $locals.len();
-        let mut a: Vec<$rust> = Vec::with_capacity(n);
-        for &lid in $locals.iter() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let node = $graph.nodes[gid.0 as usize];
-            let inp = $graph.inputs_pool.get(node.inputs_offset, node.input_count);
-            a.push($frame.get_value_by_global(inp[0]).$acc());
-        }
-        let mut dst = vec![0 as $rust; n];
-        crate::value::batch_unaryop(&mut dst, &a, $op);
-        for (i, &lid) in $locals.iter().enumerate() {
-            let gid = NodeId(lid.0 + $ns.0);
-            let cc = $graph.downstreams[gid.0 as usize].len() as u16;
-            $frame.set_value(lid, Value::$ctor(dst[i]), cc);
-        }
-    }};
-}
-
-/// 处理一批同质批量化节点（相同 ValueTag + BatchOp），使用 SIMD/rayon 批算。
-///
-/// 从 value_table 提取输入到连续 typed 数组，调用 Value.rs 的 batch 函数，
-/// 写回结果并通知下游。仅适用于 BinOp/UnOp/Cmp 标量运算节点。
-fn process_batch_group(
-    frame: &mut Frame,
-    graph: &DataFlowGraph,
-    locals: &[NodeId],
-    node_start: NodeId,
-    info: BatchInfo,
-) -> bool {
-    use crate::value::{ValueTag, BinOp, CmpOp, UnaryOp};
-    let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
-
-    if locals.is_empty() { return false; }
-
-    match info {
-        BatchInfo { tag, op: BatchOp::Bin(op) } => {
-            match tag {
-                ValueTag::I32 => exec_bin_batch!(frame, graph, locals, node_start, i32, i32, as_i32, batch_binop_i32, op),
-                ValueTag::I64 => exec_bin_batch!(frame, graph, locals, node_start, i64, i64, as_i64, batch_binop_i64, op),
-                ValueTag::F32 => exec_bin_batch!(frame, graph, locals, node_start, f32, f32, as_f32, batch_binop_f32, op),
-                ValueTag::F64 => exec_bin_batch!(frame, graph, locals, node_start, f64, f64, as_f64, batch_binop_f64, op),
-                ValueTag::I8 => exec_bin_batch!(frame, graph, locals, node_start, i8, i8, as_i8, batch_binop, op),
-                ValueTag::I16 => exec_bin_batch!(frame, graph, locals, node_start, i16, i16, as_i16, batch_binop, op),
-                ValueTag::U8 => exec_bin_batch!(frame, graph, locals, node_start, u8, u8, as_u8, batch_binop, op),
-                ValueTag::U16 => exec_bin_batch!(frame, graph, locals, node_start, u16, u16, as_u16, batch_binop, op),
-                ValueTag::U32 => exec_bin_batch!(frame, graph, locals, node_start, u32, u32, as_u32, batch_binop, op),
-                ValueTag::U64 => exec_bin_batch!(frame, graph, locals, node_start, u64, u64, as_u64, batch_binop, op),
-                ValueTag::I128 => exec_bin_batch!(frame, graph, locals, node_start, i128, i128, as_i128, batch_binop, op),
-                ValueTag::U128 => exec_bin_batch!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op),
-                ValueTag::Isize => exec_bin_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op),
-                ValueTag::Usize => exec_bin_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op),
-                _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
-            }
-        }
-        BatchInfo { tag, op: BatchOp::Cmp(op) } => {
-            match tag {
-                ValueTag::F32 => exec_cmp_batch!(frame, graph, locals, node_start, f32, as_f32, batch_cmp_f32, op),
-                ValueTag::F64 => exec_cmp_batch!(frame, graph, locals, node_start, f64, as_f64, batch_cmp_f64, op),
-                ValueTag::I32 => exec_cmp_batch!(frame, graph, locals, node_start, i32, as_i32, batch_cmp, op),
-                ValueTag::I64 => exec_cmp_batch!(frame, graph, locals, node_start, i64, as_i64, batch_cmp, op),
-                ValueTag::I8 => exec_cmp_batch!(frame, graph, locals, node_start, i8, as_i8, batch_cmp, op),
-                ValueTag::I16 => exec_cmp_batch!(frame, graph, locals, node_start, i16, as_i16, batch_cmp, op),
-                ValueTag::U8 => exec_cmp_batch!(frame, graph, locals, node_start, u8, as_u8, batch_cmp, op),
-                ValueTag::U16 => exec_cmp_batch!(frame, graph, locals, node_start, u16, as_u16, batch_cmp, op),
-                ValueTag::U32 => exec_cmp_batch!(frame, graph, locals, node_start, u32, as_u32, batch_cmp, op),
-                ValueTag::U64 => exec_cmp_batch!(frame, graph, locals, node_start, u64, as_u64, batch_cmp, op),
-                ValueTag::I128 => exec_cmp_batch!(frame, graph, locals, node_start, i128, as_i128, batch_cmp, op),
-                ValueTag::U128 => exec_cmp_batch!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op),
-                ValueTag::Isize => exec_cmp_batch!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op),
-                ValueTag::Usize => exec_cmp_batch!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op),
-                _ => return false, // F16/F128/Bool/Char → 不支持，回退到单节点路径
-            }
-        }
-        BatchInfo { tag, op: BatchOp::Unary(op) } => {
-            match tag {
-                ValueTag::I32 => exec_unary_batch!(frame, graph, locals, node_start, i32, i32, as_i32, op),
-                ValueTag::I64 => exec_unary_batch!(frame, graph, locals, node_start, i64, i64, as_i64, op),
-                ValueTag::I8 => exec_unary_batch!(frame, graph, locals, node_start, i8, i8, as_i8, op),
-                ValueTag::I16 => exec_unary_batch!(frame, graph, locals, node_start, i16, i16, as_i16, op),
-                ValueTag::U8 => exec_unary_batch!(frame, graph, locals, node_start, u8, u8, as_u8, op),
-                ValueTag::U16 => exec_unary_batch!(frame, graph, locals, node_start, u16, u16, as_u16, op),
-                ValueTag::U32 => exec_unary_batch!(frame, graph, locals, node_start, u32, u32, as_u32, op),
-                ValueTag::U64 => exec_unary_batch!(frame, graph, locals, node_start, u64, u64, as_u64, op),
-                ValueTag::I128 => exec_unary_batch!(frame, graph, locals, node_start, i128, i128, as_i128, op),
-                ValueTag::U128 => exec_unary_batch!(frame, graph, locals, node_start, u128, u128, as_u128, op),
-                ValueTag::Isize => exec_unary_batch!(frame, graph, locals, node_start, isize, isize_val, as_isize, op),
-                ValueTag::Usize => exec_unary_batch!(frame, graph, locals, node_start, usize, usize_val, as_usize, op),
-                _ => return false, // F16/F128/F32/F64/Bool/Char → 不支持，回退到单节点路径
-            }
-        }
-    }
-
-    // 通知所有批处理节点的下游
-    for &lid in locals {
-        let gid = NodeId(lid.0 + node_start.0);
-        notify_downstream(frame, graph, lid, gid, node_start);
-    }
-    true
-}
-
-/// 尝试批量化处理就绪队列中的节点。
-///
-/// drain ready_queue → 按 (ValueTag, BatchOp) 分组 → 对 2+ 节点的组
-/// 调用 process_batch_group 做 SIMD/rayon 批算 → 非批量化节点推回 ready_queue。
-/// 返回 true 表示执行了批处理（调用方应 continue 重新检查新就绪节点）。
-fn try_batch_nodes(frame: &mut Frame, graph: &DataFlowGraph) -> bool {
-    let qlen = frame.ready_queue.len();
-    if qlen < 2 { return false; }
-
-    let node_start = frame.node_offset;
-    let wave: Vec<NodeId> = frame.ready_queue.drain(..).collect();
-
-    // 分区：batchable（有 BatchInfo 且未预填充）vs rest
-    let mut groups: Vec<(BatchInfo, Vec<NodeId>)> = Vec::new();
-    let mut rest: Vec<NodeId> = Vec::new();
-
-    for lid in wave {
-        if frame.value_table.ready[lid.0 as usize] {
-            rest.push(lid);
-            continue;
-        }
-        let gid = NodeId(lid.0 + node_start);
-        let batch_info = graph.batch_infos[gid.0 as usize];
-        if let Some(info) = batch_info {
-            if let Some(g) = groups.iter_mut().find(|(k, _)| *k == info) {
-                g.1.push(lid);
-            } else {
-                groups.push((info, vec![lid]));
-            }
-        } else {
-            rest.push(lid);
-        }
-    }
-
-    // 处理 2+ 节点的组
-    let mut batch_done = false;
-    for (info, locals) in groups {
-        if locals.len() >= 2 {
-            let processed = process_batch_group(frame, graph, &locals, NodeId(node_start), info);
-            if processed {
-                batch_done = true;
-            } else {
-                // 批处理不支持此类型，节点回退到单节点路径
-                for lid in locals {
-                    rest.push(lid);
-                }
-            }
-        } else {
-            rest.push(locals[0]);
-        }
-    }
-
-    // 非批量化节点推回 ready_queue
-    for n in rest {
-        frame.push_ready(n);
-    }
-
-    batch_done
-}
-
-// =========================================================================
 // 帧操作辅助函数（纯函数，不依赖 Engine 状态）
 // =========================================================================
 
 /// 将 ConstValue 转换为 Value（不使用 arena，直接构造）。
-pub(super) fn alloc_const_value(cv: ConstValue) -> Value {
+pub fn alloc_const_value(cv: ConstValue) -> Value {
     match cv {
         ConstValue::I8(v) => Value::i8(v),
         ConstValue::I16(v) => Value::i16(v),
@@ -261,19 +51,10 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     let offset = node_start.0 as usize;
     let node_end_global = node_start.0 + node_count as u32;
 
-    // 收集嵌套子图范围
-    let nested_ranges: Vec<(u32, u32)> = graph
-        .subgraphs
-        .iter()
-        .filter(|sg| {
-            sg.id != sg_id
-                && sg.node_range.0 .0 >= node_start.0
-                && sg.node_range.1 .0 <= node_end_global
-        })
-        .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
-        .collect();
+    // 使用预计算的 nested_ranges（构建期填充），避免运行时全图扫描
+    let nested_ranges: &[(u32, u32)] = &graph.subgraphs[sg_id.0 as usize].nested_ranges;
 
-    if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+    if super::env_flag("GLUE_DEBUG_STALL") {
         eprintln!("[PREPARE] sg={} node_range=[{},{}) nested={:?}",
             sg_id.0, node_start.0, node_end_global, nested_ranges);
     }
@@ -311,39 +92,13 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
         }
     }
 
-    // 2. 预填充 Const 节点
-    for i in 0..node_count {
-        if is_nested((offset + i) as u32) {
-            continue;
-        }
-        let kind = graph.nodes[offset + i].kind;
-        if kind == NodeKind::Const {
-            if let Some(cv) = graph.const_values[offset + i] {
-                let handle = alloc_const_value(cv);
-                let local_id = NodeId(i as u32);
-                let consumer_count = graph.downstreams[offset + i].len() as u16;
-                frame.set_value(local_id, handle, consumer_count);
-                frame.push_ready(local_id);
-            } else if std::env::var("GLUE_DEBUG_STALL").is_ok() {
-                let gid = NodeId((offset + i) as u32);
-                let n = graph.nodes[offset + i];
-                eprintln!("[WARN] sg={} Const node={} cf={} has NO const_values! inputs_count={}",
-                    sg_id.0, gid.0, n.compute_fn.0, n.input_count);
-            }
-        }
-    }
-
-    // 3. 非 Const 节点 with 0 inputs 入就绪队列
+    // 2. 0-input 节点入就绪队列（Const 节点也走此路径——compute_fn 返回值）
     let param_count = graph.subgraphs[sg_id.0 as usize].param_count as usize;
     for i in 0..node_count {
         if i < param_count {
             continue;
         }
         if is_nested((offset + i) as u32) {
-            continue;
-        }
-        let kind = graph.nodes[offset + i].kind;
-        if kind == NodeKind::Const {
             continue;
         }
         if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
@@ -382,14 +137,18 @@ pub fn notify_downstream(
         // 跳过 PENDING_EXTERNAL 哨兵（嵌套子图节点/EventSource 节点）：
         // 这些节点由子帧或事件驱动，不应被父帧的 notify_downstream 递减。
         // 若递减会腐蚀哨兵（65535→65534），累计 65535 次后归零，嵌套节点被错误推入父帧执行。
+        //
+        // 只有 pending 从 >0 递减到 0 时才 push_ready。
+        // pending=0 的节点已被 prepare_frame_nodes 的 0-input 入队推入，
+        // 重复 push 会导致节点被多次执行（如 Gate 节点重复触发子帧启动，
+        // 子帧返回值覆盖、条件值未就绪时 Gate 提前执行读到 null）。
         let pending = frame.pending_inputs[ds_local_id.0 as usize];
         if pending > 0 && pending != PENDING_EXTERNAL {
-            frame.pending_inputs[ds_local_id.0 as usize] = pending - 1;
-        }
-        if frame.pending_inputs[ds_local_id.0 as usize] == 0
-            && !frame.value_table.ready[ds_local_id.0 as usize]
-        {
-            frame.push_ready(ds_local_id);
+            let new_pending = pending - 1;
+            frame.pending_inputs[ds_local_id.0 as usize] = new_pending;
+            if new_pending == 0 && !frame.value_table.ready[ds_local_id.0 as usize] {
+                frame.push_ready(ds_local_id);
+            }
         }
     }
 }
@@ -441,21 +200,16 @@ impl<S: LockStrategy> Engine<S> {
                 return;
             }
 
-            // SIMD/rayon 批量化
-            if try_batch_nodes(frame, &graph) {
-                continue;
-            }
-
-            // 弹出就绪节点（局部 id）
+            // POP: 弹出就绪节点（局部 id）
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
-                    if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+                    if super::env_flag("GLUE_DEBUG_STALL") {
                         let sg_id = frame.subgraph_id;
                         let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
                         let ncnt = (ne.0 - ns.0) as usize;
-                        eprintln!("[STALL] frame={} sg={} node_range=[{},{}) control={:?} pending={:?}",
-                            fid.0, sg_id.0, ns.0, ne.0, frame.control_signal, frame.pending.is_some());
+                        eprintln!("[STALL] frame={} sg={} node_range=[{},{}) control={:?}",
+                            fid.0, sg_id.0, ns.0, ne.0, frame.control_signal);
                         for i in 0..ncnt {
                             let gid = NodeId(i as u32 + ns.0);
                             let n = &graph.nodes[gid.0 as usize];
@@ -475,427 +229,357 @@ impl<S: LockStrategy> Engine<S> {
             let node_start = frame.node_offset;
             let graph_node_id = NodeId(local_id.0 + node_start);
             let node = graph.nodes[graph_node_id.0 as usize];
+            let ctx = EvalContext { node_start };
 
-            // 预填充节点跳过 compute_fn
-            let pre_filled = frame.value_table.ready[local_id.0 as usize];
-            let value = if pre_filled {
-                frame.value_table.values[local_id.0 as usize].clone()
-            } else if graph.safe_op_flags[graph_node_id.0 as usize] {
-                let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
-                if !inputs.is_empty() && matches!(frame.get_value_by_global(inputs[0]), Value::Null) {
-                    Value::Null
-                } else {
-                    let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
-                    compute_fn(frame, graph_node_id)
+            // COMPUTE: 统一调用 compute_fn，无特化检查
+            let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
+
+            // MATCH NodeResult: 统一副作用处理
+            match result {
+                NodeResult::Value(v) => {
+                    let cc = graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                    frame.set_value(local_id, v, cc);
+                    notify_downstream(frame, &graph, local_id, graph_node_id, NodeId(node_start));
                 }
-            } else {
-                let compute_fn = graph.compute_fns[node.compute_fn.0 as usize];
-                compute_fn(frame, graph_node_id)
-            };
-
-            // vtable 动态分派
-            if frame.pending.is_none() {
-                if let Some(method_idx) = graph.vtable_call_methods[graph_node_id.0 as usize] {
-                    let n = &graph.nodes[graph_node_id.0 as usize];
-                    let inputs = graph.inputs_pool.get(n.inputs_offset, n.input_count);
-                    let recv_val = frame.get_value_by_global(inputs[0]);
-
-                    let (target_sg, upvalues): (crate::ir::Ir::SubGraphId, Vec<Value>) = match recv_val
-                        .heap_obj()
-                    {
-                        Some(crate::value::HeapObj::TraitVal(tv)) => {
-                            let idx = method_idx as usize;
-                            match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                                Some(crate::value::HeapObj::Closure(c)) => {
-                                    (crate::ir::Ir::SubGraphId(c.func_id), c.upvalues.clone())
-                                }
-                                _ => panic!("vtable method_idx {} is not a Closure", method_idx),
-                            }
-                        }
-                        _ => panic!("vtable call on non-trait value"),
-                    };
-
-                    let arity = (graph.subgraphs[target_sg.0 as usize].param_count as usize)
-                        .saturating_sub(upvalues.len());
-                    let mut args: Vec<Value> = Vec::with_capacity(arity + upvalues.len());
-                    for &in_node in inputs.iter().skip(1).take(arity) {
-                        args.push(frame.get_value_by_global(in_node));
+                NodeResult::Batch(results) => {
+                    for &(lid, ref v) in &results {
+                        let gid = NodeId(lid.0 + node_start);
+                        let cc = graph.downstreams[gid.0 as usize].len() as u16;
+                        frame.set_value(lid, v.clone(), cc);
                     }
-                    args.extend(upvalues);
-
-                    let call_node_local = NodeId(graph_node_id.0.wrapping_sub(frame.node_offset));
-                    frame.pending = Some(Pending::Call(PendingCall {
-                        target_sg,
-                        args,
-                        call_node_local,
-                        is_async: false,
-                        closure_val: None,
-                    }));
+                    for &(lid, _) in &results {
+                        frame.ready_queue.retain(|n| *n != lid);
+                    }
+                    for &(lid, _) in &results {
+                        let gid = NodeId(lid.0 + node_start);
+                        notify_downstream(frame, &graph, lid, gid, NodeId(node_start));
+                    }
                 }
-            }
-
-            // 统一消费 pending
-            let pending = frame.pending.take();
-            if let Some(pending) = pending {
-                match pending {
-                    crate::ir::Ir::Pending::Call(pending) => {
-                        // 尾调用图跳转
-                        let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
-                        if graph.tail_call_flags[graph_call_id.0 as usize] {
-                            // 尾调用传播：从 frames 取出 caller 帧并 switch
-                            let caller = frame.caller;
-                            let propagate_to_parent =
-                                if let Some((caller_fid, call_node)) = caller {
-                                    let frames = self.frames.lock();
-                                    if let Some(caller_frame) = frames.get(&caller_fid) {
-                                        let caller_sg_id = caller_frame.subgraph_id;
-                                        let caller_loop_kind =
-                                            graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
-                                        let caller_has_caller = caller_frame.caller.is_some();
-                                        let caller_offset = caller_frame.node_offset;
-                                        let caller_graph_node =
-                                            NodeId(call_node.0 + caller_offset);
-                                        let caller_is_gate = graph.nodes[caller_graph_node.0
-                                            as usize]
-                                            .kind
-                                            == NodeKind::Gate;
-                                        caller_is_gate
-                                            && caller_loop_kind
-                                                != crate::ir::Ir::LoopKind::LoopBody
-                                            && caller_has_caller
-                                    } else {
-                                        false
-                                    }
+                NodeResult::Call(pending) => {
+                    // 尾调用图跳转
+                    let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
+                    if graph.tail_call_flags[graph_call_id.0 as usize] {
+                        let caller = frame.caller;
+                        let propagate_to_parent =
+                            if let Some((caller_fid, call_node)) = caller {
+                                let frames = self.frames.lock();
+                                if let Some(caller_frame) = frames.get(&caller_fid) {
+                                    let caller_sg_id = caller_frame.subgraph_id;
+                                    let caller_loop_kind =
+                                        graph.subgraphs[caller_sg_id.0 as usize].loop_kind;
+                                    let caller_has_caller = caller_frame.caller.is_some();
+                                    let caller_offset = caller_frame.node_offset;
+                                    let caller_graph_node =
+                                        NodeId(call_node.0 + caller_offset);
+                                    let caller_is_gate = graph.nodes[caller_graph_node.0
+                                        as usize]
+                                        .kind
+                                        == NodeKind::Gate;
+                                    caller_is_gate
+                                        && caller_loop_kind
+                                            != crate::ir::Ir::LoopKind::LoopBody
+                                        && caller_has_caller
                                 } else {
                                     false
-                                };
-
-                            if propagate_to_parent {
-                                let (caller_fid, _) = caller.unwrap();
-                                let orig_caller = {
-                                    let mut frames = self.frames.lock();
-                                    frames.remove(&caller_fid).and_then(|cf| cf.caller)
-                                };
-                                self.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
-                                self.pending_completions.lock().remove(&caller_fid);
-                                frame.caller = orig_caller;
-                                switch_subgraph(
-                                    frame,
-                                    &graph,
-                                    pending.target_sg,
-                                    &pending.args,
-                                );
-                            } else {
-                                switch_subgraph(
-                                    frame,
-                                    &graph,
-                                    pending.target_sg,
-                                    &pending.args,
-                                );
-                            }
-                            continue;
-                        }
-
-                        // LoopBody 帧复用（从 Engine 版本移植）
-                        let target_loop_kind =
-                            graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
-                        let child_fid = if target_loop_kind
-                            == crate::ir::Ir::LoopKind::LoopBody
-                        {
-                            if let Some(bfid) = frame.body_frame_id {
-                                // 复用 body_sg 帧：注入参数 + 入就绪队列
-                                let target_sg =
-                                    &graph.subgraphs[pending.target_sg.0 as usize];
-                                let param_count = target_sg.param_count as usize;
-                                let mut body_frame = self.frames.lock().remove(&bfid);
-                                if let Some(bf) = body_frame.as_mut() {
-                                    // 使用 bf.node_offset 计算参数的本地索引：
-                                    // 同函数分支帧的 node_offset 是父函数的 node_start，
-                                    // 参数在值表中的位置 = branch_start - parent_start + i。
-                                    // 跨函数调用时 param_local_offset=0，与原逻辑一致。
-                                    let parent_start = bf.node_offset;
-                                    let branch_start = target_sg.node_range.0 .0;
-                                    let param_local_offset =
-                                        (branch_start.wrapping_sub(parent_start)) as usize;
-                                    for (i, arg) in
-                                        pending.args.iter().enumerate().take(param_count)
-                                    {
-                                        let local_id =
-                                            NodeId((param_local_offset + i) as u32);
-                                        let gid = (branch_start as usize) + i;
-                                        let consumer_count =
-                                            graph.downstreams[gid].len() as u16;
-                                        bf.set_value(local_id, arg.clone(), consumer_count);
-                                        bf.push_ready(local_id);
-                                    }
-                                    bf.caller = Some((fid, pending.call_node_local));
-                                    bf.parent_frame_ptr = std::ptr::null_mut();
-                                    bf.state = FrameState::Ready;
                                 }
-                                if let Some(bf) = body_frame {
-                                    self.frames.lock().insert(bfid, bf);
-                                }
-                                bfid
                             } else {
-                                // 首次创建 body_sg 帧
-                                let bfid = self.start_subgraph(
-                                    fid,
-                                    pending.call_node_local,
-                                    pending.target_sg,
-                                    &pending.args,
-                                    frame,
-                                    pending.closure_val.clone(),
-                                );
-                                frame.body_frame_id = Some(bfid);
-                                bfid
-                            }
+                                false
+                            };
+
+                        if propagate_to_parent {
+                            let (caller_fid, _) = caller.unwrap();
+                            let orig_caller = {
+                                let mut frames = self.frames.lock();
+                                frames.remove(&caller_fid).and_then(|cf| cf.caller)
+                            };
+                            self.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
+                            self.pending_completions.lock().remove(&caller_fid);
+                            frame.caller = orig_caller;
+                            switch_subgraph(
+                                frame,
+                                &graph,
+                                pending.target_sg,
+                                &pending.args,
+                            );
                         } else {
-                            // 非 LoopBody：正常 start_subgraph
-                            self.start_subgraph(
+                            switch_subgraph(
+                                frame,
+                                &graph,
+                                pending.target_sg,
+                                &pending.args,
+                            );
+                        }
+                        continue;
+                    }
+
+                    // LoopBody 帧复用
+                    let target_loop_kind =
+                        graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
+                    let child_fid = if target_loop_kind
+                        == crate::ir::Ir::LoopKind::LoopBody
+                    {
+                        if let Some(bfid) = frame.cached_child_frame {
+                            let target_sg =
+                                &graph.subgraphs[pending.target_sg.0 as usize];
+                            let param_count = target_sg.param_count as usize;
+                            let mut body_frame = self.frames.lock().remove(&bfid);
+                            if let Some(bf) = body_frame.as_mut() {
+                                let parent_start = bf.node_offset;
+                                let branch_start = target_sg.node_range.0 .0;
+                                let param_local_offset =
+                                    (branch_start.wrapping_sub(parent_start)) as usize;
+                                for (i, arg) in
+                                    pending.args.iter().enumerate().take(param_count)
+                                {
+                                    let local_id =
+                                        NodeId((param_local_offset + i) as u32);
+                                    let gid = (branch_start as usize) + i;
+                                    let global_id = NodeId(gid as u32);
+                                    let consumer_count =
+                                        graph.downstreams[gid].len() as u16;
+                                    bf.set_value(local_id, arg.clone(), consumer_count);
+                                    // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                                    notify_downstream(bf, &graph, local_id, global_id, NodeId(parent_start));
+                                }
+                                bf.caller = Some((fid, pending.call_node_local));
+                                bf.parent_frame_ptr = std::ptr::null_mut();
+                                bf.state = FrameState::Ready;
+                            }
+                            if let Some(bf) = body_frame {
+                                self.frames.lock().insert(bfid, bf);
+                            }
+                            bfid
+                        } else {
+                            let bfid = self.start_subgraph(
                                 fid,
                                 pending.call_node_local,
                                 pending.target_sg,
                                 &pending.args,
                                 frame,
                                 pending.closure_val.clone(),
-                            )
-                        };
-
-                        if pending.is_async {
-                            // async call：先注册 async 映射，再 push 子帧（消除竞态窗口）
-                            // 若先 push，子帧可能在 register 前被其他 worker 执行完，
-                            // find_by_child 返回 None → 误判为 sync call → 返回值覆盖 async_handle
-                            let async_id = self
-                                .async_join_runtime
-                                .lock()
-                                .alloc_and_register(child_fid);
-                            let async_handle = Value::i32(async_id.0 as i32);
-
-                            // 子帧入队（async 映射已注册，find_by_child 可正确匹配）
-                            queue.push(child_fid);
-
-                            // call 节点写 AsyncHandle + 通知下游
-                            let node_start = frame.node_offset;
-                            let graph_node_id =
-                                NodeId(pending.call_node_local.0 + node_start);
-                            let consumer_count =
-                                graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                            frame.set_value(
-                                pending.call_node_local,
-                                async_handle,
-                                consumer_count,
                             );
-                            notify_downstream(
-                                frame,
-                                &graph,
-                                pending.call_node_local,
-                                graph_node_id,
-                                NodeId(node_start),
-                            );
-                            continue;
-                        } else {
-                            // sync call：子帧入队 + 当前帧挂起等 SubgraphComplete 事件
-                            // sync call 的竞态由 pending_completions 兜底
-                            // （父帧不在 HashMap 时子帧完成，complete_and_wake_caller 暂存完成信息）
+                            if std::env::var("GLUE_DEBUG_FORIN").is_ok() {
+                                let bsg = &graph.subgraphs[pending.target_sg.0 as usize];
+                                eprintln!("[FORIN-CREATE] body_sg={} bfid={:?} args={:?} body_range=[{},{})",
+                                    pending.target_sg.0, bfid, pending.args,
+                                    bsg.node_range.0 .0, bsg.node_range.1 .0);
+                            }
+                            frame.cached_child_frame = Some(bfid);
+                            bfid
+                        }
+                    } else {
+                        self.start_subgraph(
+                            fid,
+                            pending.call_node_local,
+                            pending.target_sg,
+                            &pending.args,
+                            frame,
+                            pending.closure_val.clone(),
+                        )
+                    };
+
+                    if pending.is_async {
+                        let async_id = self
+                            .async_join_runtime
+                            .lock()
+                            .alloc_and_register(child_fid);
+                        let async_handle = Value::i32(async_id.0 as i32);
+                        queue.push(child_fid);
+                        let node_start = frame.node_offset;
+                        let graph_node_id =
+                            NodeId(pending.call_node_local.0 + node_start);
+                        let consumer_count =
+                            graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                        frame.set_value(
+                            pending.call_node_local,
+                            async_handle,
+                            consumer_count,
+                        );
+                        notify_downstream(
+                            frame,
+                            &graph,
+                            pending.call_node_local,
+                            graph_node_id,
+                            NodeId(node_start),
+                        );
+                        continue;
+                    } else {
+                        queue.push(child_fid);
+                        self.event_waiters.lock().push((
+                            RuntimeEvent::SubgraphComplete(child_fid),
+                            fid,
+                        ));
+                        frame.state = FrameState::Suspended;
+                        frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
+                        frame.suspend_event =
+                            Some(RuntimeEvent::SubgraphComplete(child_fid));
+                        return;
+                    }
+                }
+                NodeResult::Await(pending) => {
+                    let (event, ready_value, await_node_local) =
+                        self.resolve_check_and_register_await(&pending, fid);
+
+                    if let Some(value) = ready_value {
+                        let node_start = frame.node_offset;
+                        let graph_node_id =
+                            NodeId(await_node_local.0 + node_start);
+                        let consumer_count =
+                            graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                        frame.set_value(await_node_local, value, consumer_count);
+                        notify_downstream(
+                            frame,
+                            &graph,
+                            await_node_local,
+                            graph_node_id,
+                            NodeId(node_start),
+                        );
+                        continue;
+                    } else {
+                        frame.state = FrameState::Suspended;
+                        frame.suspend_state =
+                            SuspendState::WaitingEvent(await_node_local);
+                        frame.suspend_event = Some(event);
+                        return;
+                    }
+                }
+                NodeResult::ChannelNotify(ch_id) => {
+                    self.on_event_arrived(
+                        RuntimeEvent::ChannelReady(ch_id),
+                        Value::VOID,
+                        queue,
+                    );
+                }
+                NodeResult::Cancel(async_id) => {
+                    let child_fid = self
+                        .async_join_runtime
+                        .lock()
+                        .find_child_by_async_id(async_id);
+                    if let Some(child_fid) = child_fid {
+                        self.cancel_frame(child_fid, queue);
+                    }
+                    let consumer_count =
+                        graph.downstreams[graph_node_id.0 as usize].len() as u16;
+                    frame.set_value(local_id, Value::VOID, consumer_count);
+                    notify_downstream(
+                        frame,
+                        &graph,
+                        local_id,
+                        graph_node_id,
+                        NodeId(node_start),
+                    );
+                }
+                NodeResult::SelectWait(gate_local) => {
+                    let info = graph.select_infos[graph_node_id.0 as usize].clone();
+
+                    if let Some(info) = info {
+                        let mut ready_branch: Option<SubGraphId> = None;
+                        for (branch_idx, branch) in info.branches.iter().enumerate() {
+                            let event_val =
+                                frame.get_value_by_global(branch.event_source_node);
+                            let is_ready = match branch.event_kind {
+                                EventSourceKind::Channel => {
+                                    event_val
+                                        .heap_obj()
+                                        .and_then(|h| h.channel())
+                                        .map_or(false, |ch| ch.has_data() || ch.is_closed())
+                                }
+                                EventSourceKind::Timer => {
+                                    let timer_id = {
+                                        if let Some((_, tid)) = frame
+                                            .select_timers
+                                            .iter()
+                                            .find(|(idx, _)| *idx == branch_idx)
+                                        {
+                                            *tid
+                                        } else {
+                                            let duration_ns = event_val.as_i64();
+                                            let tid = self.timer_runtime.lock().start(
+                                                std::time::Duration::from_nanos(
+                                                    duration_ns as u64,
+                                                ),
+                                            );
+                                            frame.select_timers.push((branch_idx, tid));
+                                            tid
+                                        }
+                                    };
+                                    self.timer_runtime.lock().is_fired(timer_id)
+                                }
+                                _ => false,
+                            };
+                            if is_ready {
+                                ready_branch = Some(branch.subgraph_id);
+                                break;
+                            }
+                        }
+
+                        if let Some(sg_id) = ready_branch {
+                            let child_fid =
+                                self.start_subgraph(fid, gate_local, sg_id, &[], frame, None);
                             queue.push(child_fid);
                             self.event_waiters.lock().push((
                                 RuntimeEvent::SubgraphComplete(child_fid),
                                 fid,
                             ));
                             frame.state = FrameState::Suspended;
-                            frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
+                            frame.suspend_state =
+                                SuspendState::WaitingSubgraph(child_fid);
                             frame.suspend_event =
                                 Some(RuntimeEvent::SubgraphComplete(child_fid));
                             return;
-                        }
-                    }
-
-                    crate::ir::Ir::Pending::ChannelNotify(ch_id) => {
-                        self.on_event_arrived(
-                            RuntimeEvent::ChannelReady(ch_id),
-                            Value::VOID,
-                            queue,
-                        );
-                    }
-
-                    crate::ir::Ir::Pending::Await(pending) => {
-                        // 原子检查就绪 + 注册 waiter（消除 TOCTOU 竞态）
-                        let (event, ready_value, await_node_local) =
-                            self.resolve_check_and_register_await(&pending, fid);
-
-                        if let Some(value) = ready_value {
-                            // 事件已就绪：注入值 + 通知下游（waiter 未注册）
-                            let node_start = frame.node_offset;
-                            let graph_node_id =
-                                NodeId(await_node_local.0 + node_start);
-                            let consumer_count =
-                                graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                            frame.set_value(await_node_local, value, consumer_count);
-                            notify_downstream(
-                                frame,
-                                &graph,
-                                await_node_local,
-                                graph_node_id,
-                                NodeId(node_start),
-                            );
-                            continue;
                         } else {
-                            // 事件未就绪：waiter 已在 resolve_check_and_register_await 内注册
-                            // 只需设帧状态后 return（无需再次 push event_waiters）
+                            for (branch_idx, branch) in info.branches.iter().enumerate() {
+                                let event_val = frame
+                                    .get_value_by_global(branch.event_source_node);
+                                let event = match branch.event_kind {
+                                    EventSourceKind::Channel => {
+                                        if let Some(ch) = event_val
+                                            .heap_obj()
+                                            .and_then(|h| h.channel())
+                                        {
+                                            RuntimeEvent::ChannelReady(
+                                                crate::ir::Ir::ChannelId(ch.id()),
+                                            )
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    EventSourceKind::Timer => {
+                                        let timer_id = frame
+                                            .select_timers
+                                            .iter()
+                                            .find(|(idx, _)| *idx == branch_idx)
+                                            .map(|(_, tid)| *tid)
+                                            .expect(
+                                                "select timer should be started above",
+                                            );
+                                        RuntimeEvent::TimerFired(timer_id)
+                                    }
+                                    _ => continue,
+                                };
+                                self.event_waiters.lock().push((event, fid));
+                            }
                             frame.state = FrameState::Suspended;
                             frame.suspend_state =
-                                SuspendState::WaitingEvent(await_node_local);
-                            frame.suspend_event = Some(event);
+                                SuspendState::WaitingEvent(gate_local);
+                            frame.suspend_event = None;
                             return;
                         }
                     }
-
-                    crate::ir::Ir::Pending::Cancel(async_id) => {
-                        let child_fid = self
-                            .async_join_runtime
-                            .lock()
-                            .find_child_by_async_id(async_id);
-                        if let Some(child_fid) = child_fid {
-                            self.cancel_frame(child_fid, queue);
-                        }
-                        let consumer_count =
-                            graph.downstreams[graph_node_id.0 as usize].len() as u16;
-                        frame.set_value(local_id, Value::VOID, consumer_count);
-                        notify_downstream(
-                            frame,
-                            &graph,
-                            local_id,
-                            graph_node_id,
-                            NodeId(node_start),
-                        );
-                        continue;
-                    }
-
-                    crate::ir::Ir::Pending::SelectWait(gate_local) => {
-                        let info = graph.select_infos[graph_node_id.0 as usize].clone();
-
-                        if let Some(info) = info {
-                            let mut ready_branch: Option<SubGraphId> = None;
-                            for (branch_idx, branch) in info.branches.iter().enumerate() {
-                                let event_val =
-                                    frame.get_value_by_global(branch.event_source_node);
-                                let is_ready = match branch.event_kind {
-                                    EventSourceKind::Channel => {
-                                        event_val
-                                            .heap_obj()
-                                            .and_then(|h| h.channel())
-                                            .map_or(false, |ch| ch.has_data() || ch.is_closed())
-                                    }
-                                    EventSourceKind::Timer => {
-                                        let timer_id = {
-                                            if let Some((_, tid)) = frame
-                                                .select_timers
-                                                .iter()
-                                                .find(|(idx, _)| *idx == branch_idx)
-                                            {
-                                                *tid
-                                            } else {
-                                                let duration_ns = event_val.as_i64();
-                                                let tid = self.timer_runtime.lock().start(
-                                                    std::time::Duration::from_nanos(
-                                                        duration_ns as u64,
-                                                    ),
-                                                );
-                                                frame.select_timers.push((branch_idx, tid));
-                                                tid
-                                            }
-                                        };
-                                        self.timer_runtime.lock().is_fired(timer_id)
-                                    }
-                                    _ => false,
-                                };
-                                if is_ready {
-                                    ready_branch = Some(branch.subgraph_id);
-                                    break;
-                                }
-                            }
-
-                            if let Some(sg_id) = ready_branch {
-                                let child_fid =
-                                    self.start_subgraph(fid, gate_local, sg_id, &[], frame, None);
-                                queue.push(child_fid);
-                                self.event_waiters.lock().push((
-                                    RuntimeEvent::SubgraphComplete(child_fid),
-                                    fid,
-                                ));
-                                frame.state = FrameState::Suspended;
-                                frame.suspend_state =
-                                    SuspendState::WaitingSubgraph(child_fid);
-                                frame.suspend_event =
-                                    Some(RuntimeEvent::SubgraphComplete(child_fid));
-                                return;
-                            } else {
-                                for (branch_idx, branch) in info.branches.iter().enumerate() {
-                                    let event_val = frame
-                                        .get_value_by_global(branch.event_source_node);
-                                    let event = match branch.event_kind {
-                                        EventSourceKind::Channel => {
-                                            if let Some(ch) = event_val
-                                                .heap_obj()
-                                                .and_then(|h| h.channel())
-                                            {
-                                                RuntimeEvent::ChannelReady(
-                                                    crate::ir::Ir::ChannelId(ch.id()),
-                                                )
-                                            } else {
-                                                continue;
-                                            }
-                                        }
-                                        EventSourceKind::Timer => {
-                                            let timer_id = frame
-                                                .select_timers
-                                                .iter()
-                                                .find(|(idx, _)| *idx == branch_idx)
-                                                .map(|(_, tid)| *tid)
-                                                .expect(
-                                                    "select timer should be started above",
-                                                );
-                                            RuntimeEvent::TimerFired(timer_id)
-                                        }
-                                        _ => continue,
-                                    };
-                                    self.event_waiters.lock().push((event, fid));
-                                }
-                                frame.state = FrameState::Suspended;
-                                frame.suspend_state =
-                                    SuspendState::WaitingEvent(gate_local);
-                                frame.suspend_event = None;
-                                return;
-                            }
-                        }
-                    }
+                }
+                NodeResult::Return(v) => {
+                    frame.control_signal = ControlSignal::Return(v);
+                    break;
+                }
+                NodeResult::Break => {
+                    frame.control_signal = ControlSignal::Break;
+                    break;
+                }
+                NodeResult::Continue => {
+                    frame.control_signal = ControlSignal::Continue;
+                    break;
                 }
             }
-
-            // 普通节点：写值表 + 检查控制信号 + 通知下游
-            let consumer_count = graph.downstreams[graph_node_id.0 as usize].len() as u16;
-            frame.set_value(local_id, value.clone(), consumer_count);
-
-            // 检查控制信号
-            let signal_kind = graph.control_signal_nodes[graph_node_id.0 as usize];
-            if let Some(kind) = signal_kind {
-                frame.control_signal = match kind {
-                    SignalKind::Return => ControlSignal::Return(value),
-                    SignalKind::Break => ControlSignal::Break,
-                    SignalKind::Continue => ControlSignal::Continue,
-                };
-                break;
-            }
-
-            // compute_propagate 等直接设 control_signal 的 compute_fn：
-            // 检查是否被设为非 None（compute_propagate 在 Err 时设 Return）
-            // 与同步路径（Compute.rs:2955-2960）保持一致，跳过 notify_downstream
-            if !matches!(frame.control_signal, ControlSignal::None) {
-                break;
-            }
-
-            // 通知下游（含槽级 RC）
-            notify_downstream(frame, &graph, local_id, graph_node_id, NodeId(node_start));
         }
 
         // 帧挂起：不执行 defer，不标记 Completed

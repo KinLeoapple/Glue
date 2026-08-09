@@ -274,7 +274,7 @@ fn has_side_effect(graph: &DataFlowGraph, idx: usize) -> bool {
     graph.writeback_targets.get(idx).map_or(false, |o| o.is_some())
     || graph.field_set_names.get(idx).map_or(false, |o| o.is_some())
     || graph.global_store_slots.get(idx).map_or(false, |o| o.is_some())
-    || graph.control_signal_nodes.get(idx).map_or(false, |o| o.is_some())
+    || crate::ir::Ir::is_control_flow_compute_fn(graph.nodes[idx].compute_fn)
     || graph.ffi_call_names.get(idx).map_or(false, |o| o.is_some())
     || graph.tail_call_flags.get(idx).copied().unwrap_or(false)
 }
@@ -923,7 +923,7 @@ fn is_store_node(graph: &DataFlowGraph, idx: usize) -> bool {
 /// 则该存储是死存储，可安全消除。
 ///
 /// 安全约束：
-/// - 不消除 control_signal_nodes 节点（Return/Break/Continue）
+/// - 不消除控制流节点（CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR）
 /// - 不消除 tail_call_flags 节点
 /// - 不消除 defer_table/event_source_decls 引用的节点
 /// - 不消除被其他活跃节点 inputs 引用的节点（存储值可能被读取）
@@ -1026,8 +1026,8 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
         // 仅处理存储类节点
         if !is_store_node(graph, idx) { continue; }
 
-        // 安全检查：不消除控制信号/尾调用节点
-        if graph.control_signal_nodes.get(idx).map_or(false, |o| o.is_some()) { continue; }
+        // 安全检查：不消除控制流/尾调用节点
+        if crate::ir::Ir::is_control_flow_compute_fn(graph.nodes[idx].compute_fn) { continue; }
         if graph.tail_call_flags.get(idx).copied().unwrap_or(false) { continue; }
 
         // 安全检查：不消除子图结构引用的节点

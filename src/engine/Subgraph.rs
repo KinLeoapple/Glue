@@ -23,8 +23,7 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     frame.value_table.reset_all();
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
-    frame.pending = None;
-    frame.body_frame_id = None;
+    frame.cached_child_frame = None;
     frame.defer_stack.clear();
     frame.select_timers.clear();
     frame.root_frame_ptr = std::ptr::null_mut();
@@ -42,9 +41,12 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
     for (i, arg) in args.iter().enumerate().take(param_count) {
         let local_id = NodeId(i as u32);
+        let global_id = NodeId((offset + i) as u32);
         let consumer_count = graph.downstreams[offset + i].len() as u16;
         frame.set_value(local_id, arg.clone(), consumer_count);
-        frame.push_ready(local_id);
+        // 不 push_ready：参数值已由 set_value 设置，notify_downstream 传播给下游即可。
+        // 若 push_ready，compute_const 会被调用并返回 VOID 覆盖参数值。
+        notify_downstream(frame, graph, local_id, global_id, NodeId(node_start.0));
     }
 }
 
@@ -68,9 +70,14 @@ impl<S: LockStrategy> Engine<S> {
         let child_fid = self.alloc_frame_id();
         let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
-        let same_function = parent_sg.function_id == child_sg.function_id;
+        // same_function 路径用于同函数内分支子图（if-else/match arm），这些子图
+        // 的 node_range 严格包含在父函数 node_range 内，需要复制父帧值。
+        // 递归调用自身（child_sg.id == parent subgraph_id）不应走此路径——
+        // 它需要全新的调用帧，而非父帧值复制。直接递归走跨函数路径。
+        let same_function = parent_sg.function_id == child_sg.function_id
+            && subgraph_id != parent_frame.subgraph_id;
 
-        if std::env::var("GLUE_DEBUG_STALL").is_ok() {
+        if super::env_flag("GLUE_DEBUG_STALL") {
             let (cs, ce) = child_sg.node_range;
             let child_sz = ce.0 - cs.0;
             if child_sz <= 3 {
@@ -120,13 +127,8 @@ impl<S: LockStrategy> Engine<S> {
 
             }
 
-            // 收集分支内嵌套子图范围
-            let nested_ranges: Vec<(u32, u32)> = self.graph.subgraphs.iter()
-                .filter(|sg| sg.id != subgraph_id
-                    && sg.node_range.0 .0 >= branch_start.0
-                    && sg.node_range.1 .0 <= child_sg.node_range.1 .0)
-                .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
-                .collect();
+            // 使用预计算的 nested_ranges（构建期填充），避免运行时全图扫描
+            let nested_ranges: &[(u32, u32)] = &child_sg.nested_ranges;
             let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
 
             // 设置 pending_inputs：分支节点按实际未就绪输入计数，非分支节点标记 EXTERNAL
@@ -164,18 +166,21 @@ impl<S: LockStrategy> Engine<S> {
                 }
             }
 
-            // 预填充分支内 Const 节点
+            // 分支内 0-input 非 Param 节点入队（必须在参数注入之前！）
+            // 顺序原因：若参数注入在前，notify_downstream 会使下游节点 pending 归零并入队；
+            // 随后 0-input 入队又检查到 pending==0 && !ready 再次入队，导致节点被执行两次
+            // （如 for-in 的 next_call 被执行两次，消耗两个迭代器元素，跳过首个元素）。
+            // 将 0-input 入队放在参数注入之前：此时下游节点 pending 仍 >0 不会被入队，
+            // 仅 0-input 常量节点入队；参数注入的 notify_downstream 随后将下游入队一次。
+            // 此顺序与跨函数路径（prepare_frame_nodes 先于参数注入）一致。
             for i in 0..parent_node_count {
                 let gid = (parent_start as usize + i) as u32;
                 let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
                 if !in_branch || is_nested(gid) { continue; }
-                if self.graph.nodes[gid as usize].kind == NodeKind::Const {
-                    if let Some(cv) = self.graph.const_values[gid as usize] {
-                        let handle = super::Schedule::alloc_const_value(cv);
-                        let cc = self.graph.downstreams[gid as usize].len() as u16;
-                        child.set_value(NodeId(i as u32), handle, cc);
-                        child.push_ready(NodeId(i as u32));
-                    }
+                let local_in_branch = (gid - branch_start.0) as usize;
+                if local_in_branch < branch_param_count { continue; }
+                if child.pending_inputs[i] == 0 && !child.value_table.ready[i] {
+                    child.push_ready(NodeId(i as u32));
                 }
             }
 
@@ -190,9 +195,11 @@ impl<S: LockStrategy> Engine<S> {
             for (i, arg) in args.iter().enumerate().take(actual_param_count) {
                 let lid = NodeId((param_local_offset + i) as u32);
                 let gid = branch_start.0 as usize + i;
+                let global_id = NodeId(gid as u32);
                 let cc = self.graph.downstreams[gid].len() as u16;
                 child.set_value(lid, arg.clone(), cc);
-                child.push_ready(lid);
+                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                notify_downstream(&mut child, &self.graph, lid, global_id, NodeId(parent_start));
             }
             // upvalue 参数注入：从父帧读取最新值（引用捕获语义），使 same_function
             // 调用能看到外层变量的最新值（而非闭包构造时的快照）。
@@ -211,6 +218,7 @@ impl<S: LockStrategy> Engine<S> {
                 if arg_idx >= branch_param_count { break; }
                 let lid = NodeId((param_local_offset + arg_idx) as u32);
                 let gid = branch_start.0 as usize + arg_idx;
+                let global_id = NodeId(gid as u32);
                 let cc = self.graph.downstreams[gid].len() as u16;
                 let val = if self_upvalue_idx >= 0 && i == self_upvalue_idx as usize {
                     closure_val.clone().unwrap_or_else(|| parent_frame.get_value_by_global(outer_node))
@@ -218,20 +226,8 @@ impl<S: LockStrategy> Engine<S> {
                     parent_frame.get_value_by_global(outer_node)
                 };
                 child.set_value(lid, val, cc);
-                child.push_ready(lid);
-            }
-
-            // 分支内 0-input 非 Const 非 Param 节点入队
-            for i in 0..parent_node_count {
-                let gid = (parent_start as usize + i) as u32;
-                let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
-                if !in_branch || is_nested(gid) { continue; }
-                let local_in_branch = (gid - branch_start.0) as usize;
-                if local_in_branch < branch_param_count { continue; }
-                if self.graph.nodes[gid as usize].kind == NodeKind::Const { continue; }
-                if child.pending_inputs[i] == 0 && !child.value_table.ready[i] {
-                    child.push_ready(NodeId(i as u32));
-                }
+                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                notify_downstream(&mut child, &self.graph, lid, global_id, NodeId(parent_start));
             }
 
             child.caller = Some((caller_fid, call_node));
@@ -240,6 +236,23 @@ impl<S: LockStrategy> Engine<S> {
             child.root_frame_ptr = std::ptr::null_mut();
             child.parent_frame_ptr = std::ptr::null_mut();
             child.closure_val = closure_val;
+
+            if std::env::var("GLUE_DEBUG_FORIN").is_ok() {
+                let rq_len = child.ready_queue.len();
+                let mut pending_info: Vec<(u32, u16, bool)> = Vec::new();
+                for i in 0..parent_node_count {
+                    let gid = (parent_start as usize + i) as u32;
+                    if gid >= branch_start.0 && gid < child_sg.node_range.1 .0 {
+                        let p = child.pending_inputs[i];
+                        let r = child.value_table.ready[i];
+                        if p != PENDING_EXTERNAL {
+                            pending_info.push((gid, p, r));
+                        }
+                    }
+                }
+                eprintln!("[FORIN-SG-CREATE] sg={} rq_len={} pending_info={:?}",
+                    subgraph_id.0, rq_len, &pending_info[..pending_info.len().min(15)]);
+            }
 
             self.frames.lock().insert(child_fid, Box::new(child));
             child_fid
@@ -255,9 +268,11 @@ impl<S: LockStrategy> Engine<S> {
             let param_count = child_sg.param_count as usize;
             for (i, arg) in args.iter().enumerate().take(param_count) {
                 let local_id = NodeId(i as u32);
+                let global_id = NodeId((offset + i) as u32);
                 let consumer_count = self.graph.downstreams[offset + i].len() as u16;
                 child.set_value(local_id, arg.clone(), consumer_count);
-                child.push_ready(local_id);
+                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                notify_downstream(&mut child, &self.graph, local_id, global_id, NodeId(node_start.0));
             }
 
             child.caller = Some((caller_fid, call_node));
@@ -290,7 +305,7 @@ impl<S: LockStrategy> Engine<S> {
                     // break/return → 循环退出
                     let mut loop_frame = self.frames.lock().remove(&loop_fid);
                     if let Some(lf) = loop_frame.as_deref_mut() {
-                        lf.body_frame_id = None;
+                        lf.cached_child_frame = None;
                         lf.control_signal = child_signal;
                     }
                     // 迭代处理 loop_frame（loop_kind 通常是 While/Loop/For，非 LoopBody，
@@ -306,11 +321,11 @@ impl<S: LockStrategy> Engine<S> {
                         ),
                     }
                 }
-                ControlSignal::Continue | ControlSignal::None => {
-                    // continue/正常完成 → 循环重置（帧复用）
+                ControlSignal::Continue => {
+                    // continue → 循环重置（帧复用）
                     let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
                         panic!(
-                            "complete_and_wake_caller: LoopBody continue/none 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            "complete_and_wake_caller: LoopBody continue 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
                             loop_fid
                         )
                     });
@@ -318,12 +333,51 @@ impl<S: LockStrategy> Engine<S> {
                     self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
                     self.frames.lock().insert(loop_fid, loop_frame);
                     queue.push(loop_fid);
-                    // body 帧已重置，放回 HashMap（不入队）。
-                    // body 的重新执行只应由 loop 帧在 cond 为真时通过
-                    // 帧复用路径（start_subgraph / queue.push）触发。
                     let body_id = child.id;
                     self.frames.lock().insert(body_id, Box::new(child));
                     return;
+                }
+                ControlSignal::None => {
+                    // 正常完成：检查 caller 循环类型
+                    if std::env::var("GLUE_DEBUG_FORIN").is_ok() {
+                        let bsg = &self.graph.subgraphs[child_frame.subgraph_id.0 as usize];
+                        let rq_len = child_frame.ready_queue.len();
+                        let (bs, be) = bsg.node_range;
+                        let mut unready: Vec<u32> = Vec::new();
+                        for i in 0..child_frame.value_table.len() {
+                            let gid = (child_frame.node_offset as usize + i) as u32;
+                            if gid >= bs.0 && gid < be.0 && !child_frame.value_table.ready[i] {
+                                unready.push(gid);
+                            }
+                        }
+                        eprintln!("[FORIN-BODY-DONE] child_sg={} rq_len={} unready_count={} unready={:?}",
+                            child_frame.subgraph_id.0, rq_len, unready.len(), &unready[..unready.len().min(10)]);
+                    }
+                    let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
+                        panic!(
+                            "complete_and_wake_caller: LoopBody none 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            loop_fid
+                        )
+                    });
+                    let loop_kind = self.graph.subgraphs[loop_frame.subgraph_id.0 as usize].loop_kind;
+                    if loop_kind == crate::ir::Ir::LoopKind::TailRec {
+                        // TailRec 循环：body_sg 无信号完成 = base case 命中。
+                        // 提取 body_sg 返回值，转换为 Return 信号让循环退出。
+                        let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
+                        loop_frame.cached_child_frame = None;
+                        loop_frame.control_signal = ControlSignal::Return(return_value);
+                        child_frame = *loop_frame;
+                        continue;
+                    } else {
+                        // 普通循环（While/Loop/For）：正常完成 → 循环重置（帧复用）
+                        let mut child = child_frame;
+                        self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
+                        self.frames.lock().insert(loop_fid, loop_frame);
+                        queue.push(loop_fid);
+                        let body_id = child.id;
+                        self.frames.lock().insert(body_id, Box::new(child));
+                        return;
+                    }
                 }
             }
         }
@@ -357,6 +411,13 @@ impl<S: LockStrategy> Engine<S> {
                 let call_graph_id = NodeId(call_node.0 + caller_offset.0);
                 let consumer_count =
                     self.graph.downstreams[call_graph_id.0 as usize].len() as u16;
+
+                if std::env::var("GLUE_DEBUG_IFELSE").is_ok() {
+                    let child_sg = &self.graph.subgraphs[child_sg_id.0 as usize];
+                    eprintln!("[COMPLETE] child_sg={} caller_fid={:?} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
+                        child_sg_id.0, caller_fid, call_node.0, call_graph_id.0, caller_offset.0,
+                        return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
+                }
 
                 caller_frame.set_value(call_node, return_value, consumer_count);
                 caller_frame.state = FrameState::Ready;

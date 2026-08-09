@@ -90,7 +90,6 @@ impl<S: LockStrategy> Engine<S> {
         frame.value_table.reset_all();
         frame.ready_queue.clear();
         frame.control_signal = ControlSignal::None;
-        frame.pending = None;
         // 以下用 prepare_frame_nodes 设置 node_offset + pending_inputs + Const 预填充
         prepare_frame_nodes(frame, &self.graph);
     }
@@ -104,41 +103,50 @@ impl<S: LockStrategy> Engine<S> {
         body_frame: &mut Frame,
     ) {
         let loop_sg_id = loop_frame.subgraph_id;
-        let (loop_kind, cond_node, return_node, iter_next_node) = {
+        let (loop_kind, cond_node, return_node, iter_next_node, reset_plan) = {
             let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
-            (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node)
+            (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node, sg.reset_plan.clone())
         };
         // 使用 loop_frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
         let loop_offset = loop_frame.node_offset;
 
         // 0. 清空 ready_queue（必须在步骤 1-3 push cond/iter_next/gate 之前）
-        // 若不清空，旧就绪条目残留，会先于 cond/iter_next 执行，引用过时值
         loop_frame.ready_queue.clear();
 
-        // 1. For 循环：额外重置 iter_next_node
-        if loop_kind == crate::ir::Ir::LoopKind::For {
-            if let Some(next_node) = iter_next_node {
-                let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
-                Self::reset_node_ready(loop_frame, next_local);
-                loop_frame.push_ready(next_local);
+        // 1-3. 按 ResetPlan 数据驱动重置（有 ResetPlan 时），否则回退到 LoopKind 分支
+        if let Some(plan) = &reset_plan {
+            for &nid in &plan.reset_to_zero {
+                let local = NodeId(nid.0.wrapping_sub(loop_offset));
+                Self::reset_node_ready(loop_frame, local);
+                loop_frame.push_ready(local);
             }
-        }
-
-        // 2. 重置 cond_node
-        if let Some(cond_node) = cond_node {
-            let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
+            for &nid in &plan.reset_to_one {
+                let local = NodeId(nid.0.wrapping_sub(loop_offset));
+                Self::reset_node_pending(loop_frame, local, 1);
+            }
+            for &nid in &plan.reset_condition_tree {
+                self.reset_condition_tree(loop_frame, loop_sg_id, nid, loop_offset);
+            }
+        } else {
+            // 回退：LoopKind 分支判断（TailRec 等无 ResetPlan 的子图）
             if loop_kind == crate::ir::Ir::LoopKind::For {
-                Self::reset_node_pending(loop_frame, cond_local, 1);
-            } else {
-                // While/Loop：递归重置条件依赖树。
-                // cond_node 可能是复合表达式（如 `i < 10 && i < 5`），其输入节点
-                // （lt1, lt2）在上一轮已求值，若不重置会保持陈旧值，导致 cond_node
-                // 读取旧比较结果（条件恒 true → 死循环）。
-                self.reset_condition_tree(loop_frame, loop_sg_id, cond_node, loop_offset);
+                if let Some(next_node) = iter_next_node {
+                    let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
+                    Self::reset_node_ready(loop_frame, next_local);
+                    loop_frame.push_ready(next_local);
+                }
+            }
+            if let Some(cond_node) = cond_node {
+                let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
+                if loop_kind == crate::ir::Ir::LoopKind::For {
+                    Self::reset_node_pending(loop_frame, cond_local, 1);
+                } else {
+                    self.reset_condition_tree(loop_frame, loop_sg_id, cond_node, loop_offset);
+                }
             }
         }
 
-        // 3. 重置 Gate 节点（pending=1，等 cond notify）
+        // 4. 重置 Gate 节点（pending=1，等 cond notify）
         let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
         Self::reset_node_pending(loop_frame, gate_local, 1);
 
@@ -150,16 +158,14 @@ impl<S: LockStrategy> Engine<S> {
         body_frame.value_table.reset_all();
         body_frame.ready_queue.clear();
         body_frame.select_timers.clear();
-        body_frame.body_frame_id = None;
+        body_frame.cached_child_frame = None;
         body_frame.control_signal = ControlSignal::None;
-        body_frame.pending = None;
-        self.prepare_same_function_frame(body_frame);
 
-        // 从 loop_frame 重新拷贝外层变量值（与 start_subgraph 逻辑一致）。
-        // prepare_same_function_frame 只设置 pending_inputs + 预填充 Const，
-        // 不拷贝外层变量。若不拷贝，分支子图（if/else）从 body 帧拷贝时拿不到
-        // ready 的 sum1/i1 等外层变量，导致计算节点 pending > 0、WriteBack
-        // 永不触发（复现：循环内 if 分支累加只在首轮生效）。
+        // 先从 loop_frame 重新拷贝外层变量值（与 start_subgraph 逻辑一致）。
+        // 必须在 prepare_same_function_frame 之前拷贝：prepare_same_function_frame
+        // 的 0-input 节点入队逻辑依赖值表 ready 状态判断 pending_inputs，若外层
+        // 变量未就绪，依赖外层变量的节点会被错误标记 pending==0 并入队，执行时
+        // 读取到空值（复现：for-in 循环体只执行首次迭代）。
         let body_sg = &self.graph.subgraphs[body_frame.subgraph_id.0 as usize];
         let (body_branch_start, body_branch_end) = body_sg.node_range;
         let copy_count = loop_frame.value_table.len().min(body_frame.value_table.len());
@@ -176,6 +182,9 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
+        // 拷贝外层变量后再设置 pending_inputs + 入队 0-input 节点
+        self.prepare_same_function_frame(body_frame);
+
         // body_sg 帧重新绑定 caller
         body_frame.caller =
             Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
@@ -188,7 +197,6 @@ impl<S: LockStrategy> Engine<S> {
         loop_frame.state = FrameState::Ready;
         loop_frame.suspend_state = SuspendState::NotSuspended;
         loop_frame.suspend_event = None;
-        loop_frame.pending = None;
     }
 
     /// same_function 分支帧重置：保持 node_offset（= 父函数 node_start），
@@ -206,18 +214,8 @@ impl<S: LockStrategy> Engine<S> {
         let branch_end = sg.node_range.1 .0;
         let branch_param_count = sg.param_count as usize;
 
-        // 收集分支内嵌套子图范围
-        let nested_ranges: Vec<(u32, u32)> = self
-            .graph
-            .subgraphs
-            .iter()
-            .filter(|s| {
-                s.id != sg_id
-                    && s.node_range.0 .0 >= branch_start
-                    && s.node_range.1 .0 <= branch_end
-            })
-            .map(|s| (s.node_range.0 .0, s.node_range.1 .0))
-            .collect();
+        // 使用预计算的 nested_ranges（构建期填充），避免运行时全图扫描
+        let nested_ranges: &[(u32, u32)] = &sg.nested_ranges;
         let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
 
         // 1. 设置 pending_inputs
@@ -258,24 +256,7 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
-        // 2. 预填充分支内 Const 节点
-        for i in 0..parent_node_count {
-            let gid = (parent_start as usize + i) as u32;
-            let in_branch = gid >= branch_start && gid < branch_end;
-            if !in_branch || is_nested(gid) {
-                continue;
-            }
-            if self.graph.nodes[gid as usize].kind == NodeKind::Const {
-                if let Some(cv) = self.graph.const_values[gid as usize] {
-                    let handle = super::Schedule::alloc_const_value(cv);
-                    let cc = self.graph.downstreams[gid as usize].len() as u16;
-                    frame.set_value(NodeId(i as u32), handle, cc);
-                    frame.push_ready(NodeId(i as u32));
-                }
-            }
-        }
-
-        // 3. 分支内 0-input 非 Const 非 Param 节点入队
+        // 2. 分支内 0-input 非 Param 节点入队（Const 节点也走此路径——compute_fn 返回值）
         for i in 0..parent_node_count {
             let gid = (parent_start as usize + i) as u32;
             let in_branch = gid >= branch_start && gid < branch_end;
@@ -284,9 +265,6 @@ impl<S: LockStrategy> Engine<S> {
             }
             let local_in_branch = (gid - branch_start) as usize;
             if local_in_branch < branch_param_count {
-                continue;
-            }
-            if self.graph.nodes[gid as usize].kind == NodeKind::Const {
                 continue;
             }
             if frame.pending_inputs[i] == 0 && !frame.value_table.ready[i] {
@@ -375,29 +353,18 @@ impl<S: LockStrategy> Engine<S> {
                 .count() as u16;
 
             Self::reset_node_pending(loop_frame, local, pending);
-
-            // 预填充 Const 节点
-            if node.kind == NodeKind::Const {
-                if let Some(cv) = self.graph.const_values[gid.0 as usize] {
-                    let handle = super::Schedule::alloc_const_value(cv);
-                    let consumer_count =
-                        self.graph.downstreams[gid.0 as usize].len() as u16;
-                    loop_frame.set_value(local, handle, consumer_count);
-                }
-            }
         }
 
-        // 阶段 2：入队（Const 节点 + 0-pending 非 Const 节点）
+        // 阶段 2：入队 0-pending 节点（Const 节点也走此路径——compute_fn 返回值）
         for &gid in &cond_nodes {
             let local = NodeId(gid.0.wrapping_sub(loop_offset));
             let i = local.0 as usize;
-            let is_const = self.graph.nodes[gid.0 as usize].kind == NodeKind::Const;
             let pending = if i < loop_frame.pending_inputs.len() {
                 loop_frame.pending_inputs[i]
             } else {
                 0
             };
-            if is_const || pending == 0 {
+            if pending == 0 {
                 loop_frame.push_ready(local);
             }
         }

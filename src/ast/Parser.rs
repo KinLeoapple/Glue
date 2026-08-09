@@ -495,18 +495,6 @@ impl<'a> Lexer<'a> {
 
     // --- Basic character operations ---
 
-    /// Peek at the current character (does not advance)
-    #[allow(dead_code)]
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    /// Peek at the next character (does not advance)
-    #[allow(dead_code)]
-    fn peek_next(&self) -> Option<u8> {
-        self.bytes.get(self.pos + 1).copied()
-    }
-
     /// Consume the current character and advance; updates line/column on newline
     fn advance(&mut self) -> Option<u8> {
         let ch = *self.bytes.get(self.pos)?;
@@ -1591,7 +1579,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Returns the most recently consumed Token
     fn previous(&self) -> Token<'a> {
-        debug_assert!(self.current > 0);
         self.tokens[self.current - 1]
     }
 

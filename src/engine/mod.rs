@@ -28,7 +28,7 @@ pub mod Frame;
 pub mod Subgraph;
 pub mod Strategy;
 
-pub use Schedule::{prepare_frame_nodes, notify_downstream};
+pub use Schedule::{prepare_frame_nodes, notify_downstream, alloc_const_value};
 pub use Subgraph::switch_subgraph;
 pub use Strategy::{LockStrategy, Lockable, Single, Multi, QueueHandle};
 pub use AsyncRt::{TimerRuntime, AsyncJoinRuntime};
@@ -38,6 +38,17 @@ use crate::value::{Value, ValueArena};
 use std::cell::RefCell;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use hashbrown::HashMap;
+use std::sync::OnceLock;
+
+/// 缓存环境变量布尔标志，避免热路径每次调用 std::env::var。
+#[inline]
+pub(super) fn env_flag(name: &str) -> bool {
+    static FLAG_STALL: OnceLock<bool> = OnceLock::new();
+    match name {
+        "GLUE_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("GLUE_DEBUG_STALL").is_ok()),
+        _ => std::env::var(name).is_ok(),
+    }
+}
 use crossbeam_deque::Injector;
 use std::sync::Arc;
 

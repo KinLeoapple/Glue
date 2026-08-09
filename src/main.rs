@@ -93,11 +93,8 @@ const MANIFEST_NAME: &str = "glue.toml";
 /// 默认入口文件
 const DEFAULT_ENTRY: &str = "src/Main.glue";
 
-/// 项目清单：名称、版本与入口文件路径
-#[allow(dead_code)]
+/// 项目清单：入口文件路径
 struct Manifest {
-    name: String,
-    version: String,
     entry: String,
 }
 
@@ -119,8 +116,6 @@ fn find_project_root() -> Option<String> {
 
 /// 解析清单文件内容（简化的 key = value 格式），返回 Manifest
 fn parse_manifest(source: &str) -> Manifest {
-    let mut name = "app".to_string();
-    let mut version = "0.0.0".to_string();
     let mut entry = DEFAULT_ENTRY.to_string();
 
     for raw_line in source.lines() {
@@ -135,18 +130,11 @@ fn parse_manifest(source: &str) -> Manifest {
         if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
             val = &val[1..val.len() - 1];
         }
-        match key {
-            "name" => name = val.to_string(),
-            "version" => version = val.to_string(),
-            "entry" => {
-                if !val.is_empty() {
-                    entry = val.to_string();
-                }
-            }
-            _ => {}
+        if key == "entry" && !val.is_empty() {
+            entry = val.to_string();
         }
     }
-    Manifest { name, version, entry }
+    Manifest { entry }
 }
 
 /// 加载项目清单：向上查找项目根，读取并解析 glue.toml
@@ -641,9 +629,17 @@ fn cmd_run(file: Option<String>, workers: Option<usize>, debug: bool) {
             non_entry_modules.push(m);
         }
     }
+    // 为每个非 entry 模块生成静态分析报告（memoize/dead_code/inline 等通用覆盖）
+    // leak 到堆上保持存活至程序结束（与 analysis_report 同生命周期，CLI 工具无回收需求）
+    let builtin_analyses: Vec<Option<&Analyzer::AnalysisReport>> = non_entry_modules.iter()
+        .map(|m| Analyzer::analyze(m, &m.arena, &sema_result))
+        .map(|r| Box::leak(Box::new(r)) as &Analyzer::AnalysisReport)
+        .map(Some)
+        .collect();
     let mut graph = IrBuilder::new(&sema_result, &type_arena, &entry_module)
         .with_builtins(non_entry_modules)
         .with_analysis(&analysis_report)
+        .with_builtin_analyses(builtin_analyses)
         .build();
 
     // 检查 IR 编译错误（未实现的特性降级、找不到函数等）
