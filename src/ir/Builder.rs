@@ -3130,10 +3130,6 @@ impl<'a> IrBuilder<'a> {
             self.current_effect = prev_effect_inner;
 
             // 清除 non_tail_rec_ctx
-            let _was_truncated = self
-                .non_tail_rec_ctx
-                .as_ref()
-                .map_or(false, |c| c.truncated);
             self.non_tail_rec_ctx = None;
             self.exit_scope();
             self.current_sg_start = prev_sg_start_inner;
